@@ -49,7 +49,9 @@ impl Server {
         ));
 
         let task_semaphore = if config.max_concurrent_tasks > 0 {
-            Some(Arc::new(Semaphore::new(config.max_concurrent_tasks as usize)))
+            Some(Arc::new(Semaphore::new(
+                config.max_concurrent_tasks as usize,
+            )))
         } else {
             None
         };

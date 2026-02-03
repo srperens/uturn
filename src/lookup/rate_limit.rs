@@ -44,7 +44,9 @@ impl RateLimiter {
         let mut entry = self.entries.entry(ip).or_default();
 
         // Clean up old request times
-        entry.request_times.retain(|&t| now.duration_since(t) < window);
+        entry
+            .request_times
+            .retain(|&t| now.duration_since(t) < window);
 
         // Check rate limit
         if self.max_requests_per_minute > 0
@@ -54,8 +56,7 @@ impl RateLimiter {
         }
 
         // Check allocation quota
-        if self.max_allocations_per_ip > 0
-            && entry.allocation_count >= self.max_allocations_per_ip
+        if self.max_allocations_per_ip > 0 && entry.allocation_count >= self.max_allocations_per_ip
         {
             return Err(RateLimitError::QuotaExceeded);
         }
@@ -94,7 +95,9 @@ impl RateLimiter {
 
         // Remove entries with no allocations and no recent requests
         self.entries.retain(|_, entry| {
-            entry.request_times.retain(|&t| now.duration_since(t) < window);
+            entry
+                .request_times
+                .retain(|&t| now.duration_since(t) < window);
             entry.allocation_count > 0 || !entry.request_times.is_empty()
         });
     }
