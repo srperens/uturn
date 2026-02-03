@@ -16,7 +16,7 @@ const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
 const ATTR_DATA: u16 = 0x0013;
 const ATTR_REALM: u16 = 0x0014;
 const ATTR_NONCE: u16 = 0x0015;
-const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+const _ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 
 /// STUN message type classes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,9 +124,8 @@ impl StunInfo {
         };
 
         // Extract method (bits 0-3, 5-7, 9-11)
-        let method_bits = (msg_type & 0x000F)
-            | ((msg_type >> 1) & 0x0070)
-            | ((msg_type >> 2) & 0x0F80);
+        let method_bits =
+            (msg_type & 0x000F) | ((msg_type >> 1) & 0x0070) | ((msg_type >> 2) & 0x0F80);
         let method = match method_bits {
             0x001 => StunMethod::Binding,
             0x003 => StunMethod::Allocate,
@@ -327,8 +326,7 @@ mod tests {
             0x00, 0x00, // Length = 0
             0x21, 0x12, 0xa4, 0x42, // Magic cookie
             0x01, 0x02, 0x03, 0x04, // Transaction ID
-            0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c,
+            0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
         ];
 
         let info = StunInfo::parse(&data).unwrap();
@@ -342,9 +340,7 @@ mod tests {
             0x00, 0x03, // Allocate Request
             0x00, 0x00, // Length = 0
             0x21, 0x12, 0xa4, 0x42, // Magic cookie
-            0x01, 0x02, 0x03, 0x04,
-            0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
         ];
 
         let info = StunInfo::parse(&data).unwrap();
@@ -358,15 +354,31 @@ mod tests {
         let padded_len = (username.len() + 3) & !3;
 
         let mut data = vec![
-            0x00, 0x01, // Binding Request
-            0x00, (4 + padded_len) as u8, // Length
-            0x21, 0x12, 0xa4, 0x42, // Magic cookie
-            0x01, 0x02, 0x03, 0x04,
-            0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c,
+            0x00,
+            0x01, // Binding Request
+            0x00,
+            (4 + padded_len) as u8, // Length
+            0x21,
+            0x12,
+            0xa4,
+            0x42, // Magic cookie
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+            0x05,
+            0x06,
+            0x07,
+            0x08,
+            0x09,
+            0x0a,
+            0x0b,
+            0x0c,
             // USERNAME attribute
-            0x00, 0x06, // Type
-            0x00, username.len() as u8, // Length
+            0x00,
+            0x06, // Type
+            0x00,
+            username.len() as u8, // Length
         ];
         data.extend_from_slice(username);
         // Add padding

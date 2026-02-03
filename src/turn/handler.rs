@@ -135,7 +135,9 @@ impl TurnHandler {
 
                 // Build and send Data Indication with the raw STUN response
                 let indication = self.build_data_indication(src_addr, &msg.raw);
-                socket.send_to(&indication, target_alloc.client_addr).await?;
+                socket
+                    .send_to(&indication, target_alloc.client_addr)
+                    .await?;
             }
         }
 
@@ -153,16 +155,19 @@ impl TurnHandler {
 
         // Check if already allocated - treat as retransmission and return success
         if let Some(alloc) = self.allocations.get_by_client(src_addr) {
-            debug!("Allocation already exists for {} - returning success for retransmission", src_addr);
+            debug!(
+                "Allocation already exists for {} - returning success for retransmission",
+                src_addr
+            );
             let lifetime = alloc.remaining_lifetime();
             let username = alloc.username.clone();
             drop(alloc);
 
             // For retransmission, we need to include MESSAGE-INTEGRITY if auth is enabled
             let key = if !self.config.credentials.is_empty() {
-                self.config.get_password(&username).map(|password| {
-                    TurnAuth::compute_key(&username, &self.config.realm, password)
-                })
+                self.config
+                    .get_password(&username)
+                    .map(|password| TurnAuth::compute_key(&username, &self.config.realm, password))
             } else {
                 None
             };
@@ -207,7 +212,9 @@ impl TurnHandler {
             let realm = msg.realm.as_deref().unwrap_or(&self.config.realm);
             let key = TurnAuth::compute_key(username, realm, password);
 
-            if let (Some(integrity), Some(offset)) = (&msg.message_integrity, msg.message_integrity_offset) {
+            if let (Some(integrity), Some(offset)) =
+                (&msg.message_integrity, msg.message_integrity_offset)
+            {
                 // Build message up to MESSAGE-INTEGRITY for validation
                 // Need to adjust the length in header to end at MESSAGE-INTEGRITY
                 let mut msg_for_hmac = msg.raw[..offset].to_vec();
@@ -232,7 +239,9 @@ impl TurnHandler {
 
             // Valid credentials - create allocation
             let lifetime = 60;
-            let alloc_id = self.allocations.create(src_addr, username.to_string(), lifetime);
+            let alloc_id = self
+                .allocations
+                .create(src_addr, username.to_string(), lifetime);
 
             info!(
                 "Created allocation {} for {} (user: {})",
@@ -252,7 +261,9 @@ impl TurnHandler {
             let username = msg.username.as_deref().unwrap_or("anonymous");
 
             let lifetime = 60;
-            let alloc_id = self.allocations.create(src_addr, username.to_string(), lifetime);
+            let alloc_id = self
+                .allocations
+                .create(src_addr, username.to_string(), lifetime);
 
             info!(
                 "Created allocation {} for {} (user: {})",
@@ -301,7 +312,10 @@ impl TurnHandler {
             let alloc_id = alloc.id;
             drop(alloc); // Release the ref before removing
             self.allocations.remove(alloc_id);
-            info!("Deleted allocation {} for {} (lifetime=0)", alloc_id, src_addr);
+            info!(
+                "Deleted allocation {} for {} (lifetime=0)",
+                alloc_id, src_addr
+            );
 
             let response = self.build_refresh_response(msg, 0, key.as_ref());
             socket.send_to(&response, src_addr).await?;
@@ -313,7 +327,10 @@ impl TurnHandler {
         alloc.refresh(lifetime);
         alloc.touch_received();
 
-        debug!("Refreshed allocation for {} (lifetime={}s)", src_addr, lifetime);
+        debug!(
+            "Refreshed allocation for {} (lifetime={}s)",
+            src_addr, lifetime
+        );
 
         let response = self.build_refresh_response(msg, lifetime, key.as_ref());
         socket.send_to(&response, src_addr).await?;
@@ -330,11 +347,12 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("CreatePermission request from {}", src_addr);
 
-        let (alloc_id, username, key) = {
+        let (alloc_id, _username, key) = {
             let alloc = match self.allocations.get_by_client(src_addr) {
                 Some(a) => a,
                 None => {
-                    let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                    let response =
+                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
                 }
@@ -342,7 +360,10 @@ impl TurnHandler {
 
             // Parse XOR-PEER-ADDRESS attributes (can have multiple)
             if msg.xor_peer_addresses.is_empty() {
-                warn!("CreatePermission missing XOR-PEER-ADDRESS from {}", src_addr);
+                warn!(
+                    "CreatePermission missing XOR-PEER-ADDRESS from {}",
+                    src_addr
+                );
                 let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
@@ -357,7 +378,10 @@ impl TurnHandler {
         for peer_addr in &msg.xor_peer_addresses {
             let peer_ip = peer_addr.ip();
             self.allocations.add_permission(alloc_id, peer_ip);
-            debug!("Added permission for {} to allocation {}", peer_ip, alloc_id);
+            debug!(
+                "Added permission for {} to allocation {}",
+                peer_ip, alloc_id
+            );
         }
 
         info!(
@@ -408,7 +432,8 @@ impl TurnHandler {
             let alloc = match self.allocations.get_by_client(src_addr) {
                 Some(a) => a,
                 None => {
-                    let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                    let response =
+                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
                 }
@@ -500,13 +525,18 @@ impl TurnHandler {
                     // The peer address from target's perspective is the relay address
                     // (since they created permission for the relay, not the sender)
                     let indication = self.build_data_indication(our_addr, data);
-                    socket.send_to(&indication, target_alloc.client_addr).await?;
+                    socket
+                        .send_to(&indication, target_alloc.client_addr)
+                        .await?;
                     sent = true;
                 }
             }
 
             if !sent {
-                warn!("No target allocation found for internal routing from {}", src_addr);
+                warn!(
+                    "No target allocation found for internal routing from {}",
+                    src_addr
+                );
             }
             return Ok(());
         }

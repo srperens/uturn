@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let _subscriber = FmtSubscriber::builder()
+    FmtSubscriber::builder()
         .with_max_level(args.log_level)
         .with_target(false)
         .init();

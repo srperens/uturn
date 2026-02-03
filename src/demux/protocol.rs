@@ -15,16 +15,10 @@ pub enum PacketType {
     Dtls(Vec<u8>),
 
     /// TURN ChannelData
-    TurnChannelData {
-        channel: u16,
-        data: Vec<u8>,
-    },
+    TurnChannelData { channel: u16, data: Vec<u8> },
 
     /// RTP packet
-    Rtp {
-        ssrc: u32,
-        data: Vec<u8>,
-    },
+    Rtp { ssrc: u32, data: Vec<u8> },
 
     /// RTCP packet
     Rtcp(Vec<u8>),
@@ -116,7 +110,7 @@ impl Demuxer {
         // - RTCP: (byte[1] & 0x7F) typically >= 200
         let pt = data[1] & 0x7F;
 
-        if pt >= 200 && pt <= 204 {
+        if (200..=204).contains(&pt) {
             PacketType::Rtcp(data.to_vec())
         } else {
             // Parse RTP header to get SSRC
@@ -143,17 +137,22 @@ mod tests {
             0x00, 0x00, // Length
             0x21, 0x12, 0xa4, 0x42, // Magic cookie
             0x00, 0x00, 0x00, 0x00, // Transaction ID (12 bytes)
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
-        assert!(matches!(Demuxer::classify(&stun_packet), PacketType::Stun(_)));
+        assert!(matches!(
+            Demuxer::classify(&stun_packet),
+            PacketType::Stun(_)
+        ));
     }
 
     #[test]
     fn test_classify_dtls() {
         // DTLS record (content type 22 = handshake)
         let dtls_packet = [22, 0xfe, 0xff, 0x00, 0x00];
-        assert!(matches!(Demuxer::classify(&dtls_packet), PacketType::Dtls(_)));
+        assert!(matches!(
+            Demuxer::classify(&dtls_packet),
+            PacketType::Dtls(_)
+        ));
     }
 
     #[test]
@@ -166,7 +165,10 @@ mod tests {
         ];
         assert!(matches!(
             Demuxer::classify(&channel_data),
-            PacketType::TurnChannelData { channel: 0x4000, .. }
+            PacketType::TurnChannelData {
+                channel: 0x4000,
+                ..
+            }
         ));
     }
 
