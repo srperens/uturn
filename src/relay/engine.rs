@@ -210,54 +210,68 @@ impl RelayEngine {
     /// Handle RTP packet from peer
     ///
     /// Peer sends RTP to relay address; forward to client.
+    /// When multiple allocations permit the same peer IP, RTP is sent to ALL of them
+    /// to avoid data leaks from SSRC collisions or shared peers.
     pub async fn handle_rtp(&self, ssrc: u32, data: &[u8], peer_addr: SocketAddr) -> Result<()> {
-        // Try to find allocation by SSRC first (fast path after learning)
-        let alloc_id = if let Some(id) = self.allocations.lookup_by_ssrc(ssrc) {
-            id
-        } else {
-            // Fall back to permission-based lookup
-            let candidates = self.allocations.lookup_by_peer_ip(peer_addr.ip());
-            if candidates.is_empty() {
-                trace!("RTP from unknown peer: {} (SSRC {:08x})", peer_addr, ssrc);
-                return Ok(());
-            }
-
-            // If multiple allocations permit this peer, we need to disambiguate
-            // For now, use the first one and register the SSRC
-            let id = candidates[0];
-
-            // Learn this SSRC for future fast lookups
-            self.allocations.register_ssrc(id, ssrc);
-            self.allocations.register_peer_tuple(id, peer_addr);
-
-            debug!(
-                "Learned SSRC {:08x} from {} -> allocation {}",
-                ssrc, peer_addr, id
-            );
-
-            id
-        };
-
-        let alloc = match self.allocations.get(alloc_id) {
-            Some(a) => a,
-            None => return Ok(()),
-        };
-
-        // Check permission
-        if !alloc.is_permitted(peer_addr.ip()) {
+        // Get all candidates that permit this peer IP
+        let candidates = self.allocations.lookup_by_peer_ip(peer_addr.ip());
+        if candidates.is_empty() {
+            trace!("RTP from unknown peer: {} (SSRC {:08x})", peer_addr, ssrc);
             return Ok(());
         }
 
-        // Check for channel binding (more efficient than Data indication)
-        if let Some(channel) = alloc.channel_for_peer(peer_addr) {
-            self.send_channel_data(channel, data, alloc.client_addr)
-                .await?;
-        } else {
-            self.send_data_indication(peer_addr, data, alloc.client_addr)
-                .await?;
-        }
+        // If exactly one candidate, we can use SSRC learning for fast path
+        // Otherwise, send to ALL candidates to avoid misrouting
+        if candidates.len() == 1 {
+            let alloc_id = candidates[0];
 
-        alloc.touch();
+            // Register for fast path on future packets
+            self.allocations.register_ssrc(alloc_id, ssrc);
+            self.allocations.register_peer_tuple(alloc_id, peer_addr);
+
+            if let Some(alloc) = self.allocations.get(alloc_id) {
+                if alloc.is_permitted(peer_addr.ip()) {
+                    if let Some(channel) = alloc.channel_for_peer(peer_addr) {
+                        self.send_channel_data(channel, data, alloc.client_addr)
+                            .await?;
+                    } else {
+                        self.send_data_indication(peer_addr, data, alloc.client_addr)
+                            .await?;
+                    }
+                    alloc.touch();
+                }
+            }
+        } else {
+            // Multiple candidates - send to ALL to avoid data leaks
+            // Don't register SSRC globally when ambiguous
+            trace!(
+                "RTP from {} (SSRC {:08x}) - {} candidates, sending to all",
+                peer_addr,
+                ssrc,
+                candidates.len()
+            );
+
+            for alloc_id in candidates {
+                let alloc = match self.allocations.get(alloc_id) {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                if !alloc.is_permitted(peer_addr.ip()) {
+                    continue;
+                }
+
+                if let Some(channel) = alloc.channel_for_peer(peer_addr) {
+                    self.send_channel_data(channel, data, alloc.client_addr)
+                        .await?;
+                } else {
+                    self.send_data_indication(peer_addr, data, alloc.client_addr)
+                        .await?;
+                }
+
+                alloc.touch();
+            }
+        }
 
         Ok(())
     }

@@ -40,20 +40,26 @@ impl RateLimiter {
     /// Returns Ok(()) if allowed (and slot is reserved), Err with reason if rejected.
     pub fn check_allocation_request(&self, ip: IpAddr) -> Result<(), RateLimitError> {
         let now = Instant::now();
-        let window = std::time::Duration::from_secs(60);
 
         let mut entry = self.entries.entry(ip).or_default();
 
-        // Clean up old request times
-        entry
-            .request_times
-            .retain(|&t| now.duration_since(t) < window);
+        // Only track request times if rate limiting is enabled
+        // This prevents unbounded memory growth when limit is 0 (unlimited)
+        if self.max_requests_per_minute > 0 {
+            let window = std::time::Duration::from_secs(60);
 
-        // Check rate limit
-        if self.max_requests_per_minute > 0
-            && entry.request_times.len() >= self.max_requests_per_minute as usize
-        {
-            return Err(RateLimitError::TooManyRequests);
+            // Clean up old request times
+            entry
+                .request_times
+                .retain(|&t| now.duration_since(t) < window);
+
+            // Check rate limit
+            if entry.request_times.len() >= self.max_requests_per_minute as usize {
+                return Err(RateLimitError::TooManyRequests);
+            }
+
+            // Record the request time
+            entry.request_times.push(now);
         }
 
         // Check allocation quota
@@ -62,8 +68,7 @@ impl RateLimiter {
             return Err(RateLimitError::QuotaExceeded);
         }
 
-        // Record the request and reserve the allocation slot atomically
-        entry.request_times.push(now);
+        // Reserve the allocation slot
         entry.allocation_count = entry.allocation_count.saturating_add(1);
 
         Ok(())

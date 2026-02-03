@@ -101,9 +101,21 @@ impl TurnHandler {
             return AuthResult::Failed(self.build_error_response(msg, TurnErrorCode::BadRequest));
         }
 
-        // Validate MESSAGE-INTEGRITY
-        let realm = msg.realm.as_deref().unwrap_or(&self.config.realm);
-        let key = TurnAuth::compute_key(username, realm, password);
+        // Validate REALM matches server's realm (RFC 5389 requirement)
+        // Using client's realm would allow authentication bypass during credential rotation
+        let client_realm = msg.realm.as_deref();
+        if let Some(realm) = client_realm {
+            if realm != self.config.realm {
+                warn!(
+                    "Realm mismatch: client sent '{}', expected '{}'",
+                    realm, self.config.realm
+                );
+                return AuthResult::Failed(self.build_unauthorized_response(msg));
+            }
+        }
+
+        // Always use server's realm for key computation
+        let key = TurnAuth::compute_key(username, &self.config.realm, password);
 
         if let (Some(integrity), Some(offset)) =
             (&msg.message_integrity, msg.message_integrity_offset)
@@ -357,9 +369,23 @@ impl TurnHandler {
                 return Ok(());
             }
 
-            // Validate MESSAGE-INTEGRITY
-            let realm = msg.realm.as_deref().unwrap_or(&self.config.realm);
-            let key = TurnAuth::compute_key(username, realm, password);
+            // Validate REALM matches server's realm (RFC 5389 requirement)
+            let client_realm = msg.realm.as_deref();
+            if let Some(realm) = client_realm {
+                if realm != self.config.realm {
+                    warn!(
+                        "Realm mismatch from {}: client sent '{}', expected '{}'",
+                        src_addr, realm, self.config.realm
+                    );
+                    self.rate_limiter.cancel_reservation(src_addr.ip());
+                    let response = self.build_unauthorized_response(msg);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            }
+
+            // Always use server's realm for key computation
+            let key = TurnAuth::compute_key(username, &self.config.realm, password);
 
             if let (Some(integrity), Some(offset)) =
                 (&msg.message_integrity, msg.message_integrity_offset)

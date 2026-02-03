@@ -264,7 +264,9 @@ impl Server {
                     let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
                     if !candidates.is_empty() {
                         debug!("DTLS from peer {} - relaying via Data Indication", src_addr);
-                        self.relay_engine.handle_peer_data(&data, src_addr).await?;
+                        // Use handle_dtls which always uses Data Indication (not ChannelData)
+                        // DTLS handshake packets must not be sent via ChannelData
+                        self.relay_engine.handle_dtls(&data, src_addr).await?;
                     } else {
                         trace!("DTLS from unknown {}", src_addr);
                     }
@@ -309,8 +311,26 @@ impl Server {
     async fn relay_client_data(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
         let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
 
-        // Get sender's allocation for tracking relay success
-        let sender_alloc = self.allocations.get_by_client(src_addr);
+        // Get sender's allocation and verify they have permission for relay IP
+        let sender_alloc = match self.allocations.get_by_client(src_addr) {
+            Some(alloc) => alloc,
+            None => {
+                warn!("relay_client_data from unknown client: {}", src_addr);
+                return Ok(());
+            }
+        };
+
+        // Check that SENDER has permission for the relay IP (RFC 5766 requirement)
+        if !sender_alloc.is_permitted(self.config.external_ip) {
+            warn!(
+                "Client {} tried to relay data without permission for relay IP",
+                src_addr
+            );
+            return Ok(());
+        }
+
+        // Keep reference for tracking relay success
+        let sender_alloc = Some(sender_alloc);
 
         // Find all allocations that have permission for our relay IP
         let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
