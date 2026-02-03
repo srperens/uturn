@@ -160,8 +160,11 @@ impl RelayEngine {
                 }
             }
 
-            if !relayed {
+            if relayed {
+                alloc.touch_relay_success();
+            } else {
                 trace!("No target clients for ChannelData relay from {}", src_addr);
+                alloc.touch_relay_attempt(); // Start orphan timer
             }
         }
         // Check if the peer is another TURN client on this server
@@ -194,7 +197,8 @@ impl RelayEngine {
             self.socket.send_to(data, peer_addr).await?;
         }
 
-        alloc.touch();
+        // Touch sender's allocation - they sent us data
+        alloc.touch_received();
         Ok(())
     }
 

@@ -231,7 +231,7 @@ impl TurnHandler {
             }
 
             // Valid credentials - create allocation
-            let lifetime = 600;
+            let lifetime = 60;
             let alloc_id = self.allocations.create(src_addr, username.to_string(), lifetime);
 
             info!(
@@ -251,7 +251,7 @@ impl TurnHandler {
             // No authentication configured - anonymous access
             let username = msg.username.as_deref().unwrap_or("anonymous");
 
-            let lifetime = 600;
+            let lifetime = 60;
             let alloc_id = self.allocations.create(src_addr, username.to_string(), lifetime);
 
             info!(
@@ -294,7 +294,7 @@ impl TurnHandler {
         let key = self.compute_response_key(msg, &alloc.username);
 
         // Parse requested lifetime (0 means delete allocation)
-        let requested_lifetime = msg.lifetime.unwrap_or(600);
+        let requested_lifetime = msg.lifetime.unwrap_or(60);
 
         if requested_lifetime == 0 {
             // Client wants to delete the allocation
@@ -308,10 +308,10 @@ impl TurnHandler {
             return Ok(());
         }
 
-        // Cap lifetime at 10 minutes max, minimum 60 seconds
-        let lifetime = requested_lifetime.clamp(60, 600);
+        // Cap lifetime at 60 seconds max, minimum 10 seconds
+        let lifetime = requested_lifetime.clamp(10, 60);
         alloc.refresh(lifetime);
-        alloc.touch();
+        alloc.touch_received();
 
         debug!("Refreshed allocation for {} (lifetime={}s)", src_addr, lifetime);
 
@@ -349,7 +349,7 @@ impl TurnHandler {
             }
 
             let key = self.compute_response_key(msg, &alloc.username);
-            alloc.touch();
+            alloc.touch_received();
             (alloc.id, alloc.username.clone(), key)
         };
 
@@ -419,7 +419,7 @@ impl TurnHandler {
 
             // Bind channel (this can be done while holding the ref)
             alloc.bind_channel(channel, peer_addr);
-            alloc.touch();
+            alloc.touch_received();
 
             (alloc_id, key)
         };
@@ -537,7 +537,7 @@ impl TurnHandler {
             peer_addr
         );
         socket.send_to(data, peer_addr).await?;
-        alloc.touch();
+        alloc.touch_received();
 
         Ok(())
     }

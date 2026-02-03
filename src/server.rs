@@ -18,7 +18,10 @@ use crate::turn::TurnHandler;
 const MAX_PACKET_SIZE: usize = 65535;
 
 /// Interval for cleaning up expired allocations
-const CLEANUP_INTERVAL_SECS: u64 = 30;
+const CLEANUP_INTERVAL_SECS: u64 = 10;
+
+/// Inactivity timeout - remove allocation if no traffic FROM client for this long
+const INACTIVITY_TIMEOUT_SECS: u64 = 30;
 
 /// uTURN server
 pub struct Server {
@@ -70,15 +73,23 @@ impl Server {
             self.config.external_ip, self.config.port
         );
 
-        // Spawn cleanup task for expired allocations
+        // Spawn cleanup task for expired, inactive, and orphaned allocations
         let cleanup_allocations = self.allocations.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
             loop {
                 interval.tick().await;
-                let removed = cleanup_allocations.cleanup_expired();
-                if removed > 0 {
-                    info!("Cleaned up {} expired allocation(s)", removed);
+                let expired = cleanup_allocations.cleanup_expired();
+                if expired > 0 {
+                    info!("Cleaned up {} expired allocation(s)", expired);
+                }
+                let inactive = cleanup_allocations.cleanup_inactive(INACTIVITY_TIMEOUT_SECS);
+                if inactive > 0 {
+                    info!("Cleaned up {} inactive allocation(s)", inactive);
+                }
+                let orphaned = cleanup_allocations.cleanup_orphaned_senders(INACTIVITY_TIMEOUT_SECS);
+                if orphaned > 0 {
+                    info!("Cleaned up {} orphaned sender allocation(s)", orphaned);
                 }
             }
         });
@@ -214,6 +225,9 @@ impl Server {
     async fn relay_client_data(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
         let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
 
+        // Get sender's allocation for tracking relay success
+        let sender_alloc = self.allocations.get_by_client(src_addr);
+
         // Find all allocations that have permission for our relay IP
         let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
 
@@ -244,6 +258,15 @@ impl Server {
                 self.socket.send_to(&indication, target_alloc.client_addr).await?;
                 target_alloc.touch();
                 relayed = true;
+            }
+        }
+
+        // Track relay success/failure for orphan detection
+        if let Some(alloc) = sender_alloc {
+            if relayed {
+                alloc.touch_relay_success();
+            } else {
+                alloc.touch_relay_attempt();
             }
         }
 

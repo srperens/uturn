@@ -63,8 +63,16 @@ pub struct Allocation {
     /// Allocation expiry time
     pub expires_at: RwLock<Instant>,
 
-    /// Last activity time
+    /// Last activity time (any direction)
     pub last_activity: RwLock<Instant>,
+
+    /// Last time we received traffic FROM the client
+    /// Used for inactivity detection (client gone but sender still active)
+    pub last_received: RwLock<Instant>,
+
+    /// Last time we successfully relayed data to at least one target
+    /// Used to detect senders with no recipients
+    pub last_successful_relay: RwLock<Option<Instant>>,
 
     /// Username for authentication
     pub username: String,
@@ -96,6 +104,8 @@ impl Allocation {
             known_peers: DashMap::new(),
             expires_at: RwLock::new(now + std::time::Duration::from_secs(lifetime_secs as u64)),
             last_activity: RwLock::new(now),
+            last_received: RwLock::new(now),
+            last_successful_relay: RwLock::new(None),
             username,
         }
     }
@@ -134,6 +144,48 @@ impl Allocation {
     /// Update last activity time
     pub fn touch(&self) {
         *self.last_activity.write() = Instant::now();
+    }
+
+    /// Update last received time (traffic FROM client)
+    /// Call this only when receiving traffic FROM the client, not when sending TO them
+    pub fn touch_received(&self) {
+        let now = Instant::now();
+        *self.last_received.write() = now;
+        *self.last_activity.write() = now;
+    }
+
+    /// Check if client is inactive (no traffic FROM client for given duration)
+    pub fn is_inactive(&self, timeout_secs: u64) -> bool {
+        let last = *self.last_received.read();
+        Instant::now().duration_since(last).as_secs() >= timeout_secs
+    }
+
+    /// Record a successful relay (data was sent to at least one target)
+    pub fn touch_relay_success(&self) {
+        *self.last_successful_relay.write() = Some(Instant::now());
+    }
+
+    /// Record a relay attempt - starts the orphan timer if not already started
+    pub fn touch_relay_attempt(&self) {
+        let mut guard = self.last_successful_relay.write();
+        if guard.is_none() {
+            // First relay attempt with no prior success - start the timer
+            *guard = Some(Instant::now());
+        }
+    }
+
+    /// Check if sender is orphaned (sending but no targets for given duration)
+    pub fn is_orphaned_sender(&self, timeout_secs: u64) -> bool {
+        match *self.last_successful_relay.read() {
+            Some(relay_time) => {
+                // Check if last successful relay (or first attempt) was too long ago
+                Instant::now().duration_since(relay_time).as_secs() >= timeout_secs
+            }
+            None => {
+                // Never tried to relay - not orphaned (just a receiver or new allocation)
+                false
+            }
+        }
     }
 
     /// Check if allocation has expired
@@ -257,10 +309,11 @@ impl AllocationTable {
             alloc.add_permission(peer_ip);
         }
 
-        self.by_permission
-            .entry(peer_ip)
-            .or_default()
-            .push(id);
+        // Only add if not already in the list (avoid duplicates on permission refresh)
+        let mut entry = self.by_permission.entry(peer_ip).or_default();
+        if !entry.contains(&id) {
+            entry.push(id);
+        }
     }
 
     /// Register SSRC and update index
@@ -309,6 +362,40 @@ impl AllocationTable {
 
         let count = expired.len();
         for id in expired {
+            self.remove(id);
+        }
+        count
+    }
+
+    /// Remove inactive allocations (no traffic FROM client for timeout_secs)
+    pub fn cleanup_inactive(&self, timeout_secs: u64) -> usize {
+        let inactive: Vec<_> = self
+            .allocations
+            .iter()
+            .filter(|r| r.is_inactive(timeout_secs))
+            .map(|r| (r.id, r.client_addr))
+            .collect();
+
+        let count = inactive.len();
+        for (id, addr) in inactive {
+            tracing::info!("Removing inactive allocation {} for {} (no traffic for {}s)", id, addr, timeout_secs);
+            self.remove(id);
+        }
+        count
+    }
+
+    /// Remove orphaned sender allocations (sending but no targets for timeout_secs)
+    pub fn cleanup_orphaned_senders(&self, timeout_secs: u64) -> usize {
+        let orphaned: Vec<_> = self
+            .allocations
+            .iter()
+            .filter(|r| r.is_orphaned_sender(timeout_secs))
+            .map(|r| (r.id, r.client_addr))
+            .collect();
+
+        let count = orphaned.len();
+        for (id, addr) in orphaned {
+            tracing::info!("Removing orphaned sender {} for {} (no relay targets for {}s)", id, addr, timeout_secs);
             self.remove(id);
         }
         count
