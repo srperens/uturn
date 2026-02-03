@@ -290,6 +290,9 @@ impl TurnHandler {
             }
         };
 
+        // Compute auth key if request had MESSAGE-INTEGRITY
+        let key = self.compute_response_key(msg, &alloc.username);
+
         // Parse requested lifetime (0 means delete allocation)
         let requested_lifetime = msg.lifetime.unwrap_or(600);
 
@@ -300,7 +303,7 @@ impl TurnHandler {
             self.allocations.remove(alloc_id);
             info!("Deleted allocation {} for {} (lifetime=0)", alloc_id, src_addr);
 
-            let response = self.build_refresh_response(msg, 0);
+            let response = self.build_refresh_response(msg, 0, key.as_ref());
             socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
@@ -312,7 +315,7 @@ impl TurnHandler {
 
         debug!("Refreshed allocation for {} (lifetime={}s)", src_addr, lifetime);
 
-        let response = self.build_refresh_response(msg, lifetime);
+        let response = self.build_refresh_response(msg, lifetime, key.as_ref());
         socket.send_to(&response, src_addr).await?;
 
         Ok(())
@@ -327,33 +330,34 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("CreatePermission request from {}", src_addr);
 
-        let alloc_id = match self.allocations.lookup_by_source(src_addr) {
-            Some(id) => id,
-            None => {
-                let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+        let (alloc_id, username, key) = {
+            let alloc = match self.allocations.get_by_client(src_addr) {
+                Some(a) => a,
+                None => {
+                    let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            };
+
+            // Parse XOR-PEER-ADDRESS attributes (can have multiple)
+            if msg.xor_peer_addresses.is_empty() {
+                warn!("CreatePermission missing XOR-PEER-ADDRESS from {}", src_addr);
+                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
+
+            let key = self.compute_response_key(msg, &alloc.username);
+            alloc.touch();
+            (alloc.id, alloc.username.clone(), key)
         };
 
-        // Parse XOR-PEER-ADDRESS attributes (can have multiple)
-        if msg.xor_peer_addresses.is_empty() {
-            warn!("CreatePermission missing XOR-PEER-ADDRESS from {}", src_addr);
-            let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
-            socket.send_to(&response, src_addr).await?;
-            return Ok(());
-        }
-
-        // Add permissions for each peer IP
+        // Add permissions for each peer IP (must use table method to update index)
         for peer_addr in &msg.xor_peer_addresses {
             let peer_ip = peer_addr.ip();
             self.allocations.add_permission(alloc_id, peer_ip);
             debug!("Added permission for {} to allocation {}", peer_ip, alloc_id);
-        }
-
-        // Touch allocation to update activity
-        if let Some(alloc) = self.allocations.get(alloc_id) {
-            alloc.touch();
         }
 
         info!(
@@ -363,7 +367,7 @@ impl TurnHandler {
             alloc_id
         );
 
-        let response = self.build_success_response(msg);
+        let response = self.build_success_response(msg, key.as_ref());
         socket.send_to(&response, src_addr).await?;
 
         Ok(())
@@ -377,15 +381,6 @@ impl TurnHandler {
         socket: &UdpSocket,
     ) -> Result<()> {
         debug!("ChannelBind request from {}", src_addr);
-
-        let alloc_id = match self.allocations.lookup_by_source(src_addr) {
-            Some(id) => id,
-            None => {
-                let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-        };
 
         // Parse CHANNEL-NUMBER
         let channel = match msg.channel_number {
@@ -409,20 +404,35 @@ impl TurnHandler {
             }
         };
 
-        // Get allocation and bind the channel
-        if let Some(alloc) = self.allocations.get(alloc_id) {
-            // Also add permission for the peer IP (ChannelBind implies permission)
-            alloc.add_permission(peer_addr.ip());
+        let (alloc_id, key) = {
+            let alloc = match self.allocations.get_by_client(src_addr) {
+                Some(a) => a,
+                None => {
+                    let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            };
+
+            let key = self.compute_response_key(msg, &alloc.username);
+            let alloc_id = alloc.id;
+
+            // Bind channel (this can be done while holding the ref)
             alloc.bind_channel(channel, peer_addr);
             alloc.touch();
 
-            info!(
-                "ChannelBind: channel 0x{:04x} -> {} for {} (alloc {})",
-                channel, peer_addr, src_addr, alloc_id
-            );
-        }
+            (alloc_id, key)
+        };
 
-        let response = self.build_success_response(msg);
+        // Add permission through the table method to update index
+        self.allocations.add_permission(alloc_id, peer_addr.ip());
+
+        info!(
+            "ChannelBind: channel 0x{:04x} -> {} for {} (alloc {})",
+            channel, peer_addr, src_addr, alloc_id
+        );
+
+        let response = self.build_success_response(msg, key.as_ref());
         socket.send_to(&response, src_addr).await?;
 
         Ok(())
@@ -595,9 +605,25 @@ impl TurnHandler {
         response
     }
 
+    /// Compute auth key for response if request had MESSAGE-INTEGRITY
+    fn compute_response_key(&self, msg: &StunInfo, username: &str) -> Option<[u8; 16]> {
+        if msg.message_integrity.is_some() && !self.config.credentials.is_empty() {
+            if let Some(password) = self.config.get_password(username) {
+                let realm = msg.realm.as_deref().unwrap_or(&self.config.realm);
+                return Some(TurnAuth::compute_key(username, realm, password));
+            }
+        }
+        None
+    }
+
     /// Build a TURN Refresh Success Response
-    fn build_refresh_response(&self, request: &StunInfo, lifetime: u32) -> Vec<u8> {
-        let mut response = Vec::with_capacity(32);
+    fn build_refresh_response(
+        &self,
+        request: &StunInfo,
+        lifetime: u32,
+        key: Option<&[u8; 16]>,
+    ) -> Vec<u8> {
+        let mut response = Vec::with_capacity(64);
 
         // Message type: Refresh Success Response (0x0104)
         response.extend_from_slice(&[0x01, 0x04]);
@@ -608,24 +634,34 @@ impl TurnHandler {
         // LIFETIME
         self.append_lifetime(&mut response, lifetime);
 
-        let attr_len = (response.len() - 20) as u16;
-        response[2..4].copy_from_slice(&attr_len.to_be_bytes());
+        // MESSAGE-INTEGRITY (if authenticated)
+        if let Some(key) = key {
+            self.append_message_integrity(&mut response, key);
+        } else {
+            let attr_len = (response.len() - 20) as u16;
+            response[2..4].copy_from_slice(&attr_len.to_be_bytes());
+        }
 
         response
     }
 
     /// Build a generic success response
-    fn build_success_response(&self, request: &StunInfo) -> Vec<u8> {
-        let mut response = Vec::with_capacity(20);
+    fn build_success_response(&self, request: &StunInfo, key: Option<&[u8; 16]>) -> Vec<u8> {
+        let mut response = Vec::with_capacity(64);
 
         // Success response: set bit 8 of method
         let msg_type = u16::from_be_bytes([request.raw[0], request.raw[1]]);
         let success_type = msg_type | 0x0100;
 
         response.extend_from_slice(&success_type.to_be_bytes());
-        response.extend_from_slice(&[0x00, 0x00]); // No attributes
+        response.extend_from_slice(&[0x00, 0x00]); // Length placeholder
         response.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
         response.extend_from_slice(&request.transaction_id);
+
+        // MESSAGE-INTEGRITY (if authenticated)
+        if let Some(key) = key {
+            self.append_message_integrity(&mut response, key);
+        }
 
         response
     }

@@ -9,18 +9,25 @@ use anyhow::Result;
 use tokio::net::UdpSocket;
 use tracing::{debug, trace, warn};
 
+use crate::config::Config;
 use crate::lookup::AllocationTable;
 
 /// Media relay engine
 pub struct RelayEngine {
+    config: Arc<Config>,
     socket: Arc<UdpSocket>,
     allocations: Arc<AllocationTable>,
 }
 
 impl RelayEngine {
     /// Create a new relay engine
-    pub fn new(socket: Arc<UdpSocket>, allocations: Arc<AllocationTable>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        socket: Arc<UdpSocket>,
+        allocations: Arc<AllocationTable>,
+    ) -> Self {
         Self {
+            config,
             socket,
             allocations,
         }
@@ -107,9 +114,58 @@ impl RelayEngine {
             return Ok(());
         }
 
+        // Get relay address for single-port detection
+        let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
+
+        // Single-port TURN: if peer is the relay address, relay to other clients
+        if peer_addr == relay_addr {
+            debug!(
+                "ChannelData to relay address - routing to other clients (channel {})",
+                channel
+            );
+
+            // Find all other allocations that have permission for relay IP
+            let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
+            let mut relayed = false;
+
+            for alloc_id in candidates {
+                if let Some(target_alloc) = self.allocations.get(alloc_id) {
+                    // Skip sender
+                    if target_alloc.client_addr == src_addr {
+                        continue;
+                    }
+
+                    // Check permission
+                    if !target_alloc.is_permitted(self.config.external_ip) {
+                        continue;
+                    }
+
+                    // Use reverse channel if available, otherwise Data Indication
+                    // The peer address from target's perspective is the relay address
+                    if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
+                        debug!(
+                            "ChannelData relay: {} -> {} via reverse channel {}",
+                            src_addr, target_alloc.client_addr, reverse_channel
+                        );
+                        self.send_channel_data(reverse_channel, data, target_alloc.client_addr).await?;
+                    } else {
+                        debug!(
+                            "ChannelData relay: {} -> {} via Data Indication",
+                            src_addr, target_alloc.client_addr
+                        );
+                        self.send_data_indication(relay_addr, data, target_alloc.client_addr).await?;
+                    }
+                    target_alloc.touch();
+                    relayed = true;
+                }
+            }
+
+            if !relayed {
+                trace!("No target clients for ChannelData relay from {}", src_addr);
+            }
+        }
         // Check if the peer is another TURN client on this server
-        // If so, we need to wrap the data in ChannelData or Data Indication
-        if let Some(target_alloc) = self.allocations.get_by_client(peer_addr) {
+        else if let Some(target_alloc) = self.allocations.get_by_client(peer_addr) {
             // Peer is another client - check if they have a channel bound back to sender
             if let Some(reverse_channel) = target_alloc.channel_for_peer(src_addr) {
                 debug!(

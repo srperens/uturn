@@ -37,14 +37,17 @@ pub enum PacketType {
 pub struct Demuxer;
 
 impl Demuxer {
-    /// Classify a packet based on its first byte (RFC 7983)
+    /// Classify a packet based on its first byte (RFC 7983 + TURN extension)
     ///
     /// | Byte 1 Value | Protocol |
     /// |--------------|----------|
     /// | 0-3          | STUN     |
     /// | 20-63        | DTLS     |
-    /// | 64-79        | TURN ChannelData |
+    /// | 64-127       | TURN ChannelData (0x4000-0x7FFF) |
     /// | 128-191      | RTP/RTCP |
+    ///
+    /// Note: RFC 7983 only specifies 64-79 for ChannelData, but TURN (RFC 5766)
+    /// allows channel numbers 0x4000-0x7FFF, which means first byte 64-127.
     pub fn classify(data: &[u8]) -> PacketType {
         if data.is_empty() {
             return PacketType::Unknown;
@@ -57,8 +60,8 @@ impl Demuxer {
             // DTLS: first byte 20-63 (content types)
             20..=63 => PacketType::Dtls(data.to_vec()),
 
-            // TURN ChannelData: first byte 64-79 (channel numbers 0x4000-0x4FFF)
-            64..=79 => Self::parse_channel_data(data),
+            // TURN ChannelData: first byte 64-127 (channel numbers 0x4000-0x7FFF)
+            64..=127 => Self::parse_channel_data(data),
 
             // RTP/RTCP: first byte 128-191 (version 2, various PT values)
             128..=191 => Self::parse_rtp_rtcp(data),

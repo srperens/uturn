@@ -47,6 +47,7 @@ impl Server {
         ));
 
         let relay_engine = Arc::new(RelayEngine::new(
+            config.clone(),
             socket.clone(),
             allocations.clone(),
         ));
