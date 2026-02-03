@@ -152,9 +152,27 @@ impl TurnHandler {
             }
         };
 
-        // TODO: Parse requested lifetime from message
-        let lifetime = 600;
+        // Parse requested lifetime (0 means delete allocation)
+        let requested_lifetime = msg.lifetime.unwrap_or(600);
+
+        if requested_lifetime == 0 {
+            // Client wants to delete the allocation
+            let alloc_id = alloc.id;
+            drop(alloc); // Release the ref before removing
+            self.allocations.remove(alloc_id);
+            info!("Deleted allocation {} for {} (lifetime=0)", alloc_id, src_addr);
+
+            let response = self.build_refresh_response(msg, 0);
+            socket.send_to(&response, src_addr).await?;
+            return Ok(());
+        }
+
+        // Cap lifetime at 10 minutes max, minimum 60 seconds
+        let lifetime = requested_lifetime.clamp(60, 600);
         alloc.refresh(lifetime);
+        alloc.touch();
+
+        debug!("Refreshed allocation for {} (lifetime={}s)", src_addr, lifetime);
 
         let response = self.build_refresh_response(msg, lifetime);
         socket.send_to(&response, src_addr).await?;
@@ -171,7 +189,7 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("CreatePermission request from {}", src_addr);
 
-        let _alloc_id = match self.allocations.lookup_by_source(src_addr) {
+        let alloc_id = match self.allocations.lookup_by_source(src_addr) {
             Some(id) => id,
             None => {
                 let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
@@ -180,8 +198,32 @@ impl TurnHandler {
             }
         };
 
-        // TODO: Parse XOR-PEER-ADDRESS from message
-        // For now, we'll need to implement attribute parsing
+        // Parse XOR-PEER-ADDRESS attributes (can have multiple)
+        if msg.xor_peer_addresses.is_empty() {
+            warn!("CreatePermission missing XOR-PEER-ADDRESS from {}", src_addr);
+            let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
+            socket.send_to(&response, src_addr).await?;
+            return Ok(());
+        }
+
+        // Add permissions for each peer IP
+        for peer_addr in &msg.xor_peer_addresses {
+            let peer_ip = peer_addr.ip();
+            self.allocations.add_permission(alloc_id, peer_ip);
+            debug!("Added permission for {} to allocation {}", peer_ip, alloc_id);
+        }
+
+        // Touch allocation to update activity
+        if let Some(alloc) = self.allocations.get(alloc_id) {
+            alloc.touch();
+        }
+
+        info!(
+            "CreatePermission: added {} peer(s) for {} (alloc {})",
+            msg.xor_peer_addresses.len(),
+            src_addr,
+            alloc_id
+        );
 
         let response = self.build_success_response(msg);
         socket.send_to(&response, src_addr).await?;
@@ -198,7 +240,7 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("ChannelBind request from {}", src_addr);
 
-        let _alloc_id = match self.allocations.lookup_by_source(src_addr) {
+        let alloc_id = match self.allocations.lookup_by_source(src_addr) {
             Some(id) => id,
             None => {
                 let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
@@ -207,7 +249,40 @@ impl TurnHandler {
             }
         };
 
-        // TODO: Parse CHANNEL-NUMBER and XOR-PEER-ADDRESS from message
+        // Parse CHANNEL-NUMBER
+        let channel = match msg.channel_number {
+            Some(ch) => ch,
+            None => {
+                warn!("ChannelBind missing CHANNEL-NUMBER from {}", src_addr);
+                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
+        // Parse XOR-PEER-ADDRESS (ChannelBind uses only one peer address)
+        let peer_addr = match msg.xor_peer_addresses.first() {
+            Some(addr) => *addr,
+            None => {
+                warn!("ChannelBind missing XOR-PEER-ADDRESS from {}", src_addr);
+                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
+        // Get allocation and bind the channel
+        if let Some(alloc) = self.allocations.get(alloc_id) {
+            // Also add permission for the peer IP (ChannelBind implies permission)
+            alloc.add_permission(peer_addr.ip());
+            alloc.bind_channel(channel, peer_addr);
+            alloc.touch();
+
+            info!(
+                "ChannelBind: channel 0x{:04x} -> {} for {} (alloc {})",
+                channel, peer_addr, src_addr, alloc_id
+            );
+        }
 
         let response = self.build_success_response(msg);
         socket.send_to(&response, src_addr).await?;

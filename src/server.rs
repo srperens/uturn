@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
@@ -15,6 +16,9 @@ use crate::turn::TurnHandler;
 
 /// Maximum UDP packet size
 const MAX_PACKET_SIZE: usize = 65535;
+
+/// Interval for cleaning up expired allocations
+const CLEANUP_INTERVAL_SECS: u64 = 30;
 
 /// uTURN server
 pub struct Server {
@@ -64,6 +68,19 @@ impl Server {
             "uTURN server running - relay address: {}:{}",
             self.config.external_ip, self.config.port
         );
+
+        // Spawn cleanup task for expired allocations
+        let cleanup_allocations = self.allocations.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                let removed = cleanup_allocations.cleanup_expired();
+                if removed > 0 {
+                    info!("Cleaned up {} expired allocation(s)", removed);
+                }
+            }
+        });
 
         loop {
             let (len, src_addr) = match self.socket.recv_from(&mut buf).await {

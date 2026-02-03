@@ -2,8 +2,17 @@
 //!
 //! Extracts ICE username fragment (ufrag) for session identification.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 /// STUN magic cookie
 pub const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
+
+/// STUN attribute types
+const ATTR_USERNAME: u16 = 0x0006;
+const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
+const ATTR_LIFETIME: u16 = 0x000D;
+const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
+const ATTR_DATA: u16 = 0x0013;
 
 /// STUN message type classes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,12 +52,33 @@ pub struct StunInfo {
     /// Format: "serverUfrag:clientUfrag" for ICE
     pub username: Option<String>,
 
+    /// XOR-PEER-ADDRESS attributes (for CreatePermission, ChannelBind, Send)
+    pub xor_peer_addresses: Vec<SocketAddr>,
+
+    /// CHANNEL-NUMBER attribute (for ChannelBind)
+    pub channel_number: Option<u16>,
+
+    /// LIFETIME attribute (for Allocate, Refresh)
+    pub lifetime: Option<u32>,
+
+    /// DATA attribute (for Send indication)
+    pub data: Option<Vec<u8>>,
+
     /// Raw message bytes
     pub raw: Vec<u8>,
 }
 
+/// Intermediate structure for parsed attributes
+struct ParsedAttrs {
+    username: Option<String>,
+    xor_peer_addresses: Vec<SocketAddr>,
+    channel_number: Option<u16>,
+    lifetime: Option<u32>,
+    data: Option<Vec<u8>>,
+}
+
 impl StunInfo {
-    /// Parse STUN message header and USERNAME attribute
+    /// Parse STUN message header and attributes
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 20 {
             return None;
@@ -98,32 +128,72 @@ impl StunInfo {
         let mut transaction_id = [0u8; 12];
         transaction_id.copy_from_slice(&data[8..20]);
 
-        // Parse attributes to find USERNAME
-        let username = Self::find_username(&data[20..20 + msg_len]);
+        // Parse all attributes
+        let attrs = Self::parse_attributes(&data[20..20 + msg_len], &transaction_id);
 
         Some(Self {
             class,
             method,
             transaction_id,
-            username,
+            username: attrs.username,
+            xor_peer_addresses: attrs.xor_peer_addresses,
+            channel_number: attrs.channel_number,
+            lifetime: attrs.lifetime,
+            data: attrs.data,
             raw: data.to_vec(),
         })
     }
 
-    /// Extract USERNAME attribute from STUN attributes
-    fn find_username(attrs: &[u8]) -> Option<String> {
+    /// Parse all relevant attributes from STUN message
+    fn parse_attributes(attrs: &[u8], transaction_id: &[u8; 12]) -> ParsedAttrs {
+        let mut result = ParsedAttrs {
+            username: None,
+            xor_peer_addresses: Vec::new(),
+            channel_number: None,
+            lifetime: None,
+            data: None,
+        };
+
         let mut offset = 0;
 
         while offset + 4 <= attrs.len() {
             let attr_type = u16::from_be_bytes([attrs[offset], attrs[offset + 1]]);
             let attr_len = u16::from_be_bytes([attrs[offset + 2], attrs[offset + 3]]) as usize;
 
-            // USERNAME attribute type = 0x0006
-            if attr_type == 0x0006 {
-                if offset + 4 + attr_len <= attrs.len() {
-                    let value = &attrs[offset + 4..offset + 4 + attr_len];
-                    return String::from_utf8(value.to_vec()).ok();
+            if offset + 4 + attr_len > attrs.len() {
+                break;
+            }
+
+            let value = &attrs[offset + 4..offset + 4 + attr_len];
+
+            match attr_type {
+                ATTR_USERNAME => {
+                    result.username = String::from_utf8(value.to_vec()).ok();
                 }
+                ATTR_XOR_PEER_ADDRESS => {
+                    if let Some(addr) = Self::decode_xor_address(value, transaction_id) {
+                        result.xor_peer_addresses.push(addr);
+                    }
+                }
+                ATTR_CHANNEL_NUMBER => {
+                    if value.len() >= 2 {
+                        let channel = u16::from_be_bytes([value[0], value[1]]);
+                        // Valid channel range: 0x4000-0x7FFF
+                        if (0x4000..=0x7FFF).contains(&channel) {
+                            result.channel_number = Some(channel);
+                        }
+                    }
+                }
+                ATTR_LIFETIME => {
+                    if value.len() >= 4 {
+                        result.lifetime =
+                            Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+                    }
+                }
+                ATTR_DATA => {
+                    result.data = Some(value.to_vec());
+                }
+                _ => {}
             }
 
             // Move to next attribute (4-byte aligned)
@@ -131,7 +201,51 @@ impl StunInfo {
             offset += 4 + padded_len;
         }
 
-        None
+        result
+    }
+
+    /// Decode XOR-PEER-ADDRESS or XOR-MAPPED-ADDRESS
+    fn decode_xor_address(value: &[u8], transaction_id: &[u8; 12]) -> Option<SocketAddr> {
+        if value.len() < 8 {
+            return None;
+        }
+
+        let family = value[1];
+
+        // XOR port with upper 16 bits of magic cookie
+        let xor_port = u16::from_be_bytes([value[2], value[3]]);
+        let port = xor_port ^ 0x2112;
+
+        match family {
+            0x01 => {
+                // IPv4
+                let magic = [0x21u8, 0x12, 0xa4, 0x42];
+                let ip = Ipv4Addr::new(
+                    value[4] ^ magic[0],
+                    value[5] ^ magic[1],
+                    value[6] ^ magic[2],
+                    value[7] ^ magic[3],
+                );
+                Some(SocketAddr::new(IpAddr::V4(ip), port))
+            }
+            0x02 => {
+                // IPv6 - XOR with magic cookie + transaction ID
+                if value.len() < 20 {
+                    return None;
+                }
+                let magic = [0x21u8, 0x12, 0xa4, 0x42];
+                let mut ip_bytes = [0u8; 16];
+                for i in 0..4 {
+                    ip_bytes[i] = value[4 + i] ^ magic[i];
+                }
+                for i in 0..12 {
+                    ip_bytes[4 + i] = value[8 + i] ^ transaction_id[i];
+                }
+                let ip = std::net::Ipv6Addr::from(ip_bytes);
+                Some(SocketAddr::new(IpAddr::V6(ip), port))
+            }
+            _ => None,
+        }
     }
 
     /// Extract ufrag pair from USERNAME attribute
