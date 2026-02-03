@@ -113,17 +113,21 @@ impl Server {
 
     /// Handle a single incoming packet
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
-        // Fast path: check if we have an allocation for this source
-        if let Some(alloc_id) = self.allocations.lookup_by_source(src_addr) {
-            trace!("Fast path: found allocation {} for {}", alloc_id, src_addr);
-            // TODO: Handle based on packet type (relay or TURN control)
+        // Fast path: check if we have an allocation for this source (it's a client)
+        let is_client = self.allocations.lookup_by_source(src_addr).is_some();
+        if is_client {
+            trace!("Fast path: found allocation for client {}", src_addr);
         }
 
-        // Classify packet
+        // Classify packet FIRST - this is important!
+        // We must classify before checking peer permissions, because a new client
+        // from the same IP (different port) could be sending a STUN Allocate request.
         let packet_type = Demuxer::classify(data);
 
         match packet_type {
             PacketType::Stun(msg) => {
+                // STUN messages are ALWAYS processed by the TURN handler.
+                // This includes new Allocate requests from any source.
                 debug!("STUN message from {}", src_addr);
                 self.turn_handler.handle_stun(msg, src_addr, &self.socket).await?;
             }
@@ -134,27 +138,180 @@ impl Server {
             }
 
             PacketType::Rtp { ssrc, data } => {
-                trace!("RTP (SSRC={:08x}) from {}", ssrc, src_addr);
-                self.relay_engine.handle_rtp(ssrc, &data, src_addr).await?;
+                if is_client {
+                    // Client sending RTP - relay to other clients (single-port TURN)
+                    debug!("RTP from client {} - relaying to other clients", src_addr);
+                    self.relay_client_data(&data, src_addr).await?;
+                } else {
+                    // Check if this is from a permitted peer
+                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    if !candidates.is_empty() {
+                        debug!("RTP from peer {} - relaying via Data Indication", src_addr);
+                        self.relay_engine.handle_peer_data(&data, src_addr).await?;
+                    } else {
+                        trace!("RTP (SSRC={:08x}) from unknown {}", ssrc, src_addr);
+                    }
+                }
             }
 
             PacketType::Rtcp(data) => {
-                trace!("RTCP from {}", src_addr);
-                self.relay_engine.handle_rtcp(&data, src_addr).await?;
+                if is_client {
+                    debug!("RTCP from client {} - relaying to other clients", src_addr);
+                    self.relay_client_data(&data, src_addr).await?;
+                } else {
+                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    if !candidates.is_empty() {
+                        debug!("RTCP from peer {} - relaying via Data Indication", src_addr);
+                        self.relay_engine.handle_peer_data(&data, src_addr).await?;
+                    } else {
+                        trace!("RTCP from unknown {}", src_addr);
+                    }
+                }
             }
 
             PacketType::Dtls(data) => {
-                trace!("DTLS from {}", src_addr);
-                // DTLS is used for SRTP key exchange in WebRTC
-                // For now, just relay it based on source tuple
-                self.relay_engine.handle_dtls(&data, src_addr).await?;
+                if is_client {
+                    // Client sending DTLS (handshake) - relay to other clients
+                    debug!("DTLS from client {} - relaying to other clients", src_addr);
+                    self.relay_client_data(&data, src_addr).await?;
+                } else {
+                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    if !candidates.is_empty() {
+                        debug!("DTLS from peer {} - relaying via Data Indication", src_addr);
+                        self.relay_engine.handle_peer_data(&data, src_addr).await?;
+                    } else {
+                        trace!("DTLS from unknown {}", src_addr);
+                    }
+                }
             }
 
             PacketType::Unknown => {
-                warn!("Unknown packet type from {} ({} bytes)", src_addr, data.len());
+                if is_client {
+                    debug!("Unknown data from client {} - relaying to other clients", src_addr);
+                    self.relay_client_data(data, src_addr).await?;
+                } else {
+                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    if !candidates.is_empty() {
+                        debug!("Unknown data from peer {} - relaying via Data Indication", src_addr);
+                        self.relay_engine.handle_peer_data(data, src_addr).await?;
+                    } else {
+                        warn!("Unknown packet type from {} ({} bytes)", src_addr, data.len());
+                    }
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Relay data from one client to other clients (single-port TURN)
+    ///
+    /// In single-port TURN, all clients share the same relay address. When client A
+    /// sends data to the server, we relay it to other clients that have permission
+    /// for the relay IP. The Data indication uses XOR-PEER-ADDRESS = relay address,
+    /// because from the receiver's perspective, the peer is at the relay address.
+    async fn relay_client_data(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
+        let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
+
+        // Find all allocations that have permission for our relay IP
+        let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
+
+        let mut relayed = false;
+        for alloc_id in candidates {
+            if let Some(target_alloc) = self.allocations.get(alloc_id) {
+                // Skip the sender's own allocation
+                if target_alloc.client_addr == src_addr {
+                    continue;
+                }
+
+                // Check that target has permission for relay IP
+                if !target_alloc.is_permitted(self.config.external_ip) {
+                    continue;
+                }
+
+                debug!(
+                    "Relaying {} bytes from client {} to client {} (via relay {})",
+                    data.len(),
+                    src_addr,
+                    target_alloc.client_addr,
+                    relay_addr
+                );
+
+                // Build and send Data indication
+                // XOR-PEER-ADDRESS = relay address (peer from receiver's perspective)
+                let indication = self.build_data_indication(relay_addr, data);
+                self.socket.send_to(&indication, target_alloc.client_addr).await?;
+                target_alloc.touch();
+                relayed = true;
+            }
+        }
+
+        if !relayed {
+            trace!("No target clients found for relay from {}", src_addr);
+        }
+
+        Ok(())
+    }
+
+    /// Build a TURN Data Indication message
+    fn build_data_indication(&self, peer_addr: SocketAddr, data: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(48 + data.len());
+
+        // Data Indication: 0x0017
+        packet.extend_from_slice(&[0x00, 0x17]);
+
+        // Length placeholder
+        packet.extend_from_slice(&[0x00, 0x00]);
+
+        // Magic cookie
+        packet.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+
+        // Transaction ID (random for indication)
+        packet.extend_from_slice(&[0; 12]);
+
+        // XOR-PEER-ADDRESS attribute (0x0012)
+        self.append_xor_peer_address(&mut packet, peer_addr);
+
+        // DATA attribute (0x0013)
+        packet.extend_from_slice(&[0x00, 0x13]);
+        packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        packet.extend_from_slice(data);
+
+        // Pad DATA attribute to 4-byte boundary
+        while (packet.len() - 20) % 4 != 0 {
+            packet.push(0);
+        }
+
+        // Update length field
+        let msg_len = (packet.len() - 20) as u16;
+        packet[2..4].copy_from_slice(&msg_len.to_be_bytes());
+
+        packet
+    }
+
+    /// Append XOR-PEER-ADDRESS attribute to buffer
+    fn append_xor_peer_address(&self, buf: &mut Vec<u8>, addr: SocketAddr) {
+        buf.extend_from_slice(&[0x00, 0x12]); // Type
+
+        match addr {
+            SocketAddr::V4(v4) => {
+                buf.extend_from_slice(&[0x00, 0x08]); // Length
+                buf.push(0x00); // Reserved
+                buf.push(0x01); // IPv4
+
+                let xor_port = v4.port() ^ 0x2112;
+                buf.extend_from_slice(&xor_port.to_be_bytes());
+
+                let addr_bytes = v4.ip().octets();
+                let magic = [0x21, 0x12, 0xa4, 0x42];
+                for i in 0..4 {
+                    buf.push(addr_bytes[i] ^ magic[i]);
+                }
+            }
+            SocketAddr::V6(_) => {
+                // IPv6 not yet supported
+                buf.extend_from_slice(&[0x00, 0x00]);
+            }
+        }
     }
 }

@@ -145,6 +145,17 @@ impl Allocation {
     pub fn refresh(&self, lifetime_secs: u32) {
         *self.expires_at.write() = Instant::now() + std::time::Duration::from_secs(lifetime_secs as u64);
     }
+
+    /// Get remaining lifetime in seconds
+    pub fn remaining_lifetime(&self) -> u32 {
+        let expires = *self.expires_at.read();
+        let now = Instant::now();
+        if expires > now {
+            (expires - now).as_secs() as u32
+        } else {
+            0
+        }
+    }
 }
 
 /// Multi-index lookup table for allocations

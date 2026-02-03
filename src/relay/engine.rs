@@ -26,6 +26,54 @@ impl RelayEngine {
         }
     }
 
+    /// Handle data from a peer
+    ///
+    /// When data arrives from a permitted peer, wrap it in Data Indication
+    /// and send to the appropriate client.
+    pub async fn handle_peer_data(
+        &self,
+        data: &[u8],
+        peer_addr: SocketAddr,
+    ) -> Result<()> {
+        // Find allocations that have permission for this peer
+        let candidates = self.allocations.lookup_by_peer_ip(peer_addr.ip());
+        if candidates.is_empty() {
+            trace!("Data from unknown peer: {}", peer_addr);
+            return Ok(());
+        }
+
+        // For single-port design with multiple clients permitted to the same peer,
+        // we need to send to all matching allocations
+        for alloc_id in candidates {
+            let alloc = match self.allocations.get(alloc_id) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            if !alloc.is_permitted(peer_addr.ip()) {
+                continue;
+            }
+
+            debug!(
+                "Relaying {} bytes from peer {} to client {} via Data Indication",
+                data.len(),
+                peer_addr,
+                alloc.client_addr
+            );
+
+            // Check for channel binding (more efficient than Data indication)
+            if let Some(channel) = alloc.channel_for_peer(peer_addr) {
+                self.send_channel_data(channel, data, alloc.client_addr).await?;
+            } else {
+                self.send_data_indication(peer_addr, data, alloc.client_addr).await?;
+            }
+
+            alloc.touch();
+        }
+
+        Ok(())
+    }
+
     /// Handle TURN ChannelData from client
     ///
     /// Client sends ChannelData to relay to a bound peer.
@@ -59,18 +107,38 @@ impl RelayEngine {
             return Ok(());
         }
 
-        // Relay to peer
-        trace!(
-            "Relaying {} bytes from client {} to peer {} (channel {})",
-            data.len(),
-            src_addr,
-            peer_addr,
-            channel
-        );
+        // Check if the peer is another TURN client on this server
+        // If so, we need to wrap the data in ChannelData or Data Indication
+        if let Some(target_alloc) = self.allocations.get_by_client(peer_addr) {
+            // Peer is another client - check if they have a channel bound back to sender
+            if let Some(reverse_channel) = target_alloc.channel_for_peer(src_addr) {
+                debug!(
+                    "ChannelData relay: {} -> {} via channel {} (reverse channel {})",
+                    src_addr, peer_addr, channel, reverse_channel
+                );
+                self.send_channel_data(reverse_channel, data, peer_addr).await?;
+            } else {
+                // No reverse channel, use Data Indication
+                debug!(
+                    "ChannelData relay: {} -> {} via Data Indication",
+                    src_addr, peer_addr
+                );
+                self.send_data_indication(src_addr, data, peer_addr).await?;
+            }
+            target_alloc.touch();
+        } else {
+            // External peer - send raw data
+            trace!(
+                "Relaying {} bytes from client {} to external peer {} (channel {})",
+                data.len(),
+                src_addr,
+                peer_addr,
+                channel
+            );
+            self.socket.send_to(data, peer_addr).await?;
+        }
 
-        self.socket.send_to(data, peer_addr).await?;
         alloc.touch();
-
         Ok(())
     }
 

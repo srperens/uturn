@@ -9,10 +9,14 @@ pub const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 
 /// STUN attribute types
 const ATTR_USERNAME: u16 = 0x0006;
+const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
 const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
 const ATTR_LIFETIME: u16 = 0x000D;
 const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
 const ATTR_DATA: u16 = 0x0013;
+const ATTR_REALM: u16 = 0x0014;
+const ATTR_NONCE: u16 = 0x0015;
+const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 
 /// STUN message type classes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +68,18 @@ pub struct StunInfo {
     /// DATA attribute (for Send indication)
     pub data: Option<Vec<u8>>,
 
+    /// REALM attribute (for authentication)
+    pub realm: Option<String>,
+
+    /// NONCE attribute (for authentication)
+    pub nonce: Option<String>,
+
+    /// MESSAGE-INTEGRITY attribute (HMAC-SHA1, 20 bytes)
+    pub message_integrity: Option<Vec<u8>>,
+
+    /// Offset where MESSAGE-INTEGRITY starts (for validation)
+    pub message_integrity_offset: Option<usize>,
+
     /// Raw message bytes
     pub raw: Vec<u8>,
 }
@@ -75,6 +91,10 @@ struct ParsedAttrs {
     channel_number: Option<u16>,
     lifetime: Option<u32>,
     data: Option<Vec<u8>>,
+    realm: Option<String>,
+    nonce: Option<String>,
+    message_integrity: Option<Vec<u8>>,
+    message_integrity_offset: Option<usize>,
 }
 
 impl StunInfo {
@@ -140,6 +160,10 @@ impl StunInfo {
             channel_number: attrs.channel_number,
             lifetime: attrs.lifetime,
             data: attrs.data,
+            realm: attrs.realm,
+            nonce: attrs.nonce,
+            message_integrity: attrs.message_integrity,
+            message_integrity_offset: attrs.message_integrity_offset,
             raw: data.to_vec(),
         })
     }
@@ -152,6 +176,10 @@ impl StunInfo {
             channel_number: None,
             lifetime: None,
             data: None,
+            realm: None,
+            nonce: None,
+            message_integrity: None,
+            message_integrity_offset: None,
         };
 
         let mut offset = 0;
@@ -192,6 +220,19 @@ impl StunInfo {
                 }
                 ATTR_DATA => {
                     result.data = Some(value.to_vec());
+                }
+                ATTR_REALM => {
+                    result.realm = String::from_utf8(value.to_vec()).ok();
+                }
+                ATTR_NONCE => {
+                    result.nonce = String::from_utf8(value.to_vec()).ok();
+                }
+                ATTR_MESSAGE_INTEGRITY => {
+                    if value.len() == 20 {
+                        result.message_integrity = Some(value.to_vec());
+                        // Offset from start of attributes section + 20 bytes header
+                        result.message_integrity_offset = Some(20 + offset);
+                    }
                 }
                 _ => {}
             }
