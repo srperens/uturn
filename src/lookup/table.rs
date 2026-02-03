@@ -136,9 +136,23 @@ impl Allocation {
         self.channels.get(&channel).map(|r| *r)
     }
 
+    /// Maximum SSRCs to track per allocation (prevents memory DoS)
+    const MAX_SSRCS_PER_ALLOCATION: usize = 100;
+
     /// Register an SSRC with this allocation
-    pub fn register_ssrc(&self, ssrc: u32) {
-        self.ssrcs.write().insert(ssrc);
+    ///
+    /// If the limit is reached, oldest SSRCs are not tracked (we just ignore new ones)
+    /// Returns true if the SSRC was newly registered, false if already known or limit reached
+    pub fn register_ssrc(&self, ssrc: u32) -> bool {
+        let mut ssrcs = self.ssrcs.write();
+        if ssrcs.contains(&ssrc) {
+            return false; // Already known
+        }
+        if ssrcs.len() >= Self::MAX_SSRCS_PER_ALLOCATION {
+            return false; // Limit reached, don't track more
+        }
+        ssrcs.insert(ssrc);
+        true
     }
 
     /// Update last activity time
@@ -368,11 +382,15 @@ impl AllocationTable {
     }
 
     /// Register SSRC and update index
+    ///
+    /// Only adds to global index if the allocation accepts the SSRC (hasn't hit limit)
     pub fn register_ssrc(&self, id: AllocationId, ssrc: u32) {
         if let Some(alloc) = self.allocations.get(&id) {
-            alloc.register_ssrc(ssrc);
+            if alloc.register_ssrc(ssrc) {
+                // Only add to global index if allocation accepted it
+                self.by_ssrc.insert(ssrc, id);
+            }
         }
-        self.by_ssrc.insert(ssrc, id);
     }
 
     /// Register peer tuple for fast path lookup

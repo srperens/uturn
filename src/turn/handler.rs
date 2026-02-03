@@ -100,17 +100,22 @@ impl TurnHandler {
             return AuthResult::Failed(self.build_error_response(msg, TurnErrorCode::BadRequest));
         }
 
-        // Validate REALM matches server's realm (RFC 5389 requirement)
-        // Using client's realm would allow authentication bypass during credential rotation
+        // Validate REALM - required for long-term credentials per RFC 5389
         let client_realm = msg.realm.as_deref();
-        if let Some(realm) = client_realm {
-            if realm != self.config.realm {
+        match client_realm {
+            Some(realm) if realm != self.config.realm => {
                 warn!(
                     "Realm mismatch: client sent '{}', expected '{}'",
                     realm, self.config.realm
                 );
                 return AuthResult::Failed(self.build_unauthorized_response(msg));
             }
+            None => {
+                // REALM is required for long-term credentials per RFC 5389
+                warn!("Missing REALM attribute in authenticated request");
+                return AuthResult::Failed(self.build_unauthorized_response(msg));
+            }
+            _ => {} // Realm matches
         }
 
         // Always use server's realm for key computation
@@ -369,10 +374,10 @@ impl TurnHandler {
                 return Ok(());
             }
 
-            // Validate REALM matches server's realm (RFC 5389 requirement)
+            // Validate REALM - required for long-term credentials per RFC 5389
             let client_realm = msg.realm.as_deref();
-            if let Some(realm) = client_realm {
-                if realm != self.config.realm {
+            match client_realm {
+                Some(realm) if realm != self.config.realm => {
                     warn!(
                         "Realm mismatch from {}: client sent '{}', expected '{}'",
                         src_addr, realm, self.config.realm
@@ -382,6 +387,18 @@ impl TurnHandler {
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
                 }
+                None => {
+                    // REALM is required for long-term credentials per RFC 5389
+                    warn!(
+                        "Missing REALM attribute in Allocate request from {}",
+                        src_addr
+                    );
+                    self.rate_limiter.cancel_reservation(src_addr.ip());
+                    let response = self.build_unauthorized_response(msg);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+                _ => {} // Realm matches
             }
 
             // Always use server's realm for key computation
