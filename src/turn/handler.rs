@@ -497,8 +497,9 @@ impl TurnHandler {
                     );
 
                     // Build and send Data Indication to target client
-                    // The peer address from target's perspective is the sender's client address
-                    let indication = self.build_data_indication(src_addr, data);
+                    // The peer address from target's perspective is the relay address
+                    // (since they created permission for the relay, not the sender)
+                    let indication = self.build_data_indication(our_addr, data);
                     socket.send_to(&indication, target_alloc.client_addr).await?;
                     sent = true;
                 }
