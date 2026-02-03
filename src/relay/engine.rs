@@ -263,58 +263,69 @@ impl RelayEngine {
     }
 
     /// Handle RTCP packet from peer
+    ///
+    /// RTCP is sent to ALL allocations that permit this peer IP to avoid
+    /// data leaks when multiple allocations share a peer.
     pub async fn handle_rtcp(&self, data: &[u8], peer_addr: SocketAddr) -> Result<()> {
-        // RTCP handling similar to RTP, but extract SSRC from RTCP header
-        // For now, use permission-based lookup
         let candidates = self.allocations.lookup_by_peer_ip(peer_addr.ip());
         if candidates.is_empty() {
             trace!("RTCP from unknown peer: {}", peer_addr);
             return Ok(());
         }
 
-        let alloc_id = candidates[0];
-        let alloc = match self.allocations.get(alloc_id) {
-            Some(a) => a,
-            None => return Ok(()),
-        };
+        // Send to ALL allocations that permit this peer (not just the first one)
+        for alloc_id in candidates {
+            let alloc = match self.allocations.get(alloc_id) {
+                Some(a) => a,
+                None => continue,
+            };
 
-        if !alloc.is_permitted(peer_addr.ip()) {
-            return Ok(());
-        }
+            if !alloc.is_permitted(peer_addr.ip()) {
+                continue;
+            }
 
-        if let Some(channel) = alloc.channel_for_peer(peer_addr) {
-            self.send_channel_data(channel, data, alloc.client_addr)
-                .await?;
-        } else {
-            self.send_data_indication(peer_addr, data, alloc.client_addr)
-                .await?;
+            if let Some(channel) = alloc.channel_for_peer(peer_addr) {
+                self.send_channel_data(channel, data, alloc.client_addr)
+                    .await?;
+            } else {
+                self.send_data_indication(peer_addr, data, alloc.client_addr)
+                    .await?;
+            }
+
+            alloc.touch();
         }
 
         Ok(())
     }
 
     /// Handle DTLS packet from peer
+    ///
+    /// DTLS is sent to ALL allocations that permit this peer IP to avoid
+    /// data leaks when multiple allocations share a peer.
     pub async fn handle_dtls(&self, data: &[u8], peer_addr: SocketAddr) -> Result<()> {
-        // DTLS handling - typically for SRTP key exchange
         let candidates = self.allocations.lookup_by_peer_ip(peer_addr.ip());
         if candidates.is_empty() {
             trace!("DTLS from unknown peer: {}", peer_addr);
             return Ok(());
         }
 
-        let alloc_id = candidates[0];
-        let alloc = match self.allocations.get(alloc_id) {
-            Some(a) => a,
-            None => return Ok(()),
-        };
+        // Send to ALL allocations that permit this peer (not just the first one)
+        for alloc_id in candidates {
+            let alloc = match self.allocations.get(alloc_id) {
+                Some(a) => a,
+                None => continue,
+            };
 
-        if !alloc.is_permitted(peer_addr.ip()) {
-            return Ok(());
+            if !alloc.is_permitted(peer_addr.ip()) {
+                continue;
+            }
+
+            // DTLS goes via Data indication (not ChannelData)
+            self.send_data_indication(peer_addr, data, alloc.client_addr)
+                .await?;
+
+            alloc.touch();
         }
-
-        // DTLS goes via Data indication (not ChannelData)
-        self.send_data_indication(peer_addr, data, alloc.client_addr)
-            .await?;
 
         Ok(())
     }
@@ -369,7 +380,7 @@ impl RelayEngine {
         packet.extend_from_slice(&txn_id);
 
         // XOR-PEER-ADDRESS attribute (0x0012)
-        self.append_xor_peer_address(&mut packet, peer_addr);
+        self.append_xor_peer_address(&mut packet, peer_addr, &txn_id);
 
         // DATA attribute (0x0013)
         packet.extend_from_slice(&[0x00, 0x13]);
@@ -390,7 +401,12 @@ impl RelayEngine {
     }
 
     /// Append XOR-PEER-ADDRESS attribute
-    fn append_xor_peer_address(&self, buf: &mut Vec<u8>, addr: SocketAddr) {
+    fn append_xor_peer_address(
+        &self,
+        buf: &mut Vec<u8>,
+        addr: SocketAddr,
+        transaction_id: &[u8; 12],
+    ) {
         buf.extend_from_slice(&[0x00, 0x12]); // Type
 
         match addr {
@@ -416,13 +432,14 @@ impl RelayEngine {
                 let xor_port = v6.port() ^ 0x2112;
                 buf.extend_from_slice(&xor_port.to_be_bytes());
 
+                // XOR address with magic cookie (4 bytes) + transaction ID (12 bytes)
                 let addr_bytes = v6.ip().octets();
                 let magic = [0x21u8, 0x12, 0xa4, 0x42];
                 for i in 0..4 {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
-                for byte in addr_bytes.iter().skip(4) {
-                    buf.push(*byte);
+                for i in 0..12 {
+                    buf.push(addr_bytes[4 + i] ^ transaction_id[i]);
                 }
             }
         }

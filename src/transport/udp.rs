@@ -16,7 +16,11 @@ pub struct UdpTransport {
 impl UdpTransport {
     /// Create a new UDP transport bound to the specified port
     pub async fn bind(port: u16, external_ip: IpAddr) -> Result<Self> {
-        let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
+        // Bind to wildcard address matching the external IP's address family
+        let bind_addr = match external_ip {
+            IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], port)),
+            IpAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)),
+        };
         let socket = UdpSocket::bind(bind_addr).await?;
 
         Ok(Self {

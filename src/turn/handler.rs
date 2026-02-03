@@ -680,6 +680,15 @@ impl TurnHandler {
             // and send the data to them
             debug!("Send to our own relay address - routing internally");
 
+            // Check that the SENDER has permission for the relay IP (RFC 5766 requirement)
+            if !alloc.is_permitted(self.config.external_ip) {
+                warn!(
+                    "Send indication to relay address from {} without permission",
+                    src_addr
+                );
+                return Ok(());
+            }
+
             let data = match &msg.data {
                 Some(d) => d,
                 None => return Ok(()),
@@ -771,7 +780,7 @@ impl TurnHandler {
         response.extend_from_slice(&request.transaction_id);
 
         // XOR-MAPPED-ADDRESS attribute
-        self.append_xor_mapped_address(&mut response, client_addr);
+        self.append_xor_mapped_address(&mut response, client_addr, &request.transaction_id);
 
         // Update length
         let attr_len = (response.len() - 20) as u16;
@@ -798,10 +807,10 @@ impl TurnHandler {
 
         // XOR-RELAYED-ADDRESS (our single port!)
         let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
-        self.append_xor_relayed_address(&mut response, relay_addr);
+        self.append_xor_relayed_address(&mut response, relay_addr, &request.transaction_id);
 
         // XOR-MAPPED-ADDRESS
-        self.append_xor_mapped_address(&mut response, client_addr);
+        self.append_xor_mapped_address(&mut response, client_addr, &request.transaction_id);
 
         // LIFETIME
         self.append_lifetime(&mut response, lifetime);
@@ -897,8 +906,8 @@ impl TurnHandler {
         response.push((error as u16 % 100) as u8); // Number
         response.extend_from_slice(reason.as_bytes());
 
-        // Padding
-        while response.len() < 20 + padded_len {
+        // Padding (20 byte header + 4 byte attr header + padded value)
+        while response.len() < 20 + 4 + padded_len {
             response.push(0);
         }
 
@@ -909,7 +918,12 @@ impl TurnHandler {
     }
 
     /// Append XOR-MAPPED-ADDRESS attribute
-    fn append_xor_mapped_address(&self, buf: &mut Vec<u8>, addr: SocketAddr) {
+    fn append_xor_mapped_address(
+        &self,
+        buf: &mut Vec<u8>,
+        addr: SocketAddr,
+        transaction_id: &[u8; 12],
+    ) {
         // Attribute type: 0x0020
         buf.extend_from_slice(&[0x00, 0x20]);
 
@@ -940,22 +954,25 @@ impl TurnHandler {
                 buf.extend_from_slice(&xor_port.to_be_bytes());
 
                 // XOR address with magic cookie (4 bytes) + transaction ID (12 bytes)
-                // For mapped address we use zeros for transaction ID part
                 let addr_bytes = v6.ip().octets();
                 let magic = [0x21u8, 0x12, 0xa4, 0x42];
                 for i in 0..4 {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
-                // Remaining 12 bytes XOR with zeros (no transaction ID available here)
-                for byte in addr_bytes.iter().skip(4) {
-                    buf.push(*byte);
+                for i in 0..12 {
+                    buf.push(addr_bytes[4 + i] ^ transaction_id[i]);
                 }
             }
         }
     }
 
     /// Append XOR-RELAYED-ADDRESS attribute
-    fn append_xor_relayed_address(&self, buf: &mut Vec<u8>, addr: SocketAddr) {
+    fn append_xor_relayed_address(
+        &self,
+        buf: &mut Vec<u8>,
+        addr: SocketAddr,
+        transaction_id: &[u8; 12],
+    ) {
         // Attribute type: 0x0016
         buf.extend_from_slice(&[0x00, 0x16]);
 
@@ -987,8 +1004,8 @@ impl TurnHandler {
                 for i in 0..4 {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
-                for byte in addr_bytes.iter().skip(4) {
-                    buf.push(*byte);
+                for i in 0..12 {
+                    buf.push(addr_bytes[4 + i] ^ transaction_id[i]);
                 }
             }
         }
@@ -1026,8 +1043,8 @@ impl TurnHandler {
         response.push(1); // Number (401 % 100)
         response.extend_from_slice(reason.as_bytes());
 
-        // Padding for ERROR-CODE
-        while response.len() < 20 + padded_len {
+        // Padding for ERROR-CODE (20 byte header + 4 byte attr header + padded value)
+        while response.len() < 20 + 4 + padded_len {
             response.push(0);
         }
 
@@ -1108,7 +1125,7 @@ impl TurnHandler {
         packet.extend_from_slice(&txn_id);
 
         // XOR-PEER-ADDRESS attribute (0x0012)
-        self.append_xor_peer_address(&mut packet, peer_addr);
+        self.append_xor_peer_address(&mut packet, peer_addr, &txn_id);
 
         // DATA attribute (0x0013)
         packet.extend_from_slice(&[0x00, 0x13]);
@@ -1128,7 +1145,12 @@ impl TurnHandler {
     }
 
     /// Append XOR-PEER-ADDRESS attribute (0x0012)
-    fn append_xor_peer_address(&self, buf: &mut Vec<u8>, addr: SocketAddr) {
+    fn append_xor_peer_address(
+        &self,
+        buf: &mut Vec<u8>,
+        addr: SocketAddr,
+        transaction_id: &[u8; 12],
+    ) {
         buf.extend_from_slice(&[0x00, 0x12]); // Type
 
         match addr {
@@ -1159,8 +1181,8 @@ impl TurnHandler {
                 for i in 0..4 {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
-                for byte in addr_bytes.iter().skip(4) {
-                    buf.push(*byte);
+                for i in 0..12 {
+                    buf.push(addr_bytes[4 + i] ^ transaction_id[i]);
                 }
             }
         }

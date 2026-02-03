@@ -38,7 +38,11 @@ pub struct Server {
 impl Server {
     /// Create a new server with the given configuration
     pub async fn new(config: Config) -> Result<Self> {
-        let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+        // Bind to wildcard address matching the external IP's address family
+        let bind_addr = match config.external_ip {
+            std::net::IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], config.port)),
+            std::net::IpAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.port)),
+        };
         let socket = UdpSocket::bind(bind_addr).await?;
 
         info!("Bound to {}", bind_addr);
@@ -377,7 +381,7 @@ impl Server {
         packet.extend_from_slice(&txn_id);
 
         // XOR-PEER-ADDRESS attribute (0x0012)
-        self.append_xor_peer_address(&mut packet, peer_addr);
+        self.append_xor_peer_address(&mut packet, peer_addr, &txn_id);
 
         // DATA attribute (0x0013)
         packet.extend_from_slice(&[0x00, 0x13]);
@@ -397,7 +401,12 @@ impl Server {
     }
 
     /// Append XOR-PEER-ADDRESS attribute to buffer
-    fn append_xor_peer_address(&self, buf: &mut Vec<u8>, addr: SocketAddr) {
+    fn append_xor_peer_address(
+        &self,
+        buf: &mut Vec<u8>,
+        addr: SocketAddr,
+        transaction_id: &[u8; 12],
+    ) {
         buf.extend_from_slice(&[0x00, 0x12]); // Type
 
         match addr {
@@ -423,13 +432,14 @@ impl Server {
                 let xor_port = v6.port() ^ 0x2112;
                 buf.extend_from_slice(&xor_port.to_be_bytes());
 
+                // XOR address with magic cookie (4 bytes) + transaction ID (12 bytes)
                 let addr_bytes = v6.ip().octets();
                 let magic = [0x21u8, 0x12, 0xa4, 0x42];
                 for i in 0..4 {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
-                for byte in addr_bytes.iter().skip(4) {
-                    buf.push(*byte);
+                for i in 0..12 {
+                    buf.push(addr_bytes[4 + i] ^ transaction_id[i]);
                 }
             }
         }
