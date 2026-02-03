@@ -1,0 +1,363 @@
+//! Allocation lookup tables
+//!
+//! Multiple lookup paths for efficient packet routing:
+//! - Source address (fast path for established flows)
+//! - ICE username fragment
+//! - SSRC
+//! - TURN channel ID
+
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use dashmap::DashMap;
+use parking_lot::RwLock;
+
+/// Unique allocation identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AllocationId(u64);
+
+impl AllocationId {
+    fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl std::fmt::Display for AllocationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "alloc-{}", self.0)
+    }
+}
+
+/// TURN allocation state
+#[derive(Debug)]
+pub struct Allocation {
+    pub id: AllocationId,
+
+    /// Client's address (TURN control connection)
+    pub client_addr: SocketAddr,
+
+    /// Local ICE username fragment
+    pub local_ufrag: String,
+
+    /// Remote ICE username fragment (learned from binding requests)
+    pub remote_ufrag: Option<String>,
+
+    /// Permitted peer IP addresses
+    pub permissions: RwLock<HashSet<IpAddr>>,
+
+    /// Channel bindings: channel_id -> peer_addr
+    pub channels: DashMap<u16, SocketAddr>,
+
+    /// Reverse channel lookup: peer_addr -> channel_id
+    pub channels_reverse: DashMap<SocketAddr, u16>,
+
+    /// Known SSRCs associated with this allocation
+    pub ssrcs: RwLock<HashSet<u32>>,
+
+    /// Known peer addresses (learned from traffic)
+    pub known_peers: DashMap<SocketAddr, PeerInfo>,
+
+    /// Allocation expiry time
+    pub expires_at: RwLock<Instant>,
+
+    /// Last activity time
+    pub last_activity: RwLock<Instant>,
+
+    /// Username for authentication
+    pub username: String,
+}
+
+/// Information about a known peer
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    /// When we last saw traffic from this peer
+    pub last_seen: Instant,
+
+    /// SSRCs observed from this peer
+    pub ssrcs: HashSet<u32>,
+}
+
+impl Allocation {
+    /// Create a new allocation
+    pub fn new(client_addr: SocketAddr, username: String, lifetime_secs: u32) -> Self {
+        let now = Instant::now();
+        Self {
+            id: AllocationId::new(),
+            client_addr,
+            local_ufrag: generate_ufrag(),
+            remote_ufrag: None,
+            permissions: RwLock::new(HashSet::new()),
+            channels: DashMap::new(),
+            channels_reverse: DashMap::new(),
+            ssrcs: RwLock::new(HashSet::new()),
+            known_peers: DashMap::new(),
+            expires_at: RwLock::new(now + std::time::Duration::from_secs(lifetime_secs as u64)),
+            last_activity: RwLock::new(now),
+            username,
+        }
+    }
+
+    /// Check if a peer IP is permitted
+    pub fn is_permitted(&self, peer_ip: IpAddr) -> bool {
+        self.permissions.read().contains(&peer_ip)
+    }
+
+    /// Add a permission for a peer IP
+    pub fn add_permission(&self, peer_ip: IpAddr) {
+        self.permissions.write().insert(peer_ip);
+    }
+
+    /// Bind a channel to a peer address
+    pub fn bind_channel(&self, channel: u16, peer_addr: SocketAddr) {
+        self.channels.insert(channel, peer_addr);
+        self.channels_reverse.insert(peer_addr, channel);
+    }
+
+    /// Get channel for a peer address
+    pub fn channel_for_peer(&self, peer_addr: SocketAddr) -> Option<u16> {
+        self.channels_reverse.get(&peer_addr).map(|r| *r)
+    }
+
+    /// Get peer address for a channel
+    pub fn peer_for_channel(&self, channel: u16) -> Option<SocketAddr> {
+        self.channels.get(&channel).map(|r| *r)
+    }
+
+    /// Register an SSRC with this allocation
+    pub fn register_ssrc(&self, ssrc: u32) {
+        self.ssrcs.write().insert(ssrc);
+    }
+
+    /// Update last activity time
+    pub fn touch(&self) {
+        *self.last_activity.write() = Instant::now();
+    }
+
+    /// Check if allocation has expired
+    pub fn is_expired(&self) -> bool {
+        Instant::now() > *self.expires_at.read()
+    }
+
+    /// Refresh the allocation lifetime
+    pub fn refresh(&self, lifetime_secs: u32) {
+        *self.expires_at.write() = Instant::now() + std::time::Duration::from_secs(lifetime_secs as u64);
+    }
+}
+
+/// Multi-index lookup table for allocations
+pub struct AllocationTable {
+    /// All allocations by ID
+    allocations: DashMap<AllocationId, Allocation>,
+
+    /// Lookup by client address (primary key)
+    by_client: DashMap<SocketAddr, AllocationId>,
+
+    /// Lookup by local ufrag
+    by_ufrag: DashMap<String, AllocationId>,
+
+    /// Lookup by SSRC (may have multiple allocations per SSRC in rare cases)
+    by_ssrc: DashMap<u32, AllocationId>,
+
+    /// Lookup by permitted peer IP -> list of allocations
+    /// (multiple clients may permit the same peer)
+    by_permission: DashMap<IpAddr, Vec<AllocationId>>,
+
+    /// Lookup by (peer_ip, peer_port) for fast path
+    by_peer_tuple: DashMap<SocketAddr, AllocationId>,
+}
+
+impl AllocationTable {
+    /// Create a new empty table
+    pub fn new() -> Self {
+        Self {
+            allocations: DashMap::new(),
+            by_client: DashMap::new(),
+            by_ufrag: DashMap::new(),
+            by_ssrc: DashMap::new(),
+            by_permission: DashMap::new(),
+            by_peer_tuple: DashMap::new(),
+        }
+    }
+
+    /// Create a new allocation
+    pub fn create(
+        &self,
+        client_addr: SocketAddr,
+        username: String,
+        lifetime_secs: u32,
+    ) -> AllocationId {
+        let alloc = Allocation::new(client_addr, username, lifetime_secs);
+        let id = alloc.id;
+        let ufrag = alloc.local_ufrag.clone();
+
+        self.by_client.insert(client_addr, id);
+        self.by_ufrag.insert(ufrag, id);
+        self.allocations.insert(id, alloc);
+
+        id
+    }
+
+    /// Get allocation by ID
+    pub fn get(&self, id: AllocationId) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
+        self.allocations.get(&id)
+    }
+
+    /// Get allocation by client address
+    pub fn get_by_client(&self, addr: SocketAddr) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
+        let id = self.by_client.get(&addr)?;
+        self.allocations.get(&*id)
+    }
+
+    /// Lookup allocation ID by source address (fast path)
+    pub fn lookup_by_source(&self, addr: SocketAddr) -> Option<AllocationId> {
+        // First try peer tuple (for relay traffic from peers)
+        if let Some(id) = self.by_peer_tuple.get(&addr) {
+            return Some(*id);
+        }
+
+        // Then try client address (for TURN control traffic)
+        self.by_client.get(&addr).map(|r| *r)
+    }
+
+    /// Lookup by ICE ufrag
+    pub fn lookup_by_ufrag(&self, ufrag: &str) -> Option<AllocationId> {
+        self.by_ufrag.get(ufrag).map(|r| *r)
+    }
+
+    /// Lookup by SSRC
+    pub fn lookup_by_ssrc(&self, ssrc: u32) -> Option<AllocationId> {
+        self.by_ssrc.get(&ssrc).map(|r| *r)
+    }
+
+    /// Lookup by peer IP (may return multiple allocations)
+    pub fn lookup_by_peer_ip(&self, ip: IpAddr) -> Vec<AllocationId> {
+        self.by_permission
+            .get(&ip)
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// Add permission and update index
+    pub fn add_permission(&self, id: AllocationId, peer_ip: IpAddr) {
+        if let Some(alloc) = self.allocations.get(&id) {
+            alloc.add_permission(peer_ip);
+        }
+
+        self.by_permission
+            .entry(peer_ip)
+            .or_default()
+            .push(id);
+    }
+
+    /// Register SSRC and update index
+    pub fn register_ssrc(&self, id: AllocationId, ssrc: u32) {
+        if let Some(alloc) = self.allocations.get(&id) {
+            alloc.register_ssrc(ssrc);
+        }
+        self.by_ssrc.insert(ssrc, id);
+    }
+
+    /// Register peer tuple for fast path lookup
+    pub fn register_peer_tuple(&self, id: AllocationId, peer_addr: SocketAddr) {
+        self.by_peer_tuple.insert(peer_addr, id);
+    }
+
+    /// Remove an allocation
+    pub fn remove(&self, id: AllocationId) {
+        if let Some((_, alloc)) = self.allocations.remove(&id) {
+            self.by_client.remove(&alloc.client_addr);
+            self.by_ufrag.remove(&alloc.local_ufrag);
+
+            for ssrc in alloc.ssrcs.read().iter() {
+                self.by_ssrc.remove(ssrc);
+            }
+
+            for peer_ip in alloc.permissions.read().iter() {
+                if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
+                    ids.retain(|&i| i != id);
+                }
+            }
+
+            for entry in alloc.known_peers.iter() {
+                self.by_peer_tuple.remove(entry.key());
+            }
+        }
+    }
+
+    /// Remove expired allocations
+    pub fn cleanup_expired(&self) -> usize {
+        let expired: Vec<_> = self
+            .allocations
+            .iter()
+            .filter(|r| r.is_expired())
+            .map(|r| r.id)
+            .collect();
+
+        let count = expired.len();
+        for id in expired {
+            self.remove(id);
+        }
+        count
+    }
+}
+
+impl Default for AllocationTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Generate a random ICE username fragment
+fn generate_ufrag() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:x}", timestamp & 0xFFFFFFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn test_create_allocation() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+
+        let id = table.create(client, "testuser".to_string(), 600);
+
+        assert!(table.get(id).is_some());
+        assert!(table.get_by_client(client).is_some());
+    }
+
+    #[test]
+    fn test_permission_lookup() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let id = table.create(client, "testuser".to_string(), 600);
+        table.add_permission(id, peer_ip);
+
+        let found = table.lookup_by_peer_ip(peer_ip);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0], id);
+    }
+
+    #[test]
+    fn test_ssrc_lookup() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+
+        let id = table.create(client, "testuser".to_string(), 600);
+        table.register_ssrc(id, 0x12345678);
+
+        assert_eq!(table.lookup_by_ssrc(0x12345678), Some(id));
+    }
+}

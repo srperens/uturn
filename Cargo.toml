@@ -1,0 +1,54 @@
+[package]
+name = "uturn"
+version = "0.1.0"
+edition = "2021"
+authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
+description = "A single-port TURN relay server for WebRTC"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/srperens/uturn"
+keywords = ["webrtc", "turn", "stun", "relay", "nat-traversal"]
+categories = ["network-programming", "multimedia"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# STUN/TURN protocol
+stun_codec = "0.3"
+bytecodec = "0.4"
+
+# Networking
+bytes = "1"
+socket2 = "0.5"
+
+# Data structures
+dashmap = "6"
+parking_lot = "0.12"
+
+# Crypto (for TURN auth)
+hmac = "0.12"
+sha1 = "0.10"
+md5 = "0.7"
+crc = "3"
+
+# Config & CLI
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+webrtc-util = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
