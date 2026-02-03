@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::demux::StunInfo;
-use crate::lookup::AllocationTable;
+use crate::lookup::{AllocationTable, RateLimitError, RateLimiter};
 
 use super::auth::TurnAuth;
 use super::message::TurnErrorCode;
@@ -18,14 +18,20 @@ use super::message::TurnErrorCode;
 pub struct TurnHandler {
     config: Arc<Config>,
     allocations: Arc<AllocationTable>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl TurnHandler {
     /// Create a new handler
-    pub fn new(config: Arc<Config>, allocations: Arc<AllocationTable>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        allocations: Arc<AllocationTable>,
+        rate_limiter: Arc<RateLimiter>,
+    ) -> Self {
         Self {
             config,
             allocations,
+            rate_limiter,
         }
     }
 
@@ -176,6 +182,18 @@ impl TurnHandler {
             return Ok(());
         }
 
+        // Check rate limits and allocation quota before processing new allocation
+        if let Err(e) = self.rate_limiter.check_allocation_request(src_addr.ip()) {
+            warn!("Allocate request rejected for {}: {}", src_addr, e);
+            let error_code = match e {
+                RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
+                RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
+            };
+            let response = self.build_error_response(msg, error_code);
+            socket.send_to(&response, src_addr).await?;
+            return Ok(());
+        }
+
         // Authentication check if credentials are configured
         if !self.config.credentials.is_empty() {
             // Check if MESSAGE-INTEGRITY is present
@@ -207,6 +225,21 @@ impl TurnHandler {
                     return Ok(());
                 }
             };
+
+            // Validate nonce freshness
+            if let Some(ref nonce) = msg.nonce {
+                if !TurnAuth::validate_nonce(nonce, self.config.nonce_lifetime_secs) {
+                    warn!("Stale nonce from {}", src_addr);
+                    let response = self.build_error_response(msg, TurnErrorCode::StaleNonce);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            } else {
+                warn!("Missing nonce from {}", src_addr);
+                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
 
             // Validate MESSAGE-INTEGRITY
             let realm = msg.realm.as_deref().unwrap_or(&self.config.realm);
@@ -242,6 +275,7 @@ impl TurnHandler {
             let alloc_id = self
                 .allocations
                 .create(src_addr, username.to_string(), lifetime);
+            self.rate_limiter.record_allocation(src_addr.ip());
 
             info!(
                 "Created allocation {} for {} (user: {})",
@@ -264,6 +298,7 @@ impl TurnHandler {
             let alloc_id = self
                 .allocations
                 .create(src_addr, username.to_string(), lifetime);
+            self.rate_limiter.record_allocation(src_addr.ip());
 
             info!(
                 "Created allocation {} for {} (user: {})",
@@ -312,6 +347,7 @@ impl TurnHandler {
             let alloc_id = alloc.id;
             drop(alloc); // Release the ref before removing
             self.allocations.remove(alloc_id);
+            self.rate_limiter.record_deallocation(src_addr.ip());
             info!(
                 "Deleted allocation {} for {} (lifetime=0)",
                 alloc_id, src_addr

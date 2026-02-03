@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::Config;
 use crate::demux::{Demuxer, PacketType};
-use crate::lookup::AllocationTable;
+use crate::lookup::{AllocationTable, RateLimiter};
 use crate::relay::RelayEngine;
 use crate::turn::TurnHandler;
 
@@ -30,6 +31,8 @@ pub struct Server {
     allocations: Arc<AllocationTable>,
     turn_handler: Arc<TurnHandler>,
     relay_engine: Arc<RelayEngine>,
+    rate_limiter: Arc<RateLimiter>,
+    task_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl Server {
@@ -40,11 +43,26 @@ impl Server {
 
         info!("Bound to {}", bind_addr);
 
+        let rate_limiter = Arc::new(RateLimiter::new(
+            config.rate_limit_per_minute,
+            config.max_allocations_per_ip,
+        ));
+
+        let task_semaphore = if config.max_concurrent_tasks > 0 {
+            Some(Arc::new(Semaphore::new(config.max_concurrent_tasks as usize)))
+        } else {
+            None
+        };
+
         let config = Arc::new(config);
         let socket = Arc::new(socket);
         let allocations = Arc::new(AllocationTable::new());
 
-        let turn_handler = Arc::new(TurnHandler::new(config.clone(), allocations.clone()));
+        let turn_handler = Arc::new(TurnHandler::new(
+            config.clone(),
+            allocations.clone(),
+            rate_limiter.clone(),
+        ));
 
         let relay_engine = Arc::new(RelayEngine::new(
             config.clone(),
@@ -58,6 +76,8 @@ impl Server {
             allocations,
             turn_handler,
             relay_engine,
+            rate_limiter,
+            task_semaphore,
         })
     }
 
@@ -111,9 +131,26 @@ impl Server {
                 allocations: self.allocations.clone(),
                 turn_handler: self.turn_handler.clone(),
                 relay_engine: self.relay_engine.clone(),
+                rate_limiter: self.rate_limiter.clone(),
+                task_semaphore: self.task_semaphore.clone(),
+            };
+
+            // Acquire semaphore permit for backpressure (if configured)
+            let permit = match &self.task_semaphore {
+                Some(sem) => match sem.clone().try_acquire_owned() {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        // At capacity - drop packet to prevent unbounded growth
+                        warn!("Task queue at capacity, dropping packet from {}", src_addr);
+                        continue;
+                    }
+                },
+                None => None,
             };
 
             tokio::spawn(async move {
+                // Hold permit until task completes
+                let _permit = permit;
                 if let Err(e) = server.handle_packet(&data, src_addr).await {
                     warn!("Error handling packet from {}: {}", src_addr, e);
                 }

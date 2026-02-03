@@ -425,14 +425,20 @@ impl Default for AllocationTable {
     }
 }
 
-/// Generate a random ICE username fragment
+/// Generate a cryptographically secure ICE username fragment
 fn generate_ufrag() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:x}", timestamp & 0xFFFFFFFF)
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 12] = rng.gen();
+    // Base64-like encoding using alphanumeric chars (ICE-safe)
+    bytes
+        .iter()
+        .map(|b| {
+            let idx = (b % 62) as usize;
+            const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            CHARS[idx] as char
+        })
+        .collect()
 }
 
 #[cfg(test)]

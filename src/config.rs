@@ -19,6 +19,18 @@ pub struct Config {
 
     /// Static credentials (username, password)
     pub credentials: Vec<(String, String)>,
+
+    /// Maximum allocations per IP address (0 = unlimited)
+    pub max_allocations_per_ip: u32,
+
+    /// Rate limit: max allocation requests per IP per minute (0 = unlimited)
+    pub rate_limit_per_minute: u32,
+
+    /// Maximum concurrent packet handling tasks (0 = unlimited)
+    pub max_concurrent_tasks: u32,
+
+    /// Nonce validity period in seconds
+    pub nonce_lifetime_secs: u64,
 }
 
 impl Config {
@@ -29,6 +41,10 @@ impl Config {
             external_ip,
             realm: "uturn".to_string(),
             credentials: Vec::new(),
+            max_allocations_per_ip: 10,
+            rate_limit_per_minute: 30,
+            max_concurrent_tasks: 1000,
+            nonce_lifetime_secs: 3600,
         }
     }
 

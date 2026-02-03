@@ -31,6 +31,22 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "UTURN_LOG_LEVEL", default_value = "info")]
     log_level: Level,
+
+    /// Maximum allocations per IP address (0 = unlimited)
+    #[arg(long, env = "UTURN_MAX_ALLOC_PER_IP", default_value = "10")]
+    max_allocations_per_ip: u32,
+
+    /// Rate limit: max allocation requests per IP per minute (0 = unlimited)
+    #[arg(long, env = "UTURN_RATE_LIMIT", default_value = "30")]
+    rate_limit_per_minute: u32,
+
+    /// Maximum concurrent packet handling tasks (0 = unlimited)
+    #[arg(long, env = "UTURN_MAX_TASKS", default_value = "1000")]
+    max_concurrent_tasks: u32,
+
+    /// Nonce validity period in seconds
+    #[arg(long, env = "UTURN_NONCE_LIFETIME", default_value = "3600")]
+    nonce_lifetime_secs: u64,
 }
 
 #[tokio::main]
@@ -63,6 +79,10 @@ async fn main() -> Result<()> {
         external_ip: args.external_ip,
         realm: args.realm,
         credentials,
+        max_allocations_per_ip: args.max_allocations_per_ip,
+        rate_limit_per_minute: args.rate_limit_per_minute,
+        max_concurrent_tasks: args.max_concurrent_tasks,
+        nonce_lifetime_secs: args.nonce_lifetime_secs,
     };
 
     info!(

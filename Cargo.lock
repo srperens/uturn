@@ -973,6 +973,7 @@ dependencies = [
  "hmac",
  "md5",
  "parking_lot",
+ "rand",
  "serde",
  "sha1",
  "socket2 0.5.10",
