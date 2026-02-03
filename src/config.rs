@@ -41,8 +41,8 @@ impl Config {
             external_ip,
             realm: "uturn".to_string(),
             credentials: Vec::new(),
-            max_allocations_per_ip: 10,
-            rate_limit_per_minute: 30,
+            max_allocations_per_ip: 100,
+            rate_limit_per_minute: 120,
             max_concurrent_tasks: 1000,
             nonce_lifetime_secs: 3600,
         }

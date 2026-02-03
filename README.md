@@ -61,6 +61,10 @@ docker run -p 3478:3478/udp \
 | `--realm` | `UTURN_REALM` | uturn | TURN realm for authentication |
 | `--user` | `UTURN_USERS` | - | Credentials in `user:pass` format (repeatable) |
 | `--log-level` | `UTURN_LOG_LEVEL` | info | Log level: trace, debug, info, warn, error |
+| `--max-allocations-per-ip` | `UTURN_MAX_ALLOC_PER_IP` | 100 | Max concurrent allocations per IP (0 = unlimited) |
+| `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 120 | Max allocation requests per IP per minute (0 = unlimited) |
+| `--max-concurrent-tasks` | `UTURN_MAX_TASKS` | 1000 | Max concurrent packet handlers (0 = unlimited) |
+| `--nonce-lifetime-secs` | `UTURN_NONCE_LIFETIME` | 3600 | Nonce validity period in seconds |
 
 ## Testing
 

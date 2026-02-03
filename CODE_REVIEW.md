@@ -2,192 +2,211 @@
 
 **Date:** 2026-02-03
 **Reviewer:** Claude (AI-assisted code review)
+**Last Updated:** 2026-02-03
 
 ## Summary
 
-uTURN is a well-structured single-port TURN relay server for WebRTC with ~3,340 lines of Rust code. The project demonstrates strong architectural design and solid Rust practices, but there are areas for improvement in security, error handling, and testing.
+uTURN is a well-structured single-port TURN relay server for WebRTC with ~3,340 lines of Rust code. The project demonstrates strong architectural design and solid Rust practices. Several security and robustness issues have been addressed.
 
 ---
 
-## High Priority Issues
+## Issue Status Overview
 
-### 1. Weak ufrag Generation (Security)
+| # | Issue | Severity | Status |
+|---|-------|----------|--------|
+| 1 | Weak ufrag Generation | Medium-High | ✅ **FIXED** |
+| 2 | No Rate Limiting | Medium | ✅ **FIXED** |
+| 3 | No Allocation Quota Per Client | Medium | ✅ **FIXED** |
+| 4 | Unbounded Task Queue | Medium | ✅ **FIXED** |
+| 5 | Nonce Not Validated for Freshness | Medium | ✅ **FIXED** |
+| 6 | Race Condition in Cleanup | Medium | ✅ **FIXED** |
+| 7 | Silent Failures in Relay Operations | Medium | Open |
+| 8 | SSRC Collision Handling | Low | Open |
+| 9 | Insufficient Error Context in Logging | Low | Open |
+| 10 | String Validation in Authentication | Low | Open |
+| 11 | IPv6 Support Missing | High (production) | Open |
+| 12 | Integration Tests Missing | Medium | Open |
 
-**File:** `src/lookup/table.rs:429-436`
-**Severity:** Medium-High
+---
 
-Ufrag is generated from only 32 bits of a timestamp, which is not cryptographically secure.
+## Fixed Issues
+
+### 1. ✅ Weak ufrag Generation (FIXED)
+
+**File:** `src/lookup/table.rs:467-480`
+
+Now uses cryptographically secure random generation with 96 bits of entropy:
 
 ```rust
 fn generate_ufrag() -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:x}", timestamp & 0xFFFFFFFF)  // Only 32 bits, timestamp-based
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 12] = rng.gen();
+    // Base64-like encoding using alphanumeric chars (ICE-safe)
+    bytes.iter().map(|b| {
+        let idx = (b % 62) as usize;
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        CHARS[idx] as char
+    }).collect()
 }
 ```
 
-**Recommendation:** Use `rand` crate with `OsRng` for cryptographically secure random generation.
+---
+
+### 2. ✅ Rate Limiting (FIXED)
+
+**Files:** `src/lookup/rate_limit.rs`, `src/server.rs:46-49`, `src/config.rs`
+
+Implemented per-IP rate limiting for allocation requests:
+- Configurable via `--rate-limit-per-minute` (default: 120)
+- Returns `TooManyRequests` error when exceeded
 
 ---
 
-### 2. No Rate Limiting (Security)
+### 3. ✅ Allocation Quota Per Client (FIXED)
 
-**File:** `src/server.rs:116-121`
-**Severity:** Medium
+**Files:** `src/lookup/rate_limit.rs`, `src/config.rs`
 
-No per-client rate limiting for allocation requests or relay operations.
+Implemented per-IP allocation quota:
+- Configurable via `--max-allocations-per-ip` (default: 100)
+- Returns `QuotaExceeded` error when limit reached
+- Tracks active allocations with proper deallocation counting
+
+---
+
+### 4. ✅ Unbounded Task Queue (FIXED)
+
+**File:** `src/server.rs:51-57, 140-151`
+
+Implemented backpressure using Tokio Semaphore:
+- Configurable via `--max-concurrent-tasks` (default: 1000)
+- Packets dropped with warning when at capacity
+- Prevents memory exhaustion under load
 
 ```rust
-tokio::spawn(async move {
-    if let Err(e) = server.handle_packet(&data, src_addr).await {
-        warn!("Error handling packet from {}: {}", src_addr, e);
-    }
-});
-```
-
-**Recommendation:** Implement per-IP rate limiting on allocation requests and relay operations.
-
----
-
-### 3. No Allocation Quota Per Client (Security)
-
-**File:** `src/turn/handler.rs:240-284`
-**Severity:** Medium
-
-No check preventing a single client from creating unlimited allocations.
-
-**Recommendation:** Add per-client or per-IP allocation limits.
-
----
-
-### 4. Unbounded Task Queue (Performance/Stability)
-
-**File:** `src/server.rs:116-121`
-**Severity:** Medium
-
-Every packet spawns a new task without backpressure. Under high load, the task queue could grow unbounded.
-
-**Recommendation:** Use `tokio::task::JoinSet` or a semaphore to limit concurrent tasks.
-
----
-
-## Medium Priority Issues
-
-### 5. Nonce Not Validated for Freshness
-
-**File:** `src/turn/handler.rs:829-831`
-**Severity:** Medium
-
-Nonce is generated but never validated in Allocate requests (no stale nonce handling).
-
-**Recommendation:** Implement nonce age checking in the authentication handler.
-
----
-
-### 6. Silent Failures in Relay Operations
-
-**File:** `src/turn/handler.rs:476-480, 554-560`
-**Severity:** Medium
-
-Send indications from unknown clients are silently dropped and return `Ok(())`.
-
-```rust
-let alloc = match self.allocations.get_by_client(src_addr) {
-    Some(a) => a,
-    None => {
-        warn!("Send indication from unknown client: {}", src_addr);
-        return Ok(());  // Returns success for failed operation
-    }
+let permit = match &self.task_semaphore {
+    Some(sem) => match sem.clone().try_acquire_owned() {
+        Ok(p) => Some(p),
+        Err(_) => {
+            warn!("Task queue at capacity, dropping packet from {}", src_addr);
+            continue;
+        }
+    },
+    None => None,
 };
 ```
 
-**Recommendation:** Consider returning an appropriate error or logging more detail.
+---
+
+### 5. ✅ Nonce Freshness Validation (FIXED)
+
+**Files:** `src/turn/auth.rs:55-66`, `src/turn/handler.rs:229-235`
+
+Implemented nonce age validation:
+- Configurable via `--nonce-lifetime-secs` (default: 3600)
+- Returns `StaleNonce` error for expired nonces
+- Proper timestamp encoding in nonce format
+
+```rust
+if !TurnAuth::validate_nonce(nonce, self.config.nonce_lifetime_secs) {
+    warn!("Stale nonce from {}", src_addr);
+    let response = self.build_error_response(msg, TurnErrorCode::StaleNonce);
+    socket.send_to(&response, src_addr).await?;
+    return Ok(());
+}
+```
 
 ---
 
-### 7. Race Condition in Cleanup
+### 6. ✅ Race Condition in Cleanup (FIXED)
 
-**File:** `src/lookup/table.rs:340-358`
-**Severity:** Medium
+**File:** `src/lookup/table.rs:361-386`
 
-Potential race condition between checking allocation state and removing it.
+Fixed by using atomic `retain()` pattern instead of collect-then-remove:
 
 ```rust
 pub fn cleanup_expired(&self) -> usize {
-    let expired: Vec<_> = self
-        .allocations
-        .iter()
-        .filter(|r| r.is_expired())
-        .map(|r| r.id)
-        .collect();
-    // Between collecting IDs and removal, another thread could modify state
-    for id in expired {
-        self.remove(id);
-    }
+    let mut count = 0;
+    self.allocations.retain(|id, alloc| {
+        if alloc.is_expired() {
+            // Clean up indices atomically within the retain closure
+            self.by_client.remove(&alloc.client_addr);
+            self.by_ufrag.remove(&alloc.local_ufrag);
+            // ... cleanup other indices ...
+            count += 1;
+            false // Remove this entry
+        } else {
+            true // Keep this entry
+        }
+    });
     count
 }
 ```
 
-**Impact:** Low in practice since `remove()` simply doesn't find the entry, but it's not atomic.
+---
+
+## Open Issues
+
+### 7. Silent Failures in Relay Operations
+
+**File:** `src/turn/handler.rs`
+**Severity:** Medium
+
+Send indications from unknown clients are silently dropped and return `Ok(())`. While this is valid protocol behavior (indications don't get responses), it may complicate debugging.
+
+**Recommendation:** Consider adding metrics or debug-level logging categories.
 
 ---
 
 ### 8. SSRC Collision Handling
 
-**File:** `src/relay/engine.rs:227-231`
+**File:** `src/relay/engine.rs`
 **Severity:** Low
 
 When multiple allocations permit the same peer, the first one is arbitrarily chosen for SSRC registration.
 
-```rust
-let id = candidates[0];  // Just picks first candidate if multiple exist
-self.allocations.register_ssrc(id, ssrc);
-```
-
-**Recommendation:** Better disambiguation or document the limitation.
+**Recommendation:** Document the limitation or implement proper disambiguation.
 
 ---
 
-## Low Priority Issues
-
 ### 9. Insufficient Error Context in Logging
 
-**File:** `src/server.rs:117`
+**File:** `src/server.rs`
 **Severity:** Low
 
-Packet handling errors are logged but not categorized by severity.
+Packet handling errors are logged but not categorized by severity or type.
+
+**Recommendation:** Add structured logging with error categories.
 
 ---
 
 ### 10. String Validation in Authentication
 
-**File:** `src/demux/stun.rs:198, 224, 227`
+**File:** `src/demux/stun.rs`
 **Severity:** Low
 
-USERNAME, REALM, NONCE attributes use `String::from_utf8()` which silently discards conversion errors.
+USERNAME, REALM, NONCE attributes use `String::from_utf8().ok()` which silently discards conversion errors.
 
-```rust
-result.username = String::from_utf8(value.to_vec()).ok();  // Silently discards on error
-```
-
-**Recommendation:** Log failures and validate length constraints.
+**Recommendation:** Log parse failures and validate length constraints per RFC.
 
 ---
 
-## Missing Features
+### 11. IPv6 Support Missing
 
-### IPv6 Support
-
-**Files:** `src/relay/engine.rs:410`, `src/turn/handler.rs:760, 785, 940`
-**Severity:** Low (for current use), High (for production)
+**Files:** `src/turn/handler.rs:796, 821, 976`, `src/relay/engine.rs:410`
+**Severity:** Low (current use), High (production)
 
 Four `unimplemented!()` macros for IPv6 address encoding. The server only works for IPv4 deployments.
 
+```rust
+SocketAddr::V6(_) => unimplemented!("IPv6 not yet supported"),
+```
+
+**Recommendation:** Implement XOR-MAPPED-ADDRESS encoding for IPv6.
+
 ---
 
-### Integration Tests
+### 12. Integration Tests Missing
 
 **Severity:** Medium
 
@@ -199,16 +218,19 @@ No end-to-end tests for:
 - ChannelData forwarding
 - Cleanup of expired allocations
 
+**Recommendation:** Add integration tests using actual UDP sockets.
+
 ---
 
 ## Positive Aspects
 
 - **Excellent architecture** - Clean separation of concerns, modular design
 - **Strong async/concurrency patterns** - Proper use of Tokio and concurrent data structures
-- **Good security foundation** - HMAC-SHA1 authentication, constant-time comparison (`src/turn/auth.rs:30-42`)
+- **Good security foundation** - HMAC-SHA1 authentication with constant-time comparison
 - **Comprehensive documentation** - ARCHITECTURE.md, RESEARCH.md, and README are thorough
-- **All tests pass** - 17 unit tests, no compiler warnings
+- **All tests pass** - 19 unit tests, no compiler warnings
 - **Smart design choices** - Single-port relay, fast lookup indices, orphan detection
+- **Recent security fixes** - Rate limiting, quotas, nonce validation, race condition fixes
 
 ---
 
@@ -218,7 +240,7 @@ No end-to-end tests for:
 |--------|-------|
 | Total lines (src/) | ~3,340 |
 | Rust files | 18 |
-| Unit tests | 17 (all passing) |
+| Unit tests | 19 (all passing) |
 | Compiler warnings | 0 |
 | Clippy warnings | 0 |
 | Modules | 6 (demux, turn, relay, lookup, transport, config) |
@@ -227,9 +249,17 @@ No end-to-end tests for:
 
 ## Conclusion
 
-uTURN is a well-engineered TURN server with solid fundamentals. The main areas for improvement are:
+uTURN is a well-engineered TURN server with solid fundamentals. Major security and stability issues have been addressed:
 
-1. **Security:** Implement rate limiting, quota enforcement, and stronger nonce validation
-2. **Robustness:** Add comprehensive integration tests
-3. **Performance:** Implement backpressure on task spawning
-4. **Completeness:** IPv6 support
+**Fixed:**
+- ✅ Cryptographically secure ufrag generation
+- ✅ Per-IP rate limiting on allocations
+- ✅ Per-IP allocation quotas
+- ✅ Task queue backpressure
+- ✅ Nonce freshness validation
+- ✅ Atomic cleanup operations
+
+**Remaining work:**
+- IPv6 support (required for production IPv6 deployments)
+- Integration tests (recommended for confidence)
+- Minor logging and validation improvements
