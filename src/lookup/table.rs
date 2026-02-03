@@ -246,21 +246,51 @@ impl AllocationTable {
         }
     }
 
-    /// Create a new allocation
+    /// Create a new allocation atomically, or return existing allocation ID
+    ///
+    /// This prevents race conditions where concurrent Allocate requests from
+    /// the same client could create multiple allocations.
+    ///
+    /// Returns (allocation_id, created) where created is true if new, false if existing.
+    pub fn create_or_get(
+        &self,
+        client_addr: SocketAddr,
+        username: String,
+        lifetime_secs: u32,
+    ) -> (AllocationId, bool) {
+        use dashmap::mapref::entry::Entry;
+
+        // Use entry API for atomic check-and-insert
+        match self.by_client.entry(client_addr) {
+            Entry::Occupied(entry) => {
+                // Allocation already exists for this client
+                (*entry.get(), false)
+            }
+            Entry::Vacant(entry) => {
+                // No allocation exists - create one atomically
+                let alloc = Allocation::new(client_addr, username, lifetime_secs);
+                let id = alloc.id;
+                let ufrag = alloc.local_ufrag.clone();
+
+                entry.insert(id);
+                self.by_ufrag.insert(ufrag, id);
+                self.allocations.insert(id, alloc);
+
+                (id, true)
+            }
+        }
+    }
+
+    /// Create a new allocation (non-atomic, for backward compatibility)
+    ///
+    /// Prefer `create_or_get` for new code to avoid race conditions.
     pub fn create(
         &self,
         client_addr: SocketAddr,
         username: String,
         lifetime_secs: u32,
     ) -> AllocationId {
-        let alloc = Allocation::new(client_addr, username, lifetime_secs);
-        let id = alloc.id;
-        let ufrag = alloc.local_ufrag.clone();
-
-        self.by_client.insert(client_addr, id);
-        self.by_ufrag.insert(ufrag, id);
-        self.allocations.insert(id, alloc);
-
+        let (id, _created) = self.create_or_get(client_addr, username, lifetime_secs);
         id
     }
 

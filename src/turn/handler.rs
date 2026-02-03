@@ -93,9 +93,8 @@ impl TurnHandler {
                 self.config.nonce_lifetime_secs,
                 &self.config.nonce_secret,
             ) {
-                return AuthResult::Failed(
-                    self.build_error_response(msg, TurnErrorCode::StaleNonce),
-                );
+                // 438 Stale Nonce must include REALM and fresh NONCE per RFC 5389
+                return AuthResult::Failed(self.build_stale_nonce_response(msg));
             }
         } else {
             return AuthResult::Failed(self.build_error_response(msg, TurnErrorCode::BadRequest));
@@ -357,7 +356,8 @@ impl TurnHandler {
                 ) {
                     warn!("Stale nonce from {}", src_addr);
                     self.rate_limiter.cancel_reservation(src_addr.ip());
-                    let response = self.build_error_response(msg, TurnErrorCode::StaleNonce);
+                    // 438 Stale Nonce must include REALM and fresh NONCE per RFC 5389
+                    let response = self.build_stale_nonce_response(msg);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
                 }
@@ -414,19 +414,35 @@ impl TurnHandler {
                 return Ok(());
             }
 
-            // Valid credentials - create allocation
-            // Note: rate limiter slot was already reserved in check_allocation_request
+            // Valid credentials - create allocation atomically
             let lifetime = 60;
-            let alloc_id = self
+            let (alloc_id, created) =
+                self.allocations
+                    .create_or_get(src_addr, username.to_string(), lifetime);
+
+            if !created {
+                // Concurrent request won the race - treat as retransmission
+                // Cancel rate limiter reservation since we didn't create a new allocation
+                debug!(
+                    "Concurrent allocation created for {} - treating as retransmission",
+                    src_addr
+                );
+                self.rate_limiter.cancel_reservation(src_addr.ip());
+            } else {
+                info!(
+                    "Created allocation {} for {} (user: {})",
+                    alloc_id, src_addr, username
+                );
+            }
+
+            // Get actual lifetime from allocation (may be different if existing)
+            let actual_lifetime = self
                 .allocations
-                .create(src_addr, username.to_string(), lifetime);
+                .get(alloc_id)
+                .map(|a| a.remaining_lifetime())
+                .unwrap_or(lifetime);
 
-            info!(
-                "Created allocation {} for {} (user: {})",
-                alloc_id, src_addr, username
-            );
-
-            let response = self.build_allocate_response(msg, src_addr, lifetime, Some(&key));
+            let response = self.build_allocate_response(msg, src_addr, actual_lifetime, Some(&key));
             debug!(
                 "Sending Allocate response ({} bytes) to {}: {:02x?}",
                 response.len(),
@@ -438,18 +454,34 @@ impl TurnHandler {
             // No authentication configured - anonymous access
             let username = msg.username.as_deref().unwrap_or("anonymous");
 
-            // Note: rate limiter slot was already reserved in check_allocation_request
+            // Create allocation atomically
             let lifetime = 60;
-            let alloc_id = self
+            let (alloc_id, created) =
+                self.allocations
+                    .create_or_get(src_addr, username.to_string(), lifetime);
+
+            if !created {
+                // Concurrent request won the race - treat as retransmission
+                debug!(
+                    "Concurrent allocation created for {} - treating as retransmission",
+                    src_addr
+                );
+                self.rate_limiter.cancel_reservation(src_addr.ip());
+            } else {
+                info!(
+                    "Created allocation {} for {} (user: {})",
+                    alloc_id, src_addr, username
+                );
+            }
+
+            // Get actual lifetime from allocation (may be different if existing)
+            let actual_lifetime = self
                 .allocations
-                .create(src_addr, username.to_string(), lifetime);
+                .get(alloc_id)
+                .map(|a| a.remaining_lifetime())
+                .unwrap_or(lifetime);
 
-            info!(
-                "Created allocation {} for {} (user: {})",
-                alloc_id, src_addr, username
-            );
-
-            let response = self.build_allocate_response(msg, src_addr, lifetime, None);
+            let response = self.build_allocate_response(msg, src_addr, actual_lifetime, None);
             debug!(
                 "Sending Allocate response ({} bytes) to {}: {:02x?}",
                 response.len(),
@@ -755,6 +787,9 @@ impl TurnHandler {
                     src_addr
                 );
             }
+
+            // Touch sender's allocation - they're actively sending data
+            alloc.touch_received();
             return Ok(());
         }
 
@@ -1078,6 +1113,53 @@ impl TurnHandler {
         self.append_realm(&mut response, &self.config.realm);
 
         // NONCE attribute
+        let nonce = TurnAuth::generate_nonce(&self.config.nonce_secret);
+        self.append_nonce(&mut response, &nonce);
+
+        // Update length
+        let attr_len = (response.len() - 20) as u16;
+        response[2..4].copy_from_slice(&attr_len.to_be_bytes());
+
+        response
+    }
+
+    /// Build a 438 Stale Nonce response with REALM and fresh NONCE
+    ///
+    /// Per RFC 5389, 438 responses must include REALM and NONCE so clients
+    /// can retry with the new nonce.
+    fn build_stale_nonce_response(&self, request: &StunInfo) -> Vec<u8> {
+        let mut response = Vec::with_capacity(128);
+
+        // Error response: set bits 4 and 8 of method
+        let msg_type = u16::from_be_bytes([request.raw[0], request.raw[1]]);
+        let error_type = msg_type | 0x0110;
+
+        response.extend_from_slice(&error_type.to_be_bytes());
+        response.extend_from_slice(&[0x00, 0x00]); // Length placeholder
+        response.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        response.extend_from_slice(&request.transaction_id);
+
+        // ERROR-CODE attribute (0x0009) - 438 Stale Nonce
+        let reason = "Stale Nonce";
+        let attr_len = 4 + reason.len();
+        let padded_len = (attr_len + 3) & !3;
+
+        response.extend_from_slice(&[0x00, 0x09]); // Type
+        response.extend_from_slice(&(attr_len as u16).to_be_bytes());
+        response.extend_from_slice(&[0x00, 0x00]); // Reserved
+        response.push(4); // Class (438 / 100)
+        response.push(38); // Number (438 % 100)
+        response.extend_from_slice(reason.as_bytes());
+
+        // Padding for ERROR-CODE (20 byte header + 4 byte attr header + padded value)
+        while response.len() < 20 + 4 + padded_len {
+            response.push(0);
+        }
+
+        // REALM attribute - required for client to retry
+        self.append_realm(&mut response, &self.config.realm);
+
+        // NONCE attribute - fresh nonce for client to use
         let nonce = TurnAuth::generate_nonce(&self.config.nonce_secret);
         self.append_nonce(&mut response, &nonce);
 
