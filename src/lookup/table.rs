@@ -281,15 +281,29 @@ impl AllocationTable {
         self.allocations.get(&*id)
     }
 
-    /// Lookup allocation ID by source address (fast path)
+    /// Check if address is a known client (has an allocation)
+    /// Use this to determine if traffic is from a client vs a peer
+    pub fn is_client(&self, addr: SocketAddr) -> bool {
+        self.by_client.contains_key(&addr)
+    }
+
+    /// Lookup allocation ID by peer tuple (for relay traffic from peers)
+    /// Returns the allocation that should receive traffic from this peer
+    pub fn lookup_by_peer_tuple(&self, addr: SocketAddr) -> Option<AllocationId> {
+        self.by_peer_tuple.get(&addr).map(|r| *r)
+    }
+
+    /// Lookup allocation ID by source address (fast path for any traffic)
+    /// Note: This returns an allocation ID but does NOT indicate if it's a client or peer.
+    /// Use is_client() to determine traffic direction.
     pub fn lookup_by_source(&self, addr: SocketAddr) -> Option<AllocationId> {
-        // First try peer tuple (for relay traffic from peers)
-        if let Some(id) = self.by_peer_tuple.get(&addr) {
+        // First try client address (for TURN control traffic)
+        if let Some(id) = self.by_client.get(&addr) {
             return Some(*id);
         }
 
-        // Then try client address (for TURN control traffic)
-        self.by_client.get(&addr).map(|r| *r)
+        // Then try peer tuple (for relay traffic from peers)
+        self.by_peer_tuple.get(&addr).map(|r| *r)
     }
 
     /// Lookup by ICE ufrag

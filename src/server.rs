@@ -184,8 +184,10 @@ impl Server {
 
     /// Handle a single incoming packet
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
-        // Fast path: check if we have an allocation for this source (it's a client)
-        let is_client = self.allocations.lookup_by_source(src_addr).is_some();
+        // Check if this is from a client (has an allocation at this address)
+        // Important: is_client checks by_client only, NOT by_peer_tuple
+        // This prevents learned peer tuples from being treated as clients
+        let is_client = self.allocations.is_client(src_addr);
         if is_client {
             trace!("Fast path: found allocation for client {}", src_addr);
         }
@@ -370,8 +372,9 @@ impl Server {
         // Magic cookie
         packet.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
 
-        // Transaction ID (random for indication)
-        packet.extend_from_slice(&[0; 12]);
+        // Transaction ID (random for indication per RFC 5389)
+        let txn_id: [u8; 12] = rand::random();
+        packet.extend_from_slice(&txn_id);
 
         // XOR-PEER-ADDRESS attribute (0x0012)
         self.append_xor_peer_address(&mut packet, peer_addr);
@@ -412,9 +415,22 @@ impl Server {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
             }
-            SocketAddr::V6(_) => {
-                // IPv6 not yet supported
-                buf.extend_from_slice(&[0x00, 0x00]);
+            SocketAddr::V6(v6) => {
+                buf.extend_from_slice(&[0x00, 0x14]); // Length = 20
+                buf.push(0x00); // Reserved
+                buf.push(0x02); // IPv6 family
+
+                let xor_port = v6.port() ^ 0x2112;
+                buf.extend_from_slice(&xor_port.to_be_bytes());
+
+                let addr_bytes = v6.ip().octets();
+                let magic = [0x21u8, 0x12, 0xa4, 0x42];
+                for i in 0..4 {
+                    buf.push(addr_bytes[i] ^ magic[i]);
+                }
+                for byte in addr_bytes.iter().skip(4) {
+                    buf.push(*byte);
+                }
             }
         }
     }

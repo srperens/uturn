@@ -34,9 +34,10 @@ impl RateLimiter {
         }
     }
 
-    /// Check if an allocation request is allowed and record it
+    /// Check if an allocation request is allowed and reserve a slot atomically
     ///
-    /// Returns Ok(()) if allowed, Err with reason if rejected
+    /// This combines check and reservation to prevent TOCTOU race conditions.
+    /// Returns Ok(()) if allowed (and slot is reserved), Err with reason if rejected.
     pub fn check_allocation_request(&self, ip: IpAddr) -> Result<(), RateLimitError> {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(60);
@@ -61,16 +62,27 @@ impl RateLimiter {
             return Err(RateLimitError::QuotaExceeded);
         }
 
-        // Record the request
+        // Record the request and reserve the allocation slot atomically
         entry.request_times.push(now);
+        entry.allocation_count = entry.allocation_count.saturating_add(1);
 
         Ok(())
     }
 
-    /// Record a successful allocation
-    pub fn record_allocation(&self, ip: IpAddr) {
-        let mut entry = self.entries.entry(ip).or_default();
-        entry.allocation_count = entry.allocation_count.saturating_add(1);
+    /// Record a successful allocation (no-op, reservation done in check)
+    ///
+    /// This is kept for API compatibility but does nothing since
+    /// check_allocation_request now atomically reserves the slot.
+    #[allow(dead_code)]
+    pub fn record_allocation(&self, _ip: IpAddr) {
+        // Reservation is now done atomically in check_allocation_request
+    }
+
+    /// Cancel a reserved allocation slot (call if allocation fails after check)
+    pub fn cancel_reservation(&self, ip: IpAddr) {
+        if let Some(mut entry) = self.entries.get_mut(&ip) {
+            entry.allocation_count = entry.allocation_count.saturating_sub(1);
+        }
     }
 
     /// Record an allocation being removed
@@ -150,11 +162,9 @@ mod tests {
         let limiter = RateLimiter::new(100, 2);
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
 
-        // Allow first two allocations
+        // Allow first two allocations (check_allocation_request now reserves atomically)
         assert!(limiter.check_allocation_request(ip).is_ok());
-        limiter.record_allocation(ip);
         assert!(limiter.check_allocation_request(ip).is_ok());
-        limiter.record_allocation(ip);
 
         // Third should fail due to quota
         assert_eq!(
@@ -164,6 +174,28 @@ mod tests {
 
         // After deallocation, should work again
         limiter.record_deallocation(ip);
+        assert!(limiter.check_allocation_request(ip).is_ok());
+    }
+
+    #[test]
+    fn test_cancel_reservation() {
+        let limiter = RateLimiter::new(100, 2);
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+
+        // Reserve two slots
+        assert!(limiter.check_allocation_request(ip).is_ok());
+        assert!(limiter.check_allocation_request(ip).is_ok());
+
+        // Third should fail
+        assert_eq!(
+            limiter.check_allocation_request(ip),
+            Err(RateLimitError::QuotaExceeded)
+        );
+
+        // Cancel one reservation
+        limiter.cancel_reservation(ip);
+
+        // Now third should succeed
         assert!(limiter.check_allocation_request(ip).is_ok());
     }
 }

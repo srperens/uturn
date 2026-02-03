@@ -21,6 +21,16 @@ pub struct TurnHandler {
     rate_limiter: Arc<RateLimiter>,
 }
 
+/// Result of authentication validation
+enum AuthResult {
+    /// Authentication successful, here's the key for response
+    Success([u8; 16]),
+    /// No authentication required (anonymous mode)
+    NotRequired,
+    /// Authentication failed, send this error response
+    Failed(Vec<u8>),
+}
+
 impl TurnHandler {
     /// Create a new handler
     pub fn new(
@@ -32,6 +42,84 @@ impl TurnHandler {
             config,
             allocations,
             rate_limiter,
+        }
+    }
+
+    /// Validate authentication for requests that require it (Refresh, CreatePermission, ChannelBind)
+    ///
+    /// Per RFC 5766 Section 10.1: All requests after the initial Allocate must be
+    /// authenticated using the same credentials as the Allocate request.
+    fn validate_request_auth(&self, msg: &StunInfo, expected_username: &str) -> AuthResult {
+        // If no credentials configured, authentication is not required
+        if self.config.credentials.is_empty() {
+            return AuthResult::NotRequired;
+        }
+
+        // Check MESSAGE-INTEGRITY is present
+        if msg.message_integrity.is_none() {
+            return AuthResult::Failed(self.build_unauthorized_response(msg));
+        }
+
+        // Check USERNAME matches the allocation's username
+        let username = match &msg.username {
+            Some(u) => u,
+            None => {
+                return AuthResult::Failed(
+                    self.build_error_response(msg, TurnErrorCode::BadRequest),
+                );
+            }
+        };
+
+        if username != expected_username {
+            warn!(
+                "Username mismatch: expected '{}', got '{}'",
+                expected_username, username
+            );
+            return AuthResult::Failed(self.build_unauthorized_response(msg));
+        }
+
+        // Get password for this user
+        let password = match self.config.get_password(username) {
+            Some(p) => p,
+            None => {
+                return AuthResult::Failed(self.build_unauthorized_response(msg));
+            }
+        };
+
+        // Validate nonce freshness
+        if let Some(ref nonce) = msg.nonce {
+            if !TurnAuth::validate_nonce(
+                nonce,
+                self.config.nonce_lifetime_secs,
+                &self.config.nonce_secret,
+            ) {
+                return AuthResult::Failed(
+                    self.build_error_response(msg, TurnErrorCode::StaleNonce),
+                );
+            }
+        } else {
+            return AuthResult::Failed(self.build_error_response(msg, TurnErrorCode::BadRequest));
+        }
+
+        // Validate MESSAGE-INTEGRITY
+        let realm = msg.realm.as_deref().unwrap_or(&self.config.realm);
+        let key = TurnAuth::compute_key(username, realm, password);
+
+        if let (Some(integrity), Some(offset)) =
+            (&msg.message_integrity, msg.message_integrity_offset)
+        {
+            // Build message up to MESSAGE-INTEGRITY for validation
+            let mut msg_for_hmac = msg.raw[..offset].to_vec();
+            let new_len = (offset - 20 + 24) as u16;
+            msg_for_hmac[2..4].copy_from_slice(&new_len.to_be_bytes());
+
+            if !TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, &key) {
+                return AuthResult::Failed(self.build_unauthorized_response(msg));
+            }
+
+            AuthResult::Success(key)
+        } else {
+            AuthResult::Failed(self.build_error_response(msg, TurnErrorCode::BadRequest))
         }
     }
 
@@ -201,6 +289,7 @@ impl TurnHandler {
             }
             Some(other) => {
                 warn!("Unsupported transport protocol {} from {}", other, src_addr);
+                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_error_response(msg, TurnErrorCode::UnsupportedTransport);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
@@ -218,6 +307,7 @@ impl TurnHandler {
             if msg.message_integrity.is_none() {
                 // First request without credentials - send 401 with REALM and NONCE
                 debug!("Allocate request missing MESSAGE-INTEGRITY, sending 401");
+                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_unauthorized_response(msg);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
@@ -228,6 +318,7 @@ impl TurnHandler {
                 Some(u) => u,
                 None => {
                     warn!("Allocate request has MESSAGE-INTEGRITY but no USERNAME");
+                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -238,6 +329,7 @@ impl TurnHandler {
                 Some(p) => p,
                 None => {
                     warn!("Unknown username in Allocate request: {}", username);
+                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_unauthorized_response(msg);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -252,12 +344,14 @@ impl TurnHandler {
                     &self.config.nonce_secret,
                 ) {
                     warn!("Stale nonce from {}", src_addr);
+                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_error_response(msg, TurnErrorCode::StaleNonce);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
                 }
             } else {
                 warn!("Missing nonce from {}", src_addr);
+                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
@@ -279,6 +373,7 @@ impl TurnHandler {
 
                 if !TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, &key) {
                     warn!("Invalid MESSAGE-INTEGRITY from {}", src_addr);
+                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_unauthorized_response(msg);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -287,17 +382,18 @@ impl TurnHandler {
                 debug!("MESSAGE-INTEGRITY validated for user {}", username);
             } else {
                 warn!("MESSAGE-INTEGRITY parsing error");
+                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
 
             // Valid credentials - create allocation
+            // Note: rate limiter slot was already reserved in check_allocation_request
             let lifetime = 60;
             let alloc_id = self
                 .allocations
                 .create(src_addr, username.to_string(), lifetime);
-            self.rate_limiter.record_allocation(src_addr.ip());
 
             info!(
                 "Created allocation {} for {} (user: {})",
@@ -316,11 +412,11 @@ impl TurnHandler {
             // No authentication configured - anonymous access
             let username = msg.username.as_deref().unwrap_or("anonymous");
 
+            // Note: rate limiter slot was already reserved in check_allocation_request
             let lifetime = 60;
             let alloc_id = self
                 .allocations
                 .create(src_addr, username.to_string(), lifetime);
-            self.rate_limiter.record_allocation(src_addr.ip());
 
             info!(
                 "Created allocation {} for {} (user: {})",
@@ -358,8 +454,16 @@ impl TurnHandler {
             }
         };
 
-        // Compute auth key if request had MESSAGE-INTEGRITY
-        let key = self.compute_response_key(msg, &alloc.username);
+        // Validate authentication (RFC 5766 Section 10.1)
+        let key = match self.validate_request_auth(msg, &alloc.username) {
+            AuthResult::Success(k) => Some(k),
+            AuthResult::NotRequired => None,
+            AuthResult::Failed(response) => {
+                warn!("Refresh auth failed from {}", src_addr);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
 
         // Parse requested lifetime (0 means delete allocation)
         let requested_lifetime = msg.lifetime.unwrap_or(60);
@@ -405,7 +509,18 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("CreatePermission request from {}", src_addr);
 
-        let (alloc_id, _username, key) = {
+        // Parse XOR-PEER-ADDRESS attributes first (can have multiple)
+        if msg.xor_peer_addresses.is_empty() {
+            warn!(
+                "CreatePermission missing XOR-PEER-ADDRESS from {}",
+                src_addr
+            );
+            let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
+            socket.send_to(&response, src_addr).await?;
+            return Ok(());
+        }
+
+        let (alloc_id, key) = {
             let alloc = match self.allocations.get_by_client(src_addr) {
                 Some(a) => a,
                 None => {
@@ -416,20 +531,19 @@ impl TurnHandler {
                 }
             };
 
-            // Parse XOR-PEER-ADDRESS attributes (can have multiple)
-            if msg.xor_peer_addresses.is_empty() {
-                warn!(
-                    "CreatePermission missing XOR-PEER-ADDRESS from {}",
-                    src_addr
-                );
-                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
+            // Validate authentication (RFC 5766 Section 10.1)
+            let key = match self.validate_request_auth(msg, &alloc.username) {
+                AuthResult::Success(k) => Some(k),
+                AuthResult::NotRequired => None,
+                AuthResult::Failed(response) => {
+                    warn!("CreatePermission auth failed from {}", src_addr);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            };
 
-            let key = self.compute_response_key(msg, &alloc.username);
             alloc.touch_received();
-            (alloc.id, alloc.username.clone(), key)
+            (alloc.id, key)
         };
 
         // Add permissions for each peer IP (must use table method to update index)
@@ -497,7 +611,17 @@ impl TurnHandler {
                 }
             };
 
-            let key = self.compute_response_key(msg, &alloc.username);
+            // Validate authentication (RFC 5766 Section 10.1)
+            let key = match self.validate_request_auth(msg, &alloc.username) {
+                AuthResult::Success(k) => Some(k),
+                AuthResult::NotRequired => None,
+                AuthResult::Failed(response) => {
+                    warn!("ChannelBind auth failed from {}", src_addr);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            };
+
             let alloc_id = alloc.id;
 
             // Bind channel (this can be done while holding the ref)
@@ -694,17 +818,6 @@ impl TurnHandler {
         response
     }
 
-    /// Compute auth key for response if request had MESSAGE-INTEGRITY
-    fn compute_response_key(&self, msg: &StunInfo, username: &str) -> Option<[u8; 16]> {
-        if msg.message_integrity.is_some() && !self.config.credentials.is_empty() {
-            if let Some(password) = self.config.get_password(username) {
-                let realm = msg.realm.as_deref().unwrap_or(&self.config.realm);
-                return Some(TurnAuth::compute_key(username, realm, password));
-            }
-        }
-        None
-    }
-
     /// Build a TURN Refresh Success Response
     fn build_refresh_response(
         &self,
@@ -750,6 +863,10 @@ impl TurnHandler {
         // MESSAGE-INTEGRITY (if authenticated)
         if let Some(key) = key {
             self.append_message_integrity(&mut response, key);
+        } else {
+            // Update length (no MESSAGE-INTEGRITY)
+            let attr_len = (response.len() - 20) as u16;
+            response[2..4].copy_from_slice(&attr_len.to_be_bytes());
         }
 
         response
@@ -813,9 +930,26 @@ impl TurnHandler {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
             }
-            SocketAddr::V6(_v6) => {
-                // TODO: IPv6 support
-                unimplemented!("IPv6 not yet supported");
+            SocketAddr::V6(v6) => {
+                buf.extend_from_slice(&[0x00, 0x14]); // Length = 20
+                buf.push(0x00); // Reserved
+                buf.push(0x02); // IPv6 family
+
+                // XOR port with magic cookie upper 16 bits
+                let xor_port = v6.port() ^ 0x2112;
+                buf.extend_from_slice(&xor_port.to_be_bytes());
+
+                // XOR address with magic cookie (4 bytes) + transaction ID (12 bytes)
+                // For mapped address we use zeros for transaction ID part
+                let addr_bytes = v6.ip().octets();
+                let magic = [0x21u8, 0x12, 0xa4, 0x42];
+                for i in 0..4 {
+                    buf.push(addr_bytes[i] ^ magic[i]);
+                }
+                // Remaining 12 bytes XOR with zeros (no transaction ID available here)
+                for byte in addr_bytes.iter().skip(4) {
+                    buf.push(*byte);
+                }
             }
         }
     }
@@ -840,7 +974,23 @@ impl TurnHandler {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
             }
-            SocketAddr::V6(_) => unimplemented!("IPv6 not yet supported"),
+            SocketAddr::V6(v6) => {
+                buf.extend_from_slice(&[0x00, 0x14]); // Length = 20
+                buf.push(0x00); // Reserved
+                buf.push(0x02); // IPv6 family
+
+                let xor_port = v6.port() ^ 0x2112;
+                buf.extend_from_slice(&xor_port.to_be_bytes());
+
+                let addr_bytes = v6.ip().octets();
+                let magic = [0x21u8, 0x12, 0xa4, 0x42];
+                for i in 0..4 {
+                    buf.push(addr_bytes[i] ^ magic[i]);
+                }
+                for byte in addr_bytes.iter().skip(4) {
+                    buf.push(*byte);
+                }
+            }
         }
     }
 
@@ -953,8 +1103,9 @@ impl TurnHandler {
         // Magic cookie
         packet.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
 
-        // Transaction ID (random for indication)
-        packet.extend_from_slice(&[0; 12]);
+        // Transaction ID (random for indication per RFC 5389)
+        let txn_id: [u8; 12] = rand::random();
+        packet.extend_from_slice(&txn_id);
 
         // XOR-PEER-ADDRESS attribute (0x0012)
         self.append_xor_peer_address(&mut packet, peer_addr);
@@ -995,7 +1146,23 @@ impl TurnHandler {
                     buf.push(addr_bytes[i] ^ magic[i]);
                 }
             }
-            SocketAddr::V6(_) => unimplemented!("IPv6 not yet supported"),
+            SocketAddr::V6(v6) => {
+                buf.extend_from_slice(&[0x00, 0x14]); // Length = 20
+                buf.push(0x00); // Reserved
+                buf.push(0x02); // IPv6 family
+
+                let xor_port = v6.port() ^ 0x2112;
+                buf.extend_from_slice(&xor_port.to_be_bytes());
+
+                let addr_bytes = v6.ip().octets();
+                let magic = [0x21u8, 0x12, 0xa4, 0x42];
+                for i in 0..4 {
+                    buf.push(addr_bytes[i] ^ magic[i]);
+                }
+                for byte in addr_bytes.iter().skip(4) {
+                    buf.push(*byte);
+                }
+            }
         }
     }
 }

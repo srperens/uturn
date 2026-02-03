@@ -86,13 +86,16 @@ impl TurnAuth {
             Err(_) => return false,
         };
 
-        // Verify HMAC
+        // Verify HMAC using constant-time comparison to prevent timing attacks
         let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC key length");
         mac.update(&timestamp.to_be_bytes());
         let hmac_result = mac.finalize().into_bytes();
         let expected_hmac = u64::from_be_bytes(hmac_result[..8].try_into().unwrap());
 
-        if provided_hmac != expected_hmac {
+        // Constant-time comparison
+        let mut diff = 0u64;
+        diff |= provided_hmac ^ expected_hmac;
+        if diff != 0 {
             return false;
         }
 

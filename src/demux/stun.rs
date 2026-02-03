@@ -18,6 +18,11 @@ const ATTR_REALM: u16 = 0x0014;
 const ATTR_NONCE: u16 = 0x0015;
 const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 
+/// Maximum attribute lengths per RFC 5389
+const MAX_USERNAME_LEN: usize = 513;
+const MAX_REALM_LEN: usize = 763;
+const MAX_NONCE_LEN: usize = 763;
+
 /// STUN message type classes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StunClass {
@@ -201,7 +206,10 @@ impl StunInfo {
 
             match attr_type {
                 ATTR_USERNAME => {
-                    result.username = String::from_utf8(value.to_vec()).ok();
+                    // RFC 5389: USERNAME must be less than 513 bytes
+                    if value.len() <= MAX_USERNAME_LEN {
+                        result.username = String::from_utf8(value.to_vec()).ok();
+                    }
                 }
                 ATTR_XOR_PEER_ADDRESS => {
                     if let Some(addr) = Self::decode_xor_address(value, transaction_id) {
@@ -227,10 +235,16 @@ impl StunInfo {
                     result.data = Some(value.to_vec());
                 }
                 ATTR_REALM => {
-                    result.realm = String::from_utf8(value.to_vec()).ok();
+                    // RFC 5389: REALM must be less than 763 bytes
+                    if value.len() <= MAX_REALM_LEN {
+                        result.realm = String::from_utf8(value.to_vec()).ok();
+                    }
                 }
                 ATTR_NONCE => {
-                    result.nonce = String::from_utf8(value.to_vec()).ok();
+                    // RFC 5389: NONCE must be less than 763 bytes
+                    if value.len() <= MAX_NONCE_LEN {
+                        result.nonce = String::from_utf8(value.to_vec()).ok();
+                    }
                 }
                 ATTR_MESSAGE_INTEGRITY => {
                     if value.len() == 20 {
