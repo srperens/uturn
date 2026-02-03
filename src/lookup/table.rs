@@ -358,63 +358,101 @@ impl AllocationTable {
         }
     }
 
-    /// Remove expired allocations
+    /// Remove expired allocations (atomic per-entry removal)
     pub fn cleanup_expired(&self) -> usize {
-        let expired: Vec<_> = self
-            .allocations
-            .iter()
-            .filter(|r| r.is_expired())
-            .map(|r| r.id)
-            .collect();
-
-        let count = expired.len();
-        for id in expired {
-            self.remove(id);
-        }
+        let mut count = 0;
+        self.allocations.retain(|id, alloc| {
+            if alloc.is_expired() {
+                // Clean up indices before removal
+                self.by_client.remove(&alloc.client_addr);
+                self.by_ufrag.remove(&alloc.local_ufrag);
+                for ssrc in alloc.ssrcs.read().iter() {
+                    self.by_ssrc.remove(ssrc);
+                }
+                for peer_ip in alloc.permissions.read().iter() {
+                    if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
+                        ids.retain(|&i| i != *id);
+                    }
+                }
+                for entry in alloc.known_peers.iter() {
+                    self.by_peer_tuple.remove(entry.key());
+                }
+                count += 1;
+                false // Remove this entry
+            } else {
+                true // Keep this entry
+            }
+        });
         count
     }
 
     /// Remove inactive allocations (no traffic FROM client for timeout_secs)
+    /// Uses atomic per-entry removal to avoid race conditions
     pub fn cleanup_inactive(&self, timeout_secs: u64) -> usize {
-        let inactive: Vec<_> = self
-            .allocations
-            .iter()
-            .filter(|r| r.is_inactive(timeout_secs))
-            .map(|r| (r.id, r.client_addr))
-            .collect();
-
-        let count = inactive.len();
-        for (id, addr) in inactive {
-            tracing::info!(
-                "Removing inactive allocation {} for {} (no traffic for {}s)",
-                id,
-                addr,
-                timeout_secs
-            );
-            self.remove(id);
-        }
+        let mut count = 0;
+        self.allocations.retain(|id, alloc| {
+            if alloc.is_inactive(timeout_secs) {
+                tracing::info!(
+                    "Removing inactive allocation {} for {} (no traffic for {}s)",
+                    id,
+                    alloc.client_addr,
+                    timeout_secs
+                );
+                // Clean up indices
+                self.by_client.remove(&alloc.client_addr);
+                self.by_ufrag.remove(&alloc.local_ufrag);
+                for ssrc in alloc.ssrcs.read().iter() {
+                    self.by_ssrc.remove(ssrc);
+                }
+                for peer_ip in alloc.permissions.read().iter() {
+                    if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
+                        ids.retain(|&i| i != *id);
+                    }
+                }
+                for entry in alloc.known_peers.iter() {
+                    self.by_peer_tuple.remove(entry.key());
+                }
+                count += 1;
+                false
+            } else {
+                true
+            }
+        });
         count
     }
 
     /// Remove orphaned sender allocations (sending but no targets for timeout_secs)
+    /// Uses atomic per-entry removal to avoid race conditions
     pub fn cleanup_orphaned_senders(&self, timeout_secs: u64) -> usize {
-        let orphaned: Vec<_> = self
-            .allocations
-            .iter()
-            .filter(|r| r.is_orphaned_sender(timeout_secs))
-            .map(|r| (r.id, r.client_addr))
-            .collect();
-
-        let count = orphaned.len();
-        for (id, addr) in orphaned {
-            tracing::info!(
-                "Removing orphaned sender {} for {} (no relay targets for {}s)",
-                id,
-                addr,
-                timeout_secs
-            );
-            self.remove(id);
-        }
+        let mut count = 0;
+        self.allocations.retain(|id, alloc| {
+            if alloc.is_orphaned_sender(timeout_secs) {
+                tracing::info!(
+                    "Removing orphaned sender {} for {} (no relay targets for {}s)",
+                    id,
+                    alloc.client_addr,
+                    timeout_secs
+                );
+                // Clean up indices
+                self.by_client.remove(&alloc.client_addr);
+                self.by_ufrag.remove(&alloc.local_ufrag);
+                for ssrc in alloc.ssrcs.read().iter() {
+                    self.by_ssrc.remove(ssrc);
+                }
+                for peer_ip in alloc.permissions.read().iter() {
+                    if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
+                        ids.retain(|&i| i != *id);
+                    }
+                }
+                for entry in alloc.known_peers.iter() {
+                    self.by_peer_tuple.remove(entry.key());
+                }
+                count += 1;
+                false
+            } else {
+                true
+            }
+        });
         count
     }
 }
