@@ -74,6 +74,10 @@ async fn main() -> Result<()> {
         })
         .collect();
 
+    // Generate random nonce secret at startup
+    use rand::Rng;
+    let nonce_secret: [u8; 16] = rand::thread_rng().gen();
+
     let config = Config {
         port: args.port,
         external_ip: args.external_ip,
@@ -83,6 +87,7 @@ async fn main() -> Result<()> {
         rate_limit_per_minute: args.rate_limit_per_minute,
         max_concurrent_tasks: args.max_concurrent_tasks,
         nonce_lifetime_secs: args.nonce_lifetime_secs,
+        nonce_secret,
     };
 
     info!(

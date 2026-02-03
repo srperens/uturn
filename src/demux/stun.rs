@@ -16,7 +16,7 @@ const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
 const ATTR_DATA: u16 = 0x0013;
 const ATTR_REALM: u16 = 0x0014;
 const ATTR_NONCE: u16 = 0x0015;
-const _ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 
 /// STUN message type classes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,9 @@ pub struct StunInfo {
     /// Offset where MESSAGE-INTEGRITY starts (for validation)
     pub message_integrity_offset: Option<usize>,
 
+    /// REQUESTED-TRANSPORT attribute (protocol number, e.g., 17 for UDP)
+    pub requested_transport: Option<u8>,
+
     /// Raw message bytes
     pub raw: Vec<u8>,
 }
@@ -95,6 +98,7 @@ struct ParsedAttrs {
     nonce: Option<String>,
     message_integrity: Option<Vec<u8>>,
     message_integrity_offset: Option<usize>,
+    requested_transport: Option<u8>,
 }
 
 impl StunInfo {
@@ -163,6 +167,7 @@ impl StunInfo {
             nonce: attrs.nonce,
             message_integrity: attrs.message_integrity,
             message_integrity_offset: attrs.message_integrity_offset,
+            requested_transport: attrs.requested_transport,
             raw: data.to_vec(),
         })
     }
@@ -179,6 +184,7 @@ impl StunInfo {
             nonce: None,
             message_integrity: None,
             message_integrity_offset: None,
+            requested_transport: None,
         };
 
         let mut offset = 0;
@@ -231,6 +237,12 @@ impl StunInfo {
                         result.message_integrity = Some(value.to_vec());
                         // Offset from start of attributes section + 20 bytes header
                         result.message_integrity_offset = Some(20 + offset);
+                    }
+                }
+                ATTR_REQUESTED_TRANSPORT => {
+                    // REQUESTED-TRANSPORT is 4 bytes: protocol (1 byte) + RFFU (3 bytes)
+                    if !value.is_empty() {
+                        result.requested_transport = Some(value[0]);
                     }
                 }
                 _ => {}

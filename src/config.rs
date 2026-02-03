@@ -31,11 +31,17 @@ pub struct Config {
 
     /// Nonce validity period in seconds
     pub nonce_lifetime_secs: u64,
+
+    /// Secret key for nonce generation (randomly generated at startup)
+    pub nonce_secret: [u8; 16],
 }
 
 impl Config {
     /// Create a new config with minimal settings
     pub fn new(external_ip: IpAddr) -> Self {
+        use rand::Rng;
+        let nonce_secret: [u8; 16] = rand::thread_rng().gen();
+
         Self {
             port: 3478,
             external_ip,
@@ -45,6 +51,7 @@ impl Config {
             rate_limit_per_minute: 120,
             max_concurrent_tasks: 1000,
             nonce_lifetime_secs: 3600,
+            nonce_secret,
         }
     }
 

@@ -41,28 +41,67 @@ impl TurnAuth {
         diff == 0
     }
 
-    /// Generate a nonce value
-    pub fn generate_nonce() -> String {
+    /// Generate a nonce value bound to a server secret
+    ///
+    /// Format: `{timestamp_hex}:{hmac_hex}` where HMAC is computed over the timestamp
+    /// using the server secret. This prevents nonce prediction/replay.
+    pub fn generate_nonce(secret: &[u8; 16]) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        format!("{:016x}", timestamp)
+
+        // Compute HMAC of timestamp using server secret
+        let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC key length");
+        mac.update(&timestamp.to_be_bytes());
+        let hmac_result = mac.finalize().into_bytes();
+
+        // Return timestamp:hmac (first 8 bytes of HMAC for brevity)
+        format!(
+            "{:016x}:{:016x}",
+            timestamp,
+            u64::from_be_bytes(hmac_result[..8].try_into().unwrap())
+        )
     }
 
-    /// Check if nonce is valid (not too old)
-    pub fn validate_nonce(nonce: &str, max_age_secs: u64) -> bool {
+    /// Check if nonce is valid (not too old and HMAC matches)
+    pub fn validate_nonce(nonce: &str, max_age_secs: u64, secret: &[u8; 16]) -> bool {
         use std::time::{SystemTime, UNIX_EPOCH};
-        if let Ok(nonce_time) = u64::from_str_radix(nonce, 16) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            now.saturating_sub(nonce_time) < max_age_secs
-        } else {
-            false
+
+        // Parse timestamp:hmac format
+        let parts: Vec<&str> = nonce.split(':').collect();
+        if parts.len() != 2 {
+            // Legacy format (timestamp only) - reject for security
+            return false;
         }
+
+        let timestamp = match u64::from_str_radix(parts[0], 16) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+
+        let provided_hmac = match u64::from_str_radix(parts[1], 16) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        // Verify HMAC
+        let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC key length");
+        mac.update(&timestamp.to_be_bytes());
+        let hmac_result = mac.finalize().into_bytes();
+        let expected_hmac = u64::from_be_bytes(hmac_result[..8].try_into().unwrap());
+
+        if provided_hmac != expected_hmac {
+            return false;
+        }
+
+        // Check timestamp freshness
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        now.saturating_sub(timestamp) < max_age_secs
     }
 }
 
@@ -97,8 +136,22 @@ mod tests {
 
     #[test]
     fn test_nonce_validation() {
-        let nonce = TurnAuth::generate_nonce();
-        assert!(TurnAuth::validate_nonce(&nonce, 3600)); // Valid for 1 hour
-        assert!(!TurnAuth::validate_nonce("0000000000000001", 3600)); // Too old
+        let secret: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let nonce = TurnAuth::generate_nonce(&secret);
+        assert!(TurnAuth::validate_nonce(&nonce, 3600, &secret)); // Valid for 1 hour
+
+        // Wrong secret should fail
+        let wrong_secret: [u8; 16] = [0; 16];
+        assert!(!TurnAuth::validate_nonce(&nonce, 3600, &wrong_secret));
+
+        // Old timestamp should fail (crafted with valid HMAC but old timestamp)
+        assert!(!TurnAuth::validate_nonce(
+            "0000000000000001:0000000000000000",
+            3600,
+            &secret
+        ));
+
+        // Invalid format should fail
+        assert!(!TurnAuth::validate_nonce("invalid", 3600, &secret));
     }
 }

@@ -332,8 +332,20 @@ impl AllocationTable {
     }
 
     /// Register peer tuple for fast path lookup
+    /// Also records in known_peers so it gets cleaned up with the allocation
     pub fn register_peer_tuple(&self, id: AllocationId, peer_addr: SocketAddr) {
         self.by_peer_tuple.insert(peer_addr, id);
+
+        // Also record in known_peers so cleanup removes the by_peer_tuple entry
+        if let Some(alloc) = self.allocations.get(&id) {
+            alloc
+                .known_peers
+                .entry(peer_addr)
+                .or_insert_with(|| PeerInfo {
+                    last_seen: Instant::now(),
+                    ssrcs: HashSet::new(),
+                });
+        }
     }
 
     /// Remove an allocation
@@ -359,11 +371,13 @@ impl AllocationTable {
     }
 
     /// Remove expired allocations (atomic per-entry removal)
-    pub fn cleanup_expired(&self) -> usize {
-        let mut count = 0;
+    /// Returns the list of client IPs whose allocations were removed
+    pub fn cleanup_expired(&self) -> Vec<IpAddr> {
+        let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_expired() {
                 // Clean up indices before removal
+                removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
                 for ssrc in alloc.ssrcs.read().iter() {
@@ -377,19 +391,19 @@ impl AllocationTable {
                 for entry in alloc.known_peers.iter() {
                     self.by_peer_tuple.remove(entry.key());
                 }
-                count += 1;
                 false // Remove this entry
             } else {
                 true // Keep this entry
             }
         });
-        count
+        removed_ips
     }
 
     /// Remove inactive allocations (no traffic FROM client for timeout_secs)
     /// Uses atomic per-entry removal to avoid race conditions
-    pub fn cleanup_inactive(&self, timeout_secs: u64) -> usize {
-        let mut count = 0;
+    /// Returns the list of client IPs whose allocations were removed
+    pub fn cleanup_inactive(&self, timeout_secs: u64) -> Vec<IpAddr> {
+        let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_inactive(timeout_secs) {
                 tracing::info!(
@@ -399,6 +413,7 @@ impl AllocationTable {
                     timeout_secs
                 );
                 // Clean up indices
+                removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
                 for ssrc in alloc.ssrcs.read().iter() {
@@ -412,19 +427,19 @@ impl AllocationTable {
                 for entry in alloc.known_peers.iter() {
                     self.by_peer_tuple.remove(entry.key());
                 }
-                count += 1;
                 false
             } else {
                 true
             }
         });
-        count
+        removed_ips
     }
 
     /// Remove orphaned sender allocations (sending but no targets for timeout_secs)
     /// Uses atomic per-entry removal to avoid race conditions
-    pub fn cleanup_orphaned_senders(&self, timeout_secs: u64) -> usize {
-        let mut count = 0;
+    /// Returns the list of client IPs whose allocations were removed
+    pub fn cleanup_orphaned_senders(&self, timeout_secs: u64) -> Vec<IpAddr> {
+        let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_orphaned_sender(timeout_secs) {
                 tracing::info!(
@@ -434,6 +449,7 @@ impl AllocationTable {
                     timeout_secs
                 );
                 // Clean up indices
+                removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
                 for ssrc in alloc.ssrcs.read().iter() {
@@ -447,13 +463,12 @@ impl AllocationTable {
                 for entry in alloc.known_peers.iter() {
                     self.by_peer_tuple.remove(entry.key());
                 }
-                count += 1;
                 false
             } else {
                 true
             }
         });
-        count
+        removed_ips
     }
 }
 

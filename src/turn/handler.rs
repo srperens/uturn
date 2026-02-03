@@ -194,6 +194,24 @@ impl TurnHandler {
             return Ok(());
         }
 
+        // Validate REQUESTED-TRANSPORT (RFC 5766 requires UDP = 17)
+        match msg.requested_transport {
+            Some(17) => {
+                // UDP is supported
+            }
+            Some(other) => {
+                warn!("Unsupported transport protocol {} from {}", other, src_addr);
+                let response = self.build_error_response(msg, TurnErrorCode::UnsupportedTransport);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+            None => {
+                // Per RFC 5766, REQUESTED-TRANSPORT is required. However, some clients
+                // may omit it for UDP-only servers. We'll be lenient and assume UDP.
+                debug!("Allocate request missing REQUESTED-TRANSPORT, assuming UDP");
+            }
+        }
+
         // Authentication check if credentials are configured
         if !self.config.credentials.is_empty() {
             // Check if MESSAGE-INTEGRITY is present
@@ -228,7 +246,11 @@ impl TurnHandler {
 
             // Validate nonce freshness
             if let Some(ref nonce) = msg.nonce {
-                if !TurnAuth::validate_nonce(nonce, self.config.nonce_lifetime_secs) {
+                if !TurnAuth::validate_nonce(
+                    nonce,
+                    self.config.nonce_lifetime_secs,
+                    &self.config.nonce_secret,
+                ) {
                     warn!("Stale nonce from {}", src_addr);
                     let response = self.build_error_response(msg, TurnErrorCode::StaleNonce);
                     socket.send_to(&response, src_addr).await?;
@@ -863,7 +885,7 @@ impl TurnHandler {
         self.append_realm(&mut response, &self.config.realm);
 
         // NONCE attribute
-        let nonce = TurnAuth::generate_nonce();
+        let nonce = TurnAuth::generate_nonce(&self.config.nonce_secret);
         self.append_nonce(&mut response, &nonce);
 
         // Update length

@@ -101,14 +101,13 @@ impl Demuxer {
             return PacketType::Unknown;
         }
 
-        // Distinguish RTP from RTCP by payload type:
-        // - RTP PT: 0-127 (though only some are used)
-        // - RTCP PT: 200-204 (SR, RR, SDES, BYE, APP)
+        // Distinguish RTP from RTCP by payload type in second byte:
+        // - RTP: PT is 7 bits (0-127), with marker bit in MSB
+        // - RTCP: PT is full 8 bits: 200-204 (SR, RR, SDES, BYE, APP)
         //
-        // In practice, check the second byte:
-        // - RTP: (byte[1] & 0x7F) typically < 128
-        // - RTCP: (byte[1] & 0x7F) typically >= 200
-        let pt = data[1] & 0x7F;
+        // RTCP PT values: SR=200 (0xC8), RR=201, SDES=202, BYE=203, APP=204
+        // We check the raw byte without masking for RTCP detection.
+        let pt = data[1];
 
         if (200..=204).contains(&pt) {
             PacketType::Rtcp(data.to_vec())
@@ -185,5 +184,35 @@ mod tests {
             PacketType::Rtp { ssrc, .. } => assert_eq!(ssrc, 0x12345678),
             _ => panic!("Expected RTP"),
         }
+    }
+
+    #[test]
+    fn test_classify_rtcp() {
+        // RTCP Sender Report (PT=200, 0xC8)
+        let rtcp_sr = [
+            0x80, 0xC8, // V=2, PT=200 (SR)
+            0x00, 0x06, // Length
+            0x12, 0x34, 0x56, 0x78, // SSRC
+            0x00, 0x00, 0x00, 0x00, // NTP timestamp (high)
+        ];
+        assert!(matches!(Demuxer::classify(&rtcp_sr), PacketType::Rtcp(_)));
+
+        // RTCP Receiver Report (PT=201, 0xC9)
+        let rtcp_rr = [
+            0x80, 0xC9, // V=2, PT=201 (RR)
+            0x00, 0x01, // Length
+            0x12, 0x34, 0x56, 0x78, // SSRC
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(matches!(Demuxer::classify(&rtcp_rr), PacketType::Rtcp(_)));
+
+        // RTCP BYE (PT=203, 0xCB)
+        let rtcp_bye = [
+            0x80, 0xCB, // V=2, PT=203 (BYE)
+            0x00, 0x01, // Length
+            0x12, 0x34, 0x56, 0x78, // SSRC
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(matches!(Demuxer::classify(&rtcp_bye), PacketType::Rtcp(_)));
     }
 }

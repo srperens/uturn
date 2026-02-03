@@ -94,23 +94,45 @@ impl Server {
 
         // Spawn cleanup task for expired, inactive, and orphaned allocations
         let cleanup_allocations = self.allocations.clone();
+        let cleanup_rate_limiter = self.rate_limiter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
             loop {
                 interval.tick().await;
-                let expired = cleanup_allocations.cleanup_expired();
-                if expired > 0 {
-                    info!("Cleaned up {} expired allocation(s)", expired);
+
+                // Cleanup expired allocations and update quota
+                let expired_ips = cleanup_allocations.cleanup_expired();
+                if !expired_ips.is_empty() {
+                    info!("Cleaned up {} expired allocation(s)", expired_ips.len());
+                    for ip in expired_ips {
+                        cleanup_rate_limiter.record_deallocation(ip);
+                    }
                 }
-                let inactive = cleanup_allocations.cleanup_inactive(INACTIVITY_TIMEOUT_SECS);
-                if inactive > 0 {
-                    info!("Cleaned up {} inactive allocation(s)", inactive);
+
+                // Cleanup inactive allocations and update quota
+                let inactive_ips = cleanup_allocations.cleanup_inactive(INACTIVITY_TIMEOUT_SECS);
+                if !inactive_ips.is_empty() {
+                    info!("Cleaned up {} inactive allocation(s)", inactive_ips.len());
+                    for ip in inactive_ips {
+                        cleanup_rate_limiter.record_deallocation(ip);
+                    }
                 }
-                let orphaned =
+
+                // Cleanup orphaned senders and update quota
+                let orphaned_ips =
                     cleanup_allocations.cleanup_orphaned_senders(INACTIVITY_TIMEOUT_SECS);
-                if orphaned > 0 {
-                    info!("Cleaned up {} orphaned sender allocation(s)", orphaned);
+                if !orphaned_ips.is_empty() {
+                    info!(
+                        "Cleaned up {} orphaned sender allocation(s)",
+                        orphaned_ips.len()
+                    );
+                    for ip in orphaned_ips {
+                        cleanup_rate_limiter.record_deallocation(ip);
+                    }
                 }
+
+                // Cleanup stale rate limiter entries
+                cleanup_rate_limiter.cleanup();
             }
         });
 
@@ -199,8 +221,13 @@ impl Server {
                     // Check if this is from a permitted peer
                     let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
                     if !candidates.is_empty() {
-                        debug!("RTP from peer {} - relaying via Data Indication", src_addr);
-                        self.relay_engine.handle_peer_data(&data, src_addr).await?;
+                        // Use SSRC-aware routing to disambiguate when multiple clients
+                        // permit the same peer IP
+                        debug!(
+                            "RTP from peer {} (SSRC={:08x}) - relaying with SSRC routing",
+                            src_addr, ssrc
+                        );
+                        self.relay_engine.handle_rtp(ssrc, &data, src_addr).await?;
                     } else {
                         trace!("RTP (SSRC={:08x}) from unknown {}", ssrc, src_addr);
                     }
@@ -214,8 +241,8 @@ impl Server {
                 } else {
                     let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
                     if !candidates.is_empty() {
-                        debug!("RTCP from peer {} - relaying via Data Indication", src_addr);
-                        self.relay_engine.handle_peer_data(&data, src_addr).await?;
+                        debug!("RTCP from peer {} - relaying", src_addr);
+                        self.relay_engine.handle_rtcp(&data, src_addr).await?;
                     } else {
                         trace!("RTCP from unknown {}", src_addr);
                     }
