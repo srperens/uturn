@@ -37,11 +37,7 @@ impl RelayEngine {
     ///
     /// When data arrives from a permitted peer, wrap it in Data Indication
     /// and send to the appropriate client.
-    pub async fn handle_peer_data(
-        &self,
-        data: &[u8],
-        peer_addr: SocketAddr,
-    ) -> Result<()> {
+    pub async fn handle_peer_data(&self, data: &[u8], peer_addr: SocketAddr) -> Result<()> {
         // Find allocations that have permission for this peer
         let candidates = self.allocations.lookup_by_peer_ip(peer_addr.ip());
         if candidates.is_empty() {
@@ -70,9 +66,11 @@ impl RelayEngine {
 
             // Check for channel binding (more efficient than Data indication)
             if let Some(channel) = alloc.channel_for_peer(peer_addr) {
-                self.send_channel_data(channel, data, alloc.client_addr).await?;
+                self.send_channel_data(channel, data, alloc.client_addr)
+                    .await?;
             } else {
-                self.send_data_indication(peer_addr, data, alloc.client_addr).await?;
+                self.send_data_indication(peer_addr, data, alloc.client_addr)
+                    .await?;
             }
 
             alloc.touch();
@@ -103,7 +101,10 @@ impl RelayEngine {
         let peer_addr = match alloc.peer_for_channel(channel) {
             Some(addr) => addr,
             None => {
-                warn!("ChannelData for unbound channel {} from {}", channel, src_addr);
+                warn!(
+                    "ChannelData for unbound channel {} from {}",
+                    channel, src_addr
+                );
                 return Ok(());
             }
         };
@@ -140,23 +141,26 @@ impl RelayEngine {
                         continue;
                     }
 
-                    // Use reverse channel if available, otherwise Data Indication
-                    // The peer address from target's perspective is the relay address
+                    // Use reverse channel if available - skip clients without channel binding
+                    // Data Indication to relay address doesn't work for WebRTC clients
+                    // (they expect ChannelData for peers they have bound channels to)
                     if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
                         debug!(
                             "ChannelData relay: {} -> {} via reverse channel {}",
                             src_addr, target_alloc.client_addr, reverse_channel
                         );
-                        self.send_channel_data(reverse_channel, data, target_alloc.client_addr).await?;
+                        self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
+                            .await?;
+                        target_alloc.touch();
+                        relayed = true;
                     } else {
-                        debug!(
-                            "ChannelData relay: {} -> {} via Data Indication",
-                            src_addr, target_alloc.client_addr
+                        // Client hasn't bound a channel to relay yet - skip
+                        // They'll receive data once ChannelBind completes
+                        trace!(
+                            "Skipping {} - no channel binding to relay yet",
+                            target_alloc.client_addr
                         );
-                        self.send_data_indication(relay_addr, data, target_alloc.client_addr).await?;
                     }
-                    target_alloc.touch();
-                    relayed = true;
                 }
             }
 
@@ -175,7 +179,8 @@ impl RelayEngine {
                     "ChannelData relay: {} -> {} via channel {} (reverse channel {})",
                     src_addr, peer_addr, channel, reverse_channel
                 );
-                self.send_channel_data(reverse_channel, data, peer_addr).await?;
+                self.send_channel_data(reverse_channel, data, peer_addr)
+                    .await?;
             } else {
                 // No reverse channel, use Data Indication
                 debug!(
@@ -205,12 +210,7 @@ impl RelayEngine {
     /// Handle RTP packet from peer
     ///
     /// Peer sends RTP to relay address; forward to client.
-    pub async fn handle_rtp(
-        &self,
-        ssrc: u32,
-        data: &[u8],
-        peer_addr: SocketAddr,
-    ) -> Result<()> {
+    pub async fn handle_rtp(&self, ssrc: u32, data: &[u8], peer_addr: SocketAddr) -> Result<()> {
         // Try to find allocation by SSRC first (fast path after learning)
         let alloc_id = if let Some(id) = self.allocations.lookup_by_ssrc(ssrc) {
             id
@@ -250,9 +250,11 @@ impl RelayEngine {
 
         // Check for channel binding (more efficient than Data indication)
         if let Some(channel) = alloc.channel_for_peer(peer_addr) {
-            self.send_channel_data(channel, data, alloc.client_addr).await?;
+            self.send_channel_data(channel, data, alloc.client_addr)
+                .await?;
         } else {
-            self.send_data_indication(peer_addr, data, alloc.client_addr).await?;
+            self.send_data_indication(peer_addr, data, alloc.client_addr)
+                .await?;
         }
 
         alloc.touch();
@@ -281,9 +283,11 @@ impl RelayEngine {
         }
 
         if let Some(channel) = alloc.channel_for_peer(peer_addr) {
-            self.send_channel_data(channel, data, alloc.client_addr).await?;
+            self.send_channel_data(channel, data, alloc.client_addr)
+                .await?;
         } else {
-            self.send_data_indication(peer_addr, data, alloc.client_addr).await?;
+            self.send_data_indication(peer_addr, data, alloc.client_addr)
+                .await?;
         }
 
         Ok(())
@@ -309,7 +313,8 @@ impl RelayEngine {
         }
 
         // DTLS goes via Data indication (not ChannelData)
-        self.send_data_indication(peer_addr, data, alloc.client_addr).await?;
+        self.send_data_indication(peer_addr, data, alloc.client_addr)
+            .await?;
 
         Ok(())
     }

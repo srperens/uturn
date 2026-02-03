@@ -195,7 +195,8 @@ impl Allocation {
 
     /// Refresh the allocation lifetime
     pub fn refresh(&self, lifetime_secs: u32) {
-        *self.expires_at.write() = Instant::now() + std::time::Duration::from_secs(lifetime_secs as u64);
+        *self.expires_at.write() =
+            Instant::now() + std::time::Duration::from_secs(lifetime_secs as u64);
     }
 
     /// Get remaining lifetime in seconds
@@ -264,12 +265,18 @@ impl AllocationTable {
     }
 
     /// Get allocation by ID
-    pub fn get(&self, id: AllocationId) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
+    pub fn get(
+        &self,
+        id: AllocationId,
+    ) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
         self.allocations.get(&id)
     }
 
     /// Get allocation by client address
-    pub fn get_by_client(&self, addr: SocketAddr) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
+    pub fn get_by_client(
+        &self,
+        addr: SocketAddr,
+    ) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
         let id = self.by_client.get(&addr)?;
         self.allocations.get(&*id)
     }
@@ -378,7 +385,12 @@ impl AllocationTable {
 
         let count = inactive.len();
         for (id, addr) in inactive {
-            tracing::info!("Removing inactive allocation {} for {} (no traffic for {}s)", id, addr, timeout_secs);
+            tracing::info!(
+                "Removing inactive allocation {} for {} (no traffic for {}s)",
+                id,
+                addr,
+                timeout_secs
+            );
             self.remove(id);
         }
         count
@@ -395,7 +407,12 @@ impl AllocationTable {
 
         let count = orphaned.len();
         for (id, addr) in orphaned {
-            tracing::info!("Removing orphaned sender {} for {} (no relay targets for {}s)", id, addr, timeout_secs);
+            tracing::info!(
+                "Removing orphaned sender {} for {} (no relay targets for {}s)",
+                id,
+                addr,
+                timeout_secs
+            );
             self.remove(id);
         }
         count

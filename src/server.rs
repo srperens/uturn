@@ -44,10 +44,7 @@ impl Server {
         let socket = Arc::new(socket);
         let allocations = Arc::new(AllocationTable::new());
 
-        let turn_handler = Arc::new(TurnHandler::new(
-            config.clone(),
-            allocations.clone(),
-        ));
+        let turn_handler = Arc::new(TurnHandler::new(config.clone(), allocations.clone()));
 
         let relay_engine = Arc::new(RelayEngine::new(
             config.clone(),
@@ -87,7 +84,8 @@ impl Server {
                 if inactive > 0 {
                     info!("Cleaned up {} inactive allocation(s)", inactive);
                 }
-                let orphaned = cleanup_allocations.cleanup_orphaned_senders(INACTIVITY_TIMEOUT_SECS);
+                let orphaned =
+                    cleanup_allocations.cleanup_orphaned_senders(INACTIVITY_TIMEOUT_SECS);
                 if orphaned > 0 {
                     info!("Cleaned up {} orphaned sender allocation(s)", orphaned);
                 }
@@ -141,12 +139,16 @@ impl Server {
                 // STUN messages are ALWAYS processed by the TURN handler.
                 // This includes new Allocate requests from any source.
                 debug!("STUN message from {}", src_addr);
-                self.turn_handler.handle_stun(msg, src_addr, &self.socket).await?;
+                self.turn_handler
+                    .handle_stun(msg, src_addr, &self.socket)
+                    .await?;
             }
 
             PacketType::TurnChannelData { channel, data } => {
                 debug!("ChannelData (channel={}) from {}", channel, src_addr);
-                self.relay_engine.handle_channel_data(channel, &data, src_addr).await?;
+                self.relay_engine
+                    .handle_channel_data(channel, &data, src_addr)
+                    .await?;
             }
 
             PacketType::Rtp { ssrc, data } => {
@@ -199,15 +201,25 @@ impl Server {
 
             PacketType::Unknown => {
                 if is_client {
-                    debug!("Unknown data from client {} - relaying to other clients", src_addr);
+                    debug!(
+                        "Unknown data from client {} - relaying to other clients",
+                        src_addr
+                    );
                     self.relay_client_data(data, src_addr).await?;
                 } else {
                     let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
                     if !candidates.is_empty() {
-                        debug!("Unknown data from peer {} - relaying via Data Indication", src_addr);
+                        debug!(
+                            "Unknown data from peer {} - relaying via Data Indication",
+                            src_addr
+                        );
                         self.relay_engine.handle_peer_data(data, src_addr).await?;
                     } else {
-                        warn!("Unknown packet type from {} ({} bytes)", src_addr, data.len());
+                        warn!(
+                            "Unknown packet type from {} ({} bytes)",
+                            src_addr,
+                            data.len()
+                        );
                     }
                 }
             }
@@ -255,7 +267,9 @@ impl Server {
                 // Build and send Data indication
                 // XOR-PEER-ADDRESS = relay address (peer from receiver's perspective)
                 let indication = self.build_data_indication(relay_addr, data);
-                self.socket.send_to(&indication, target_alloc.client_addr).await?;
+                self.socket
+                    .send_to(&indication, target_alloc.client_addr)
+                    .await?;
                 target_alloc.touch();
                 relayed = true;
             }

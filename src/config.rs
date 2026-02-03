@@ -45,7 +45,11 @@ impl Config {
     }
 
     /// Add a credential
-    pub fn with_credential(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn with_credential(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         self.credentials.push((username.into(), password.into()));
         self
     }

@@ -28,11 +28,7 @@ impl TurnAuth {
     }
 
     /// Verify MESSAGE-INTEGRITY attribute
-    pub fn verify_message_integrity(
-        message: &[u8],
-        received_integrity: &[u8],
-        key: &[u8],
-    ) -> bool {
+    pub fn verify_message_integrity(message: &[u8], received_integrity: &[u8], key: &[u8]) -> bool {
         let computed = Self::compute_message_integrity(message, key);
         // Constant-time comparison
         if received_integrity.len() != 20 {
@@ -88,11 +84,15 @@ mod tests {
         let message = b"test message";
 
         let integrity = TurnAuth::compute_message_integrity(message, &key);
-        assert!(TurnAuth::verify_message_integrity(message, &integrity, &key));
+        assert!(TurnAuth::verify_message_integrity(
+            message, &integrity, &key
+        ));
 
         // Wrong key should fail
         let wrong_key = TurnAuth::compute_key("user", "realm", "wrong");
-        assert!(!TurnAuth::verify_message_integrity(message, &integrity, &wrong_key));
+        assert!(!TurnAuth::verify_message_integrity(
+            message, &integrity, &wrong_key
+        ));
     }
 
     #[test]
