@@ -1,0 +1,58 @@
+# Build stage
+FROM rust:1.84-alpine AS builder
+
+RUN apk add --no-cache musl-dev
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --release
+
+# Runtime stage
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates curl
+
+COPY --from=builder /build/target/release/uturn /usr/local/bin/uturn
+
+# Create health check script
+RUN mkdir -p /www && echo "OK" > /www/index.html
+
+# Create entrypoint script that starts both HTTP health check and TURN server
+RUN printf '#!/bin/sh\n\
+# Set UTURN_PORT from UDP_PORT if provided\n\
+if [ -n "$UDP_PORT" ]; then\n\
+  export UTURN_PORT="$UDP_PORT"\n\
+fi\n\
+\n\
+# Auto-detect external IP if not set\n\
+if [ -z "$UTURN_EXTERNAL_IP" ]; then\n\
+  echo "UTURN_EXTERNAL_IP not set, detecting from ipinfo.io..."\n\
+  UTURN_EXTERNAL_IP=$(curl -s --max-time 10 https://ipinfo.io/ip)\n\
+  if [ -z "$UTURN_EXTERNAL_IP" ]; then\n\
+    echo "ERROR: Failed to detect external IP and UTURN_EXTERNAL_IP not set"\n\
+    exit 1\n\
+  fi\n\
+  export UTURN_EXTERNAL_IP\n\
+  echo "Detected external IP: $UTURN_EXTERNAL_IP"\n\
+fi\n\
+\n\
+# Start HTTP health check server on PORT (required by OSC)\n\
+while true; do\n\
+  echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 3\\r\\n\\r\\nOK\\n" | nc -l -p ${PORT:-8080} > /dev/null 2>&1\n\
+done &\n\
+\n\
+# Start TURN server\n\
+exec /usr/local/bin/uturn "$@"\n\
+' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+# Default ports
+# PORT: HTTP health check (set by OSC)
+# UTURN_PORT: UDP TURN server port
+EXPOSE 3478/udp
+
+# Optional: UTURN_EXTERNAL_IP (auto-detected from ipinfo.io if not set)
+# Optional: UDP_PORT (sets UTURN_PORT), UTURN_REALM, UTURN_USERS, UTURN_LOG_LEVEL, PORT
+
+ENTRYPOINT ["/entrypoint.sh"]
