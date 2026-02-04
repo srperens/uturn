@@ -4,4 +4,4 @@ mod rate_limit;
 mod table;
 
 pub use rate_limit::{RateLimitError, RateLimiter};
-pub use table::{AllocationId, AllocationTable};
+pub use table::{Allocation, AllocationId, AllocationTable};

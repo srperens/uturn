@@ -2,8 +2,8 @@
 //!
 //! Multiple lookup paths for efficient packet routing:
 //! - Source address (fast path for established flows)
-//! - ICE username fragment
-//! - SSRC
+//! - ICE username fragment (bi-directional matching)
+//! - Peer tuple (IP:port)
 //! - TURN channel ID
 
 use std::collections::HashSet;
@@ -54,9 +54,6 @@ pub struct Allocation {
     /// Reverse channel lookup: peer_addr -> channel_id
     pub channels_reverse: DashMap<SocketAddr, u16>,
 
-    /// Known SSRCs associated with this allocation
-    pub ssrcs: RwLock<HashSet<u32>>,
-
     /// Known peer addresses (learned from traffic)
     pub known_peers: DashMap<SocketAddr, PeerInfo>,
 
@@ -76,6 +73,17 @@ pub struct Allocation {
 
     /// Username for authentication
     pub username: String,
+
+    /// Remote ufrag this allocation wants to communicate with (from ICE)
+    /// Set when we see a STUN Binding Request with USERNAME attribute
+    pub paired_ufrag: RwLock<Option<String>>,
+
+    /// This allocation's ICE ufrag (learned from STUN USERNAME attribute)
+    /// Different from local_ufrag which is server-generated
+    pub ice_ufrag: RwLock<Option<String>>,
+
+    /// Remote ICE ufrag this allocation communicates with (from STUN USERNAME)
+    pub ice_remote_ufrag: RwLock<Option<String>>,
 }
 
 /// Information about a known peer
@@ -83,9 +91,6 @@ pub struct Allocation {
 pub struct PeerInfo {
     /// When we last saw traffic from this peer
     pub last_seen: Instant,
-
-    /// SSRCs observed from this peer
-    pub ssrcs: HashSet<u32>,
 }
 
 impl Allocation {
@@ -100,14 +105,63 @@ impl Allocation {
             permissions: RwLock::new(HashSet::new()),
             channels: DashMap::new(),
             channels_reverse: DashMap::new(),
-            ssrcs: RwLock::new(HashSet::new()),
             known_peers: DashMap::new(),
             expires_at: RwLock::new(now + std::time::Duration::from_secs(lifetime_secs as u64)),
             last_activity: RwLock::new(now),
             last_received: RwLock::new(now),
             last_successful_relay: RwLock::new(None),
             username,
+            paired_ufrag: RwLock::new(None),
+            ice_ufrag: RwLock::new(None),
+            ice_remote_ufrag: RwLock::new(None),
         }
+    }
+
+    /// Set the paired ufrag (from ICE USERNAME)
+    /// Returns true if this is a new pairing
+    pub fn set_paired_ufrag(&self, ufrag: String) -> bool {
+        let mut guard = self.paired_ufrag.write();
+        if guard.as_ref() == Some(&ufrag) {
+            return false;
+        }
+        *guard = Some(ufrag);
+        true
+    }
+
+    /// Get the paired ufrag
+    pub fn get_paired_ufrag(&self) -> Option<String> {
+        self.paired_ufrag.read().clone()
+    }
+
+    /// Set this allocation's ICE ufrag (from STUN USERNAME local part)
+    /// Returns true if this is a new value
+    pub fn set_ice_ufrag(&self, ufrag: String) -> bool {
+        let mut guard = self.ice_ufrag.write();
+        if guard.as_ref() == Some(&ufrag) {
+            return false;
+        }
+        *guard = Some(ufrag);
+        true
+    }
+
+    /// Get this allocation's ICE ufrag
+    pub fn get_ice_ufrag(&self) -> Option<String> {
+        self.ice_ufrag.read().clone()
+    }
+
+    /// Set the remote ICE ufrag (peer this allocation communicates with)
+    pub fn set_ice_remote_ufrag(&self, ufrag: String) -> bool {
+        let mut guard = self.ice_remote_ufrag.write();
+        if guard.as_ref() == Some(&ufrag) {
+            return false;
+        }
+        *guard = Some(ufrag);
+        true
+    }
+
+    /// Get the remote ICE ufrag
+    pub fn get_ice_remote_ufrag(&self) -> Option<String> {
+        self.ice_remote_ufrag.read().clone()
     }
 
     /// Check if a peer IP is permitted
@@ -134,25 +188,6 @@ impl Allocation {
     /// Get peer address for a channel
     pub fn peer_for_channel(&self, channel: u16) -> Option<SocketAddr> {
         self.channels.get(&channel).map(|r| *r)
-    }
-
-    /// Maximum SSRCs to track per allocation (prevents memory DoS)
-    const MAX_SSRCS_PER_ALLOCATION: usize = 100;
-
-    /// Register an SSRC with this allocation
-    ///
-    /// If the limit is reached, oldest SSRCs are not tracked (we just ignore new ones)
-    /// Returns true if the SSRC was newly registered, false if already known or limit reached
-    pub fn register_ssrc(&self, ssrc: u32) -> bool {
-        let mut ssrcs = self.ssrcs.write();
-        if ssrcs.contains(&ssrc) {
-            return false; // Already known
-        }
-        if ssrcs.len() >= Self::MAX_SSRCS_PER_ALLOCATION {
-            return false; // Limit reached, don't track more
-        }
-        ssrcs.insert(ssrc);
-        true
     }
 
     /// Update last activity time
@@ -236,15 +271,16 @@ pub struct AllocationTable {
     /// Lookup by local ufrag
     by_ufrag: DashMap<String, AllocationId>,
 
-    /// Lookup by SSRC (may have multiple allocations per SSRC in rare cases)
-    by_ssrc: DashMap<u32, AllocationId>,
-
     /// Lookup by permitted peer IP -> list of allocations
     /// (multiple clients may permit the same peer)
     by_permission: DashMap<IpAddr, Vec<AllocationId>>,
 
     /// Lookup by (peer_ip, peer_port) for fast path
     by_peer_tuple: DashMap<SocketAddr, AllocationId>,
+
+    /// Lookup by ICE ufrag (learned from STUN USERNAME attribute)
+    /// This is the client's actual ICE ufrag, not server-generated
+    by_ice_ufrag: DashMap<String, AllocationId>,
 }
 
 impl AllocationTable {
@@ -254,9 +290,9 @@ impl AllocationTable {
             allocations: DashMap::new(),
             by_client: DashMap::new(),
             by_ufrag: DashMap::new(),
-            by_ssrc: DashMap::new(),
             by_permission: DashMap::new(),
             by_peer_tuple: DashMap::new(),
+            by_ice_ufrag: DashMap::new(),
         }
     }
 
@@ -355,9 +391,108 @@ impl AllocationTable {
         self.by_ufrag.get(ufrag).map(|r| *r)
     }
 
-    /// Lookup by SSRC
-    pub fn lookup_by_ssrc(&self, ssrc: u32) -> Option<AllocationId> {
-        self.by_ssrc.get(&ssrc).map(|r| *r)
+    /// Find all allocations that are paired with a given ufrag
+    /// These are allocations that want to receive data from the allocation with that ufrag
+    pub fn find_paired_allocations(&self, ufrag: &str) -> Vec<AllocationId> {
+        let mut result = Vec::new();
+        for entry in self.allocations.iter() {
+            if let Some(paired) = entry.value().get_paired_ufrag() {
+                if paired == ufrag {
+                    result.push(entry.value().id);
+                }
+            }
+        }
+        result
+    }
+
+    /// Set pairing: receiver with ice_ufrag=receiver_ufrag should receive from sender_ufrag
+    /// This is called when we see sender send STUN Binding Request to receiver
+    /// Returns true if the pairing was set, false if receiver not found
+    pub fn set_pairing(&self, sender_ice_ufrag: &str, receiver_ice_ufrag: &str) -> bool {
+        // Find the receiver allocation by ICE ufrag
+        if let Some(receiver_id) = self.lookup_by_ice_ufrag(receiver_ice_ufrag) {
+            if let Some(receiver_alloc) = self.allocations.get(&receiver_id) {
+                receiver_alloc.set_paired_ufrag(sender_ice_ufrag.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Register ICE ufrag pair for an allocation (learned from STUN USERNAME)
+    /// local_ufrag is this client's ufrag, remote_ufrag is who they want to talk to
+    ///
+    /// Uses by_ice_ufrag as atomic check: if local_ufrag already registered to another
+    /// allocation, this is a broadcast duplicate and we skip registration.
+    pub fn register_ice_ufrags(
+        &self,
+        id: AllocationId,
+        local_ufrag: String,
+        remote_ufrag: String,
+    ) -> bool {
+        // Atomic check: try to insert into by_ice_ufrag index
+        // If already exists for DIFFERENT allocation, this is broadcast duplicate
+        use dashmap::mapref::entry::Entry;
+        match self.by_ice_ufrag.entry(local_ufrag.clone()) {
+            Entry::Occupied(_) => {
+                // Already registered by this or another allocation - skip
+                false
+            }
+            Entry::Vacant(entry) => {
+                // Not registered yet - this allocation wins
+                if let Some(alloc) = self.allocations.get(&id) {
+                    if alloc.get_ice_ufrag().is_some() {
+                        // Allocation already has different ufrag, don't overwrite
+                        return false;
+                    }
+                    alloc.set_ice_ufrag(local_ufrag.clone());
+                    alloc.set_ice_remote_ufrag(remote_ufrag);
+                    entry.insert(id);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Lookup by ICE ufrag (client's actual ICE ufrag from STUN)
+    pub fn lookup_by_ice_ufrag(&self, ice_ufrag: &str) -> Option<AllocationId> {
+        self.by_ice_ufrag.get(ice_ufrag).map(|r| *r)
+    }
+
+    /// Find all allocations paired with a given ICE ufrag
+    /// These are allocations that want to receive from sender with that ice_ufrag
+    pub fn find_paired_by_ice_ufrag(&self, ice_ufrag: &str) -> Vec<AllocationId> {
+        let mut result = Vec::new();
+        for entry in self.allocations.iter() {
+            if let Some(paired) = entry.value().get_paired_ufrag() {
+                if paired == ice_ufrag {
+                    result.push(entry.value().id);
+                }
+            }
+        }
+        result
+    }
+
+    /// Find allocations that are ICE peers of the sender
+    /// Uses bi-directional matching: if sender has (local=X, remote=Y),
+    /// find allocations with (local=Y, remote=X)
+    pub fn find_ice_peers(&self, sender_local: &str, sender_remote: &str) -> Vec<AllocationId> {
+        let mut result = Vec::new();
+        for entry in self.allocations.iter() {
+            let alloc = entry.value();
+            // Check bi-directional match: sender's remote should be peer's local
+            // and sender's local should be peer's remote
+            if let (Some(peer_local), Some(peer_remote)) =
+                (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
+            {
+                if peer_local == sender_remote && peer_remote == sender_local {
+                    result.push(alloc.id);
+                }
+            }
+        }
+        result
     }
 
     /// Lookup by peer IP (may return multiple allocations)
@@ -366,6 +501,28 @@ impl AllocationTable {
             .get(&ip)
             .map(|r| r.clone())
             .unwrap_or_default()
+    }
+
+    /// Lookup by peer address - prefer tuple, fallback to IP
+    ///
+    /// Returns (candidates, is_unique) where:
+    /// - candidates: list of allocation IDs that may receive this traffic
+    /// - is_unique: true if exactly one candidate (safe to register tuple)
+    ///
+    /// This function enables fast-path routing: on first packet from a peer,
+    /// if is_unique is true, the caller should register the tuple for future
+    /// direct lookups. This avoids bandwidth multiplication when multiple
+    /// allocations share the same peer IP permission.
+    pub fn lookup_by_peer_addr(&self, addr: SocketAddr) -> (Vec<AllocationId>, bool) {
+        // Fast path: direct tuple lookup (already registered)
+        if let Some(id) = self.by_peer_tuple.get(&addr) {
+            return (vec![*id], true);
+        }
+
+        // Slow path: IP-based lookup (first packet from this peer)
+        let candidates = self.lookup_by_peer_ip(addr.ip());
+        let is_unique = candidates.len() == 1;
+        (candidates, is_unique)
     }
 
     /// Add permission and update index
@@ -381,18 +538,6 @@ impl AllocationTable {
         }
     }
 
-    /// Register SSRC and update index
-    ///
-    /// Only adds to global index if the allocation accepts the SSRC (hasn't hit limit)
-    pub fn register_ssrc(&self, id: AllocationId, ssrc: u32) {
-        if let Some(alloc) = self.allocations.get(&id) {
-            if alloc.register_ssrc(ssrc) {
-                // Only add to global index if allocation accepted it
-                self.by_ssrc.insert(ssrc, id);
-            }
-        }
-    }
-
     /// Register peer tuple for fast path lookup
     /// Also records in known_peers so it gets cleaned up with the allocation
     pub fn register_peer_tuple(&self, id: AllocationId, peer_addr: SocketAddr) {
@@ -405,7 +550,6 @@ impl AllocationTable {
                 .entry(peer_addr)
                 .or_insert_with(|| PeerInfo {
                     last_seen: Instant::now(),
-                    ssrcs: HashSet::new(),
                 });
         }
     }
@@ -416,8 +560,8 @@ impl AllocationTable {
             self.by_client.remove(&alloc.client_addr);
             self.by_ufrag.remove(&alloc.local_ufrag);
 
-            for ssrc in alloc.ssrcs.read().iter() {
-                self.by_ssrc.remove(ssrc);
+            if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                self.by_ice_ufrag.remove(&ice_ufrag);
             }
 
             for peer_ip in alloc.permissions.read().iter() {
@@ -442,8 +586,8 @@ impl AllocationTable {
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
-                for ssrc in alloc.ssrcs.read().iter() {
-                    self.by_ssrc.remove(ssrc);
+                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                    self.by_ice_ufrag.remove(&ice_ufrag);
                 }
                 for peer_ip in alloc.permissions.read().iter() {
                     if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
@@ -468,7 +612,7 @@ impl AllocationTable {
         let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_inactive(timeout_secs) {
-                tracing::info!(
+                tracing::debug!(
                     "Removing inactive allocation {} for {} (no traffic for {}s)",
                     id,
                     alloc.client_addr,
@@ -478,8 +622,8 @@ impl AllocationTable {
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
-                for ssrc in alloc.ssrcs.read().iter() {
-                    self.by_ssrc.remove(ssrc);
+                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                    self.by_ice_ufrag.remove(&ice_ufrag);
                 }
                 for peer_ip in alloc.permissions.read().iter() {
                     if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
@@ -504,7 +648,7 @@ impl AllocationTable {
         let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_orphaned_sender(timeout_secs) {
-                tracing::info!(
+                tracing::debug!(
                     "Removing orphaned sender {} for {} (no relay targets for {}s)",
                     id,
                     alloc.client_addr,
@@ -514,8 +658,8 @@ impl AllocationTable {
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
-                for ssrc in alloc.ssrcs.read().iter() {
-                    self.by_ssrc.remove(ssrc);
+                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                    self.by_ice_ufrag.remove(&ice_ufrag);
                 }
                 for peer_ip in alloc.permissions.read().iter() {
                     if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
@@ -584,16 +728,5 @@ mod tests {
         let found = table.lookup_by_peer_ip(peer_ip);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], id);
-    }
-
-    #[test]
-    fn test_ssrc_lookup() {
-        let table = AllocationTable::new();
-        let client = "192.168.1.100:54321".parse().unwrap();
-
-        let id = table.create(client, "testuser".to_string(), 600);
-        table.register_ssrc(id, 0x12345678);
-
-        assert_eq!(table.lookup_by_ssrc(0x12345678), Some(id));
     }
 }
