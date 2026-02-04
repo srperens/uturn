@@ -263,7 +263,7 @@ impl TurnHandler {
     ) -> Result<()> {
         info!("Allocate request from {}", src_addr);
 
-        // Check if already allocated - treat as retransmission and return success
+        // 1. Check if already allocated - treat as retransmission and return success
         if let Some(alloc) = self.allocations.get_by_client(src_addr) {
             debug!(
                 "Allocation already exists for {} - returning success for retransmission",
@@ -286,26 +286,14 @@ impl TurnHandler {
             return Ok(());
         }
 
-        // Check rate limits and allocation quota before processing new allocation
-        if let Err(e) = self.rate_limiter.check_allocation_request(src_addr.ip()) {
-            warn!("Allocate request rejected for {}: {}", src_addr, e);
-            let error_code = match e {
-                RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
-                RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
-            };
-            let response = self.build_error_response(msg, error_code);
-            socket.send_to(&response, src_addr).await?;
-            return Ok(());
-        }
-
-        // Validate REQUESTED-TRANSPORT (RFC 5766 requires UDP = 17)
+        // 2. Validate REQUESTED-TRANSPORT (RFC 5766 requires UDP = 17)
+        // This is checked before auth/rate-limit as it's a protocol error
         match msg.requested_transport {
             Some(17) => {
                 // UDP is supported
             }
             Some(other) => {
                 warn!("Unsupported transport protocol {} from {}", other, src_addr);
-                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_error_response(msg, TurnErrorCode::UnsupportedTransport);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
@@ -317,13 +305,14 @@ impl TurnHandler {
             }
         }
 
-        // Authentication check if credentials are configured
+        // 3. Authentication check BEFORE rate limiting
+        // Auth failures should return 401, not 508 (rate limit errors)
+        // Only valid auth attempts should count against rate limits
         if !self.config.credentials.is_empty() {
             // Check if MESSAGE-INTEGRITY is present
             if msg.message_integrity.is_none() {
                 // First request without credentials - send 401 with REALM and NONCE
                 debug!("Allocate request missing MESSAGE-INTEGRITY, sending 401");
-                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_unauthorized_response(msg);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
@@ -334,7 +323,6 @@ impl TurnHandler {
                 Some(u) => u,
                 None => {
                     warn!("Allocate request has MESSAGE-INTEGRITY but no USERNAME");
-                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -345,7 +333,6 @@ impl TurnHandler {
                 Some(p) => p,
                 None => {
                     warn!("Unknown username in Allocate request: {}", username);
-                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_unauthorized_response(msg);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -360,7 +347,6 @@ impl TurnHandler {
                     &self.config.nonce_secret,
                 ) {
                     warn!("Stale nonce from {}", src_addr);
-                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     // 438 Stale Nonce must include REALM and fresh NONCE per RFC 5389
                     let response = self.build_stale_nonce_response(msg);
                     socket.send_to(&response, src_addr).await?;
@@ -368,7 +354,6 @@ impl TurnHandler {
                 }
             } else {
                 warn!("Missing nonce from {}", src_addr);
-                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
@@ -382,7 +367,6 @@ impl TurnHandler {
                         "Realm mismatch from {}: client sent '{}', expected '{}'",
                         src_addr, realm, self.config.realm
                     );
-                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_unauthorized_response(msg);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -393,7 +377,6 @@ impl TurnHandler {
                         "Missing REALM attribute in Allocate request from {}",
                         src_addr
                     );
-                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_unauthorized_response(msg);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -416,7 +399,6 @@ impl TurnHandler {
 
                 if !TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, &key) {
                     warn!("Invalid MESSAGE-INTEGRITY from {}", src_addr);
-                    self.rate_limiter.cancel_reservation(src_addr.ip());
                     let response = self.build_unauthorized_response(msg);
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
@@ -425,13 +407,24 @@ impl TurnHandler {
                 debug!("MESSAGE-INTEGRITY validated for user {}", username);
             } else {
                 warn!("MESSAGE-INTEGRITY parsing error");
-                self.rate_limiter.cancel_reservation(src_addr.ip());
                 let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
 
-            // Valid credentials - create allocation atomically
+            // 4. Authentication passed - NOW check rate limits
+            if let Err(e) = self.rate_limiter.check_allocation_request(src_addr.ip()) {
+                warn!("Allocate request rejected for {}: {}", src_addr, e);
+                let error_code = match e {
+                    RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
+                    RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
+                };
+                let response = self.build_error_response(msg, error_code);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+
+            // 5. Valid credentials and rate limit passed - create allocation atomically
             let lifetime = 60;
             let (alloc_id, created) =
                 self.allocations
@@ -469,6 +462,18 @@ impl TurnHandler {
             socket.send_to(&response, src_addr).await?;
         } else {
             // No authentication configured - anonymous access
+            // Check rate limits for anonymous requests
+            if let Err(e) = self.rate_limiter.check_allocation_request(src_addr.ip()) {
+                warn!("Allocate request rejected for {}: {}", src_addr, e);
+                let error_code = match e {
+                    RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
+                    RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
+                };
+                let response = self.build_error_response(msg, error_code);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+
             let username = msg.username.as_deref().unwrap_or("anonymous");
 
             // Create allocation atomically
