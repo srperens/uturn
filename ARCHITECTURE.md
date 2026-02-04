@@ -33,8 +33,8 @@ uTURN is a WebRTC-focused TURN server that operates on a single UDP port. Unlike
                                     │  │  │ Allocation 1 (Client A) │  │  │
                                     │  │  │ - permissions           │  │  │
                                     │  │  │ - channels              │  │  │
-                                    │  │  │ - ufrag mapping         │  │  │
-                                    │  │  │ - ssrc mapping          │  │  │
+                                    │  │  │ - ice_ufrag             │  │  │
+                                    │  │  │ - ice_remote_ufrag      │  │  │
                                     │  │  └─────────────────────────┘  │  │
                                     │  │  ┌─────────────────────────┐  │  │
                                     │  │  │ Allocation 2 (Client B) │  │  │
@@ -96,47 +96,46 @@ impl Demuxer {
 | 64-79 | TURN ChannelData |
 | 128-191 | RTP or RTCP |
 
-#### STUN Session Identification
+#### STUN Session Identification (ICE Ufrag Pairing)
 
-STUN messages contain USERNAME attribute: `serverUfrag:clientUfrag`
+STUN Binding Requests contain USERNAME attribute: `remoteUfrag:localUfrag`
+
+Each allocation learns its ICE credentials from STUN messages and uses **bi-directional matching** to find its peer:
 
 ```rust
-fn extract_ufrag(stun: &StunMessage) -> Option<(String, String)> {
-    let username = stun.get_attribute::<Username>()?;
-    let parts: Vec<&str> = username.split(':').collect();
-    Some((parts[0].to_string(), parts[1].to_string()))
+// Extract ufrags from STUN USERNAME attribute
+fn extract_stun_ufrags(data: &[u8]) -> Option<(String, String)> {
+    // Parse USERNAME attribute (type 0x0006)
+    // Format: "remoteUfrag:localUfrag"
+    // Returns (remote_ufrag, local_ufrag)
+}
+
+// Bi-directional matching: find allocations where their
+// (local, remote) matches our (remote, local)
+fn find_ice_peers(sender_local: &str, sender_remote: &str) -> Vec<AllocationId> {
+    // If sender has local=X, remote=Y
+    // Find peers with local=Y, remote=X
 }
 ```
 
-#### RTP/RTCP SSRC Extraction
-
-```rust
-fn extract_ssrc(rtp_data: &[u8]) -> Option<u32> {
-    if rtp_data.len() < 12 {
-        return None;
-    }
-    // SSRC is bytes 8-11 (big-endian)
-    Some(u32::from_be_bytes([
-        rtp_data[8], rtp_data[9], rtp_data[10], rtp_data[11]
-    ]))
-}
-```
+The ICE ufrag pairing is learned atomically on the first STUN Binding Request using DashMap's entry API, preventing duplicate registrations when the same STUN message is broadcast to multiple allocations.
 
 ### 3. Allocation Manager
 
 Tracks all active TURN allocations and their state.
 
 ```rust
-pub struct AllocationManager {
+pub struct AllocationTable {
     // Primary lookup: client address → allocation
-    by_client: HashMap<SocketAddr, AllocationId>,
+    by_client: DashMap<SocketAddr, AllocationId>,
 
     // Reverse lookups for demuxing
-    by_ufrag: HashMap<String, AllocationId>,
-    by_ssrc: HashMap<u32, AllocationId>,
-    by_permission: HashMap<IpAddr, Vec<AllocationId>>,
+    by_ufrag: DashMap<String, AllocationId>,         // TURN ufrag
+    by_ice_ufrag: DashMap<String, AllocationId>,     // ICE local ufrag
+    by_peer_ip: DashMap<IpAddr, Vec<AllocationId>>,  // Permission-based
+    by_peer_tuple: DashMap<SocketAddr, AllocationId>, // Direct peer lookup
 
-    allocations: HashMap<AllocationId, Allocation>,
+    allocations: DashMap<AllocationId, Allocation>,
 }
 
 pub struct Allocation {
@@ -144,21 +143,20 @@ pub struct Allocation {
     client_addr: SocketAddr,
     relay_addr: SocketAddr,  // Always external_ip:listen_port
 
-    // ICE credentials
-    local_ufrag: String,
-    remote_ufrag: Option<String>,
+    // TURN credentials
+    ufrag: String,
+
+    // ICE credentials (learned from STUN Binding Requests)
+    ice_ufrag: RwLock<Option<String>>,         // This allocation's ICE ufrag
+    ice_remote_ufrag: RwLock<Option<String>>,  // Remote peer's ICE ufrag
 
     // TURN state
-    permissions: HashSet<IpAddr>,
-    channels: HashMap<u16, SocketAddr>,  // channel_id → peer_addr
-
-    // Learned mappings for fast demux
-    known_ssrcs: HashSet<u32>,
-    known_peers: HashMap<SocketAddr, PeerState>,
+    permissions: RwLock<HashSet<IpAddr>>,
+    channels: DashMap<u16, SocketAddr>,  // channel_id → peer_addr
 
     // Lifetime management
-    expires_at: Instant,
-    last_activity: Instant,
+    expires_at: RwLock<Instant>,
+    last_activity: AtomicU64,
 }
 ```
 
@@ -186,10 +184,23 @@ impl TurnHandler {
 
 ### 5. Relay Engine
 
-Forwards media between peers and clients.
+Forwards media between peers and clients, with ICE ufrag-based routing.
 
 ```rust
 impl RelayEngine {
+    /// Handle ChannelData from client - may contain STUN for ICE pairing
+    pub async fn handle_channel_data(&self, data: &[u8], alloc: &Allocation) {
+        // If this is a STUN Binding Request, learn ICE credentials
+        if let Some((remote_ufrag, local_ufrag)) = extract_stun_ufrags(data) {
+            // Atomically register this allocation's ICE ufrags
+            self.allocations.register_ice_ufrags(alloc.id, local_ufrag, remote_ufrag);
+
+            // Find peer allocations using bi-directional matching
+            let ice_peers = self.allocations.find_ice_peers(&local, &remote);
+            // Route to matched peers...
+        }
+    }
+
     /// Peer → Client: Media arriving from a peer for relay to client
     pub async fn relay_to_client(
         &self,
@@ -198,7 +209,7 @@ impl RelayEngine {
         allocation: &Allocation,
     ) {
         // Check permission
-        if !allocation.permissions.contains(&peer_addr.ip()) {
+        if !allocation.has_permission(&peer_addr.ip()) {
             return; // Drop: no permission
         }
 
@@ -220,7 +231,7 @@ impl RelayEngine {
         allocation: &Allocation,
     ) {
         // Check permission
-        if !allocation.permissions.contains(&peer_addr.ip()) {
+        if !allocation.has_permission(&peer_addr.ip()) {
             return;
         }
 
@@ -258,9 +269,8 @@ Peer                    uTURN                         Client
   │    (to :3478)         │                              │
   │                       │ Demux:                       │
   │                       │ 1. First byte → RTP          │
-  │                       │ 2. Extract SSRC              │
-  │                       │ 3. Lookup allocation         │
-  │                       │    (by SSRC or src tuple)    │
+  │                       │ 2. Lookup by peer tuple      │
+  │                       │ 3. Or lookup by ICE pairing  │
   │                       │ 4. Check permission          │
   │                       │                              │
   │                       │─── Data Indication ─────────►│
@@ -283,21 +293,28 @@ Packet arrives from (ip, port)
      ▼           ▼             ▼            ▼
    STUN       DTLS           RTP      ChannelData
      │           │             │            │
-     ▼           │             ▼            ▼
- ┌────────┐      │      ┌───────────┐  ┌─────────┐
- │ Parse  │      │      │ Extract   │  │ Channel │
- │ ufrag  │      │      │   SSRC    │  │   ID    │
- └───┬────┘      │      └─────┬─────┘  └────┬────┘
-     │           │            │             │
-     └───────────┴────────────┴─────────────┘
+     ▼           │             │            ▼
+ ┌────────┐      │             │       ┌─────────┐
+ │ Parse  │      │             │       │ Channel │
+ │ ufrag  │      │             │       │   ID    │
+ └───┬────┘      │             │       └────┬────┘
+     │           │             │            │
+     ▼           │             │            │
+ ┌────────────┐  │             │            │
+ │ Learn ICE  │  │             │            │
+ │ pair for   │  │             │            │
+ │ allocation │  │             │            │
+ └───┬────────┘  │             │            │
+     │           │             │            │
+     └───────────┴─────────────┴────────────┘
                        │
                        ▼
               ┌─────────────────┐
               │ Lookup by:      │
               │ 1. src (ip,port)│ ◄── fast path
-              │ 2. ufrag        │
-              │ 3. SSRC         │
-              │ 4. channel ID   │
+              │ 2. ICE ufrag    │ ◄── bi-directional
+              │    pairing      │     matching
+              │ 3. channel ID   │
               └────────┬────────┘
                        │
                        ▼
@@ -310,6 +327,46 @@ Packet arrives from (ip, port)
                    ▼     ▼
               Process   Drop
 ```
+
+## Single-Port Routing with ICE Ufrag Pairing
+
+### The Problem
+
+In single-port TURN, all clients share the same relay address (`external_ip:port`). When a peer sends media to this address, we must determine which client should receive it.
+
+**Without proper routing:** If multiple clients have `CreatePermission` for the same peer IP, data gets duplicated to all of them, causing bandwidth multiplication.
+
+### The Solution: ICE Ufrag Bi-Directional Matching
+
+WebRTC ICE connectivity checks use STUN Binding Requests with a USERNAME attribute formatted as `remoteUfrag:localUfrag`. Each side of a connection uses complementary credentials:
+
+```
+Client A (sender):   local=X, remote=Y  →  USERNAME="Y:X"
+Client B (receiver): local=Y, remote=X  →  USERNAME="X:Y"
+```
+
+When Client A sends a STUN Binding Request, we:
+1. Extract `(remote_ufrag=Y, local_ufrag=X)` from USERNAME
+2. Register `ice_ufrag=X` and `ice_remote_ufrag=Y` on Client A's allocation
+3. Look for allocations where `ice_ufrag=Y` and `ice_remote_ufrag=X` (the inverse)
+4. Found match = Client B is Client A's peer
+
+### Atomic Registration
+
+Since STUN Binding Requests may be broadcast to multiple allocations (via IP-based permission lookup), we use atomic registration with DashMap's entry API:
+
+```rust
+match self.by_ice_ufrag.entry(local_ufrag) {
+    Entry::Occupied(_) => false,  // Already claimed by another allocation
+    Entry::Vacant(entry) => {
+        // First one wins - register atomically
+        entry.insert(id);
+        true
+    }
+}
+```
+
+This ensures each ICE ufrag is registered exactly once, preventing duplicate routing.
 
 ## State Machine
 
@@ -357,9 +414,7 @@ uturn/
 │   │
 │   ├── demux/
 │   │   ├── mod.rs           # Demultiplexer
-│   │   ├── protocol.rs      # Protocol detection (RFC 7983)
-│   │   ├── stun.rs          # STUN parsing, ufrag extraction
-│   │   └── rtp.rs           # RTP header parsing, SSRC
+│   │   └── protocol.rs      # Protocol detection (RFC 7983)
 │   │
 │   ├── turn/
 │   │   ├── mod.rs
@@ -374,7 +429,8 @@ uturn/
 │   │
 │   └── lookup/
 │       ├── mod.rs
-│       └── table.rs         # Fast lookup tables
+│       ├── table.rs         # Allocation table & ICE ufrag indexes
+│       └── rate_limit.rs    # Per-client rate limiting
 │
 └── tests/
     ├── integration.rs
