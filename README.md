@@ -68,18 +68,23 @@ docker run -p 3478:3478/udp \
 
 ## Testing
 
-Test with `turnutils_uclient` from [coturn](https://github.com/coturn/coturn):
+Test with `turnutils_uclient` and `turnutils_peer` from [coturn](https://github.com/coturn/coturn):
 
 ```bash
-# Basic client-to-client test
-turnutils_uclient -y -u alice -w secretpass your-server-ip
+# Start a peer server on the TURN server (or any reachable host)
+ssh your-server 'turnutils_peer -p 33333 &'
 
-# Multiple clients
-turnutils_uclient -y -m 4 -u alice -w secretpass your-server-ip
+# Run the TURN client test
+turnutils_uclient -u alice -w secretpass -e your-server-ip -r 33333 your-server-ip
 
 # Expected output: 0% packet loss
 # Total lost packets 0 (0.000000%)
+
+# Clean up
+ssh your-server 'pkill turnutils_peer'
 ```
+
+Note: The `-y` self-test flag doesn't work with single-port TURN since client and peer share the same relay address.
 
 ## Features
 
@@ -107,7 +112,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details.
 
 **Allocation lookup:**
 - Source address → client allocation
-- Peer IP permission → target allocations
+- ICE ufrag pairing → bi-directional peer matching (prevents bandwidth multiplication)
+- Peer IP permission → target allocations (fallback)
 - Channel number → peer address binding
 
 ## License
