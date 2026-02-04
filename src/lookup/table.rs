@@ -2,8 +2,8 @@
 //!
 //! Multiple lookup paths for efficient packet routing:
 //! - Source address (fast path for established flows)
-//! - ICE username fragment
-//! - SSRC
+//! - ICE username fragment (bi-directional matching)
+//! - Peer tuple (IP:port)
 //! - TURN channel ID
 
 use std::collections::HashSet;
@@ -54,13 +54,6 @@ pub struct Allocation {
     /// Reverse channel lookup: peer_addr -> channel_id
     pub channels_reverse: DashMap<SocketAddr, u16>,
 
-    /// Known SSRCs associated with this allocation (SSRCs we've seen FROM this client)
-    pub ssrcs: RwLock<HashSet<u32>>,
-
-    /// SSRCs this allocation is listening to (learned from RTCP Receiver Reports)
-    /// When client sends RTCP RR about an SSRC, it means they're receiving that stream
-    pub listening_ssrcs: RwLock<HashSet<u32>>,
-
     /// Known peer addresses (learned from traffic)
     pub known_peers: DashMap<SocketAddr, PeerInfo>,
 
@@ -98,9 +91,6 @@ pub struct Allocation {
 pub struct PeerInfo {
     /// When we last saw traffic from this peer
     pub last_seen: Instant,
-
-    /// SSRCs observed from this peer
-    pub ssrcs: HashSet<u32>,
 }
 
 impl Allocation {
@@ -115,8 +105,6 @@ impl Allocation {
             permissions: RwLock::new(HashSet::new()),
             channels: DashMap::new(),
             channels_reverse: DashMap::new(),
-            ssrcs: RwLock::new(HashSet::new()),
-            listening_ssrcs: RwLock::new(HashSet::new()),
             known_peers: DashMap::new(),
             expires_at: RwLock::new(now + std::time::Duration::from_secs(lifetime_secs as u64)),
             last_activity: RwLock::new(now),
@@ -202,45 +190,6 @@ impl Allocation {
         self.channels.get(&channel).map(|r| *r)
     }
 
-    /// Maximum SSRCs to track per allocation (prevents memory DoS)
-    const MAX_SSRCS_PER_ALLOCATION: usize = 100;
-
-    /// Register an SSRC with this allocation (SSRC we've seen FROM this client)
-    ///
-    /// If the limit is reached, oldest SSRCs are not tracked (we just ignore new ones)
-    /// Returns true if the SSRC was newly registered, false if already known or limit reached
-    pub fn register_ssrc(&self, ssrc: u32) -> bool {
-        let mut ssrcs = self.ssrcs.write();
-        if ssrcs.contains(&ssrc) {
-            return false; // Already known
-        }
-        if ssrcs.len() >= Self::MAX_SSRCS_PER_ALLOCATION {
-            return false; // Limit reached, don't track more
-        }
-        ssrcs.insert(ssrc);
-        true
-    }
-
-    /// Register an SSRC that this allocation is listening to (from RTCP Receiver Reports)
-    ///
-    /// Returns true if the SSRC was newly registered
-    pub fn register_listening_ssrc(&self, ssrc: u32) -> bool {
-        let mut ssrcs = self.listening_ssrcs.write();
-        if ssrcs.contains(&ssrc) {
-            return false;
-        }
-        if ssrcs.len() >= Self::MAX_SSRCS_PER_ALLOCATION {
-            return false;
-        }
-        ssrcs.insert(ssrc);
-        true
-    }
-
-    /// Check if this allocation is listening to a specific SSRC
-    pub fn is_listening_to(&self, ssrc: u32) -> bool {
-        self.listening_ssrcs.read().contains(&ssrc)
-    }
-
     /// Update last activity time
     pub fn touch(&self) {
         *self.last_activity.write() = Instant::now();
@@ -322,19 +271,12 @@ pub struct AllocationTable {
     /// Lookup by local ufrag
     by_ufrag: DashMap<String, AllocationId>,
 
-    /// Lookup by SSRC (may have multiple allocations per SSRC in rare cases)
-    by_ssrc: DashMap<u32, AllocationId>,
-
     /// Lookup by permitted peer IP -> list of allocations
     /// (multiple clients may permit the same peer)
     by_permission: DashMap<IpAddr, Vec<AllocationId>>,
 
     /// Lookup by (peer_ip, peer_port) for fast path
     by_peer_tuple: DashMap<SocketAddr, AllocationId>,
-
-    /// Lookup by listening SSRC -> list of allocations that want to receive this SSRC
-    /// (learned from RTCP Receiver Reports)
-    by_listening_ssrc: DashMap<u32, Vec<AllocationId>>,
 
     /// Lookup by ICE ufrag (learned from STUN USERNAME attribute)
     /// This is the client's actual ICE ufrag, not server-generated
@@ -348,10 +290,8 @@ impl AllocationTable {
             allocations: DashMap::new(),
             by_client: DashMap::new(),
             by_ufrag: DashMap::new(),
-            by_ssrc: DashMap::new(),
             by_permission: DashMap::new(),
             by_peer_tuple: DashMap::new(),
-            by_listening_ssrc: DashMap::new(),
             by_ice_ufrag: DashMap::new(),
         }
     }
@@ -555,11 +495,6 @@ impl AllocationTable {
         result
     }
 
-    /// Lookup by SSRC
-    pub fn lookup_by_ssrc(&self, ssrc: u32) -> Option<AllocationId> {
-        self.by_ssrc.get(&ssrc).map(|r| *r)
-    }
-
     /// Lookup by peer IP (may return multiple allocations)
     pub fn lookup_by_peer_ip(&self, ip: IpAddr) -> Vec<AllocationId> {
         self.by_permission
@@ -603,42 +538,6 @@ impl AllocationTable {
         }
     }
 
-    /// Register SSRC and update index
-    ///
-    /// Only adds to global index if the allocation accepts the SSRC (hasn't hit limit)
-    pub fn register_ssrc(&self, id: AllocationId, ssrc: u32) {
-        if let Some(alloc) = self.allocations.get(&id) {
-            if alloc.register_ssrc(ssrc) {
-                // Only add to global index if allocation accepted it
-                self.by_ssrc.insert(ssrc, id);
-            }
-        }
-    }
-
-    /// Register a listening SSRC for an allocation (from RTCP Receiver Reports)
-    ///
-    /// This records that the allocation wants to receive RTP with this SSRC.
-    /// Used for SSRC-based routing to avoid bandwidth multiplication.
-    pub fn register_listening_ssrc(&self, id: AllocationId, ssrc: u32) {
-        if let Some(alloc) = self.allocations.get(&id) {
-            if alloc.register_listening_ssrc(ssrc) {
-                // Add to index - multiple allocations may listen to same SSRC
-                let mut entry = self.by_listening_ssrc.entry(ssrc).or_default();
-                if !entry.contains(&id) {
-                    entry.push(id);
-                }
-            }
-        }
-    }
-
-    /// Lookup allocations that are listening to a specific SSRC
-    pub fn lookup_listeners_by_ssrc(&self, ssrc: u32) -> Vec<AllocationId> {
-        self.by_listening_ssrc
-            .get(&ssrc)
-            .map(|r| r.clone())
-            .unwrap_or_default()
-    }
-
     /// Register peer tuple for fast path lookup
     /// Also records in known_peers so it gets cleaned up with the allocation
     pub fn register_peer_tuple(&self, id: AllocationId, peer_addr: SocketAddr) {
@@ -651,7 +550,6 @@ impl AllocationTable {
                 .entry(peer_addr)
                 .or_insert_with(|| PeerInfo {
                     last_seen: Instant::now(),
-                    ssrcs: HashSet::new(),
                 });
         }
     }
@@ -664,16 +562,6 @@ impl AllocationTable {
 
             if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                 self.by_ice_ufrag.remove(&ice_ufrag);
-            }
-
-            for ssrc in alloc.ssrcs.read().iter() {
-                self.by_ssrc.remove(ssrc);
-            }
-
-            for ssrc in alloc.listening_ssrcs.read().iter() {
-                if let Some(mut ids) = self.by_listening_ssrc.get_mut(ssrc) {
-                    ids.retain(|&i| i != id);
-                }
             }
 
             for peer_ip in alloc.permissions.read().iter() {
@@ -700,14 +588,6 @@ impl AllocationTable {
                 self.by_ufrag.remove(&alloc.local_ufrag);
                 if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(&ice_ufrag);
-                }
-                for ssrc in alloc.ssrcs.read().iter() {
-                    self.by_ssrc.remove(ssrc);
-                }
-                for ssrc in alloc.listening_ssrcs.read().iter() {
-                    if let Some(mut ids) = self.by_listening_ssrc.get_mut(ssrc) {
-                        ids.retain(|&i| i != *id);
-                    }
                 }
                 for peer_ip in alloc.permissions.read().iter() {
                     if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
@@ -745,14 +625,6 @@ impl AllocationTable {
                 if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(&ice_ufrag);
                 }
-                for ssrc in alloc.ssrcs.read().iter() {
-                    self.by_ssrc.remove(ssrc);
-                }
-                for ssrc in alloc.listening_ssrcs.read().iter() {
-                    if let Some(mut ids) = self.by_listening_ssrc.get_mut(ssrc) {
-                        ids.retain(|&i| i != *id);
-                    }
-                }
                 for peer_ip in alloc.permissions.read().iter() {
                     if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
                         ids.retain(|&i| i != *id);
@@ -788,14 +660,6 @@ impl AllocationTable {
                 self.by_ufrag.remove(&alloc.local_ufrag);
                 if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(&ice_ufrag);
-                }
-                for ssrc in alloc.ssrcs.read().iter() {
-                    self.by_ssrc.remove(ssrc);
-                }
-                for ssrc in alloc.listening_ssrcs.read().iter() {
-                    if let Some(mut ids) = self.by_listening_ssrc.get_mut(ssrc) {
-                        ids.retain(|&i| i != *id);
-                    }
                 }
                 for peer_ip in alloc.permissions.read().iter() {
                     if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
@@ -864,16 +728,5 @@ mod tests {
         let found = table.lookup_by_peer_ip(peer_ip);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], id);
-    }
-
-    #[test]
-    fn test_ssrc_lookup() {
-        let table = AllocationTable::new();
-        let client = "192.168.1.100:54321".parse().unwrap();
-
-        let id = table.create(client, "testuser".to_string(), 600);
-        table.register_ssrc(id, 0x12345678);
-
-        assert_eq!(table.lookup_by_ssrc(0x12345678), Some(id));
     }
 }

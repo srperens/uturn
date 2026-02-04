@@ -329,9 +329,8 @@ impl RelayEngine {
         if is_unique {
             let alloc_id = candidates[0];
 
-            // Register tuple and SSRC for fast path on future packets
+            // Register tuple for fast path on future packets
             self.allocations.register_peer_tuple(alloc_id, peer_addr);
-            self.allocations.register_ssrc(alloc_id, ssrc);
 
             if let Some(alloc) = self.allocations.get(alloc_id) {
                 if alloc.is_permitted(peer_addr.ip()) {
