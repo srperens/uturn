@@ -256,7 +256,8 @@ impl RelayEngine {
                 // Debug: log occasionally
                 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if count.is_multiple_of(1000) {
+                #[allow(clippy::manual_is_multiple_of)]
+                if count % 1000 == 0 {
                     debug!(
                         "RTP from {} (local={:?}, remote={:?}), {} ICE peers",
                         src_addr,
