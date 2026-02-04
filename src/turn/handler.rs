@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
 use crate::demux::StunInfo;
@@ -738,7 +738,7 @@ impl TurnHandler {
         let alloc = match self.allocations.get_by_client(src_addr) {
             Some(a) => a,
             None => {
-                warn!("Send indication from unknown client: {}", src_addr);
+                trace!("Send indication from unknown client: {}", src_addr);
                 return Ok(());
             }
         };
@@ -804,7 +804,7 @@ impl TurnHandler {
             }
 
             if !sent {
-                warn!(
+                trace!(
                     "No target allocation found for internal routing from {}",
                     src_addr
                 );
@@ -819,7 +819,7 @@ impl TurnHandler {
         let data = match &msg.data {
             Some(d) => d,
             None => {
-                warn!("Send indication missing DATA from {}", src_addr);
+                trace!("Send indication missing DATA from {}", src_addr);
                 return Ok(());
             }
         };

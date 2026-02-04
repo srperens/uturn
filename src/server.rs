@@ -284,7 +284,7 @@ impl Server {
                         );
                         self.relay_engine.handle_peer_data(data, src_addr).await?;
                     } else {
-                        warn!(
+                        trace!(
                             "Unknown packet type from {} ({} bytes)",
                             src_addr,
                             data.len()
@@ -310,14 +310,14 @@ impl Server {
         let sender_alloc = match self.allocations.get_by_client(src_addr) {
             Some(alloc) => alloc,
             None => {
-                warn!("relay_client_data from unknown client: {}", src_addr);
+                trace!("relay_client_data from unknown client: {}", src_addr);
                 return Ok(());
             }
         };
 
         // Check that SENDER has permission for the relay IP (RFC 5766 requirement)
         if !sender_alloc.is_permitted(self.config.external_ip) {
-            warn!(
+            trace!(
                 "Client {} tried to relay data without permission for relay IP",
                 src_addr
             );

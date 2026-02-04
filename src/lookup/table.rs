@@ -612,7 +612,7 @@ impl AllocationTable {
         let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_inactive(timeout_secs) {
-                tracing::info!(
+                tracing::debug!(
                     "Removing inactive allocation {} for {} (no traffic for {}s)",
                     id,
                     alloc.client_addr,
@@ -648,7 +648,7 @@ impl AllocationTable {
         let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_orphaned_sender(timeout_secs) {
-                tracing::info!(
+                tracing::debug!(
                     "Removing orphaned sender {} for {} (no relay targets for {}s)",
                     id,
                     alloc.client_addr,

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::config::Config;
 use crate::lookup::{Allocation, AllocationId, AllocationTable};
@@ -168,7 +168,7 @@ impl RelayEngine {
         let alloc = match self.allocations.get_by_client(src_addr) {
             Some(a) => a,
             None => {
-                warn!("ChannelData from unknown client: {}", src_addr);
+                trace!("ChannelData from unknown client: {}", src_addr);
                 return Ok(());
             }
         };
@@ -177,9 +177,10 @@ impl RelayEngine {
         let peer_addr = match alloc.peer_for_channel(channel) {
             Some(addr) => addr,
             None => {
-                warn!(
+                trace!(
                     "ChannelData for unbound channel {} from {}",
-                    channel, src_addr
+                    channel,
+                    src_addr
                 );
                 return Ok(());
             }
@@ -187,7 +188,7 @@ impl RelayEngine {
 
         // Check permission
         if !alloc.is_permitted(peer_addr.ip()) {
-            warn!("No permission for peer {} in allocation", peer_addr);
+            trace!("No permission for peer {} in allocation", peer_addr);
             return Ok(());
         }
 
