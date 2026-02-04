@@ -224,15 +224,10 @@ impl Server {
                     debug!("RTP from client {} - relaying to other clients", src_addr);
                     self.relay_client_data(&data, src_addr).await?;
                 } else {
-                    // Check if this is from a permitted peer
-                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    // Check if this is from a permitted peer (prefer tuple, fallback to IP)
+                    let (candidates, _) = self.allocations.lookup_by_peer_addr(src_addr);
                     if !candidates.is_empty() {
-                        // Use SSRC-aware routing to disambiguate when multiple clients
-                        // permit the same peer IP
-                        debug!(
-                            "RTP from peer {} (SSRC={:08x}) - relaying with SSRC routing",
-                            src_addr, ssrc
-                        );
+                        debug!("RTP from peer {} (SSRC={:08x}) - relaying", src_addr, ssrc);
                         self.relay_engine.handle_rtp(ssrc, &data, src_addr).await?;
                     } else {
                         trace!("RTP (SSRC={:08x}) from unknown {}", ssrc, src_addr);
@@ -245,7 +240,7 @@ impl Server {
                     debug!("RTCP from client {} - relaying to other clients", src_addr);
                     self.relay_client_data(&data, src_addr).await?;
                 } else {
-                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    let (candidates, _) = self.allocations.lookup_by_peer_addr(src_addr);
                     if !candidates.is_empty() {
                         debug!("RTCP from peer {} - relaying", src_addr);
                         self.relay_engine.handle_rtcp(&data, src_addr).await?;
@@ -261,7 +256,7 @@ impl Server {
                     debug!("DTLS from client {} - relaying to other clients", src_addr);
                     self.relay_client_data(&data, src_addr).await?;
                 } else {
-                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    let (candidates, _) = self.allocations.lookup_by_peer_addr(src_addr);
                     if !candidates.is_empty() {
                         debug!("DTLS from peer {} - relaying via Data Indication", src_addr);
                         // Use handle_dtls which always uses Data Indication (not ChannelData)
@@ -281,7 +276,7 @@ impl Server {
                     );
                     self.relay_client_data(data, src_addr).await?;
                 } else {
-                    let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
+                    let (candidates, _) = self.allocations.lookup_by_peer_addr(src_addr);
                     if !candidates.is_empty() {
                         debug!(
                             "Unknown data from peer {} - relaying via Data Indication",
