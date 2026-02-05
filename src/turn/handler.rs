@@ -293,6 +293,9 @@ impl TurnHandler {
                 }
             }
 
+            // Update inactivity timer - client is actively sending ICE checks
+            sender_alloc.touch_received();
+
             // For TURN clients: don't respond ourselves - let the peer respond
             // This allows consent freshness to work correctly (timeout if peer is gone)
             return Ok(());

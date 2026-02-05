@@ -633,6 +633,11 @@ impl AllocationTable {
         let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_expired() {
+                tracing::info!(
+                    "Removing expired allocation {} for {} (lifetime ended)",
+                    id,
+                    alloc.client_addr
+                );
                 // Clean up indices before removal
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
@@ -670,7 +675,7 @@ impl AllocationTable {
         let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_inactive(timeout_secs) {
-                tracing::debug!(
+                tracing::info!(
                     "Removing inactive allocation {} for {} (no traffic for {}s)",
                     id,
                     alloc.client_addr,
@@ -713,7 +718,7 @@ impl AllocationTable {
         let mut removed_ips = Vec::new();
         self.allocations.retain(|id, alloc| {
             if alloc.is_orphaned_sender(timeout_secs) {
-                tracing::debug!(
+                tracing::info!(
                     "Removing orphaned sender {} for {} (no relay targets for {}s)",
                     id,
                     alloc.client_addr,

@@ -21,7 +21,7 @@ use crate::turn::TurnHandler;
 const CLEANUP_INTERVAL_SECS: u64 = 10;
 
 /// Inactivity timeout - remove allocation if no traffic FROM client for this long
-const INACTIVITY_TIMEOUT_SECS: u64 = 30;
+const INACTIVITY_TIMEOUT_SECS: u64 = 45;
 
 /// uTURN server
 pub struct Server {

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use tokio::signal;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -33,7 +34,7 @@ struct Args {
     log_level: Level,
 
     /// Maximum allocations per IP address (0 = unlimited)
-    #[arg(long, env = "UTURN_MAX_ALLOC_PER_IP", default_value = "10")]
+    #[arg(long, env = "UTURN_MAX_ALLOC_PER_IP", default_value = "200")]
     max_allocations_per_ip: u32,
 
     /// Rate limit: max allocation requests per IP per minute (0 = unlimited)
@@ -98,5 +99,39 @@ async fn main() -> Result<()> {
     );
 
     let server = Server::new(config).await?;
-    server.run().await
+
+    // Run server with graceful shutdown on SIGTERM/SIGINT
+    tokio::select! {
+        result = server.run() => {
+            result
+        }
+        _ = shutdown_signal() => {
+            info!("Received shutdown signal, exiting gracefully");
+            Ok(())
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
