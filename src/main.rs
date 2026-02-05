@@ -41,10 +41,6 @@ struct Args {
     #[arg(long, env = "UTURN_RATE_LIMIT", default_value = "30")]
     rate_limit_per_minute: u32,
 
-    /// Maximum concurrent packet handling tasks (0 = unlimited)
-    #[arg(long, env = "UTURN_MAX_TASKS", default_value = "1000")]
-    max_concurrent_tasks: u32,
-
     /// Nonce validity period in seconds
     #[arg(long, env = "UTURN_NONCE_LIFETIME", default_value = "3600")]
     nonce_lifetime_secs: u64,
@@ -86,7 +82,6 @@ async fn main() -> Result<()> {
         credentials,
         max_allocations_per_ip: args.max_allocations_per_ip,
         rate_limit_per_minute: args.rate_limit_per_minute,
-        max_concurrent_tasks: args.max_concurrent_tasks,
         nonce_lifetime_secs: args.nonce_lifetime_secs,
         nonce_secret,
     };

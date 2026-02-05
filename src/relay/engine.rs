@@ -590,13 +590,16 @@ impl RelayEngine {
     }
 
     /// Send TURN ChannelData to client
+    #[inline]
     async fn send_channel_data(
         &self,
         channel: u16,
         data: &[u8],
         client_addr: SocketAddr,
     ) -> Result<()> {
-        let mut packet = Vec::with_capacity(4 + data.len());
+        // Pre-calculate padded size
+        let padding = (4 - ((4 + data.len()) % 4)) % 4;
+        let mut packet = Vec::with_capacity(4 + data.len() + padding);
 
         // Channel number
         packet.extend_from_slice(&channel.to_be_bytes());
@@ -607,16 +610,15 @@ impl RelayEngine {
         // Data
         packet.extend_from_slice(data);
 
-        // Pad to 4-byte boundary
-        while packet.len() % 4 != 0 {
-            packet.push(0);
-        }
+        // Pad to 4-byte boundary (more efficient than byte-by-byte)
+        packet.resize(packet.len() + padding, 0);
 
         self.socket.send_to(&packet, client_addr).await?;
         Ok(())
     }
 
     /// Send TURN Data Indication to client
+    #[inline]
     async fn send_data_indication(
         &self,
         peer_addr: SocketAddr,
@@ -646,10 +648,9 @@ impl RelayEngine {
         packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
         packet.extend_from_slice(data);
 
-        // Pad DATA attribute
-        while (packet.len() - 20) % 4 != 0 {
-            packet.push(0);
-        }
+        // Pad DATA attribute to 4-byte boundary
+        let padding = (4 - ((packet.len() - 20) % 4)) % 4;
+        packet.resize(packet.len() + padding, 0);
 
         // Update length
         let msg_len = (packet.len() - 20) as u16;

@@ -1,4 +1,6 @@
 //! Main server implementation
+//!
+//! Performance-optimized: processes packets inline without task-per-packet overhead.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -6,10 +8,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::buffer_pool::BufferPool;
 use crate::coarse_time;
 use crate::config::Config;
 use crate::demux::{Demuxer, PacketType};
@@ -23,6 +23,9 @@ const CLEANUP_INTERVAL_SECS: u64 = 10;
 /// Inactivity timeout - remove allocation if no traffic FROM client for this long
 const INACTIVITY_TIMEOUT_SECS: u64 = 45;
 
+/// Receive buffer size - MTU is typically 1500, but allow for jumbo frames
+const RECV_BUFFER_SIZE: usize = 2048;
+
 /// uTURN server
 pub struct Server {
     config: Arc<Config>,
@@ -31,8 +34,6 @@ pub struct Server {
     turn_handler: Arc<TurnHandler>,
     relay_engine: Arc<RelayEngine>,
     rate_limiter: Arc<RateLimiter>,
-    task_semaphore: Option<Arc<Semaphore>>,
-    buffer_pool: Arc<BufferPool>,
 }
 
 impl Server {
@@ -54,18 +55,6 @@ impl Server {
             config.rate_limit_per_minute,
             config.max_allocations_per_ip,
         ));
-
-        let task_semaphore = if config.max_concurrent_tasks > 0 {
-            Some(Arc::new(Semaphore::new(
-                config.max_concurrent_tasks as usize,
-            )))
-        } else {
-            None
-        };
-
-        // Create and pre-allocate buffer pool
-        let buffer_pool = BufferPool::new();
-        buffer_pool.preallocate(64); // Pre-allocate some buffers
 
         let config = Arc::new(config);
         let socket = Arc::new(socket);
@@ -90,13 +79,11 @@ impl Server {
             turn_handler,
             relay_engine,
             rate_limiter,
-            task_semaphore,
-            buffer_pool,
         })
     }
 
     /// Run the server main loop
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(&self) -> Result<()> {
         info!(
             "uTURN server running - relay address: {}:{}",
             self.config.external_ip, self.config.port
@@ -149,12 +136,12 @@ impl Server {
             }
         });
 
-        // Main receive loop - uses buffer pool to reduce allocations
-        loop {
-            // Get a buffer from the pool (reused, not allocated per-packet)
-            let mut pooled_buf = self.buffer_pool.get();
+        // Main receive loop - process packets inline for maximum performance
+        // No task spawning, no buffer pool mutex, no Arc clones per packet
+        let mut recv_buf = vec![0u8; RECV_BUFFER_SIZE];
 
-            let (len, src_addr) = match self.socket.recv_from(pooled_buf.as_mut_slice()).await {
+        loop {
+            let (len, src_addr) = match self.socket.recv_from(&mut recv_buf).await {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Failed to receive packet: {}", e);
@@ -164,43 +151,10 @@ impl Server {
 
             trace!("Received {} bytes from {}", len, src_addr);
 
-            // Acquire semaphore permit for backpressure (if configured)
-            let permit = match &self.task_semaphore {
-                Some(sem) => match sem.clone().try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    Err(_) => {
-                        // At capacity - drop packet (buffer returns to pool on drop)
-                        warn!("Task queue at capacity, dropping packet from {}", src_addr);
-                        continue;
-                    }
-                },
-                None => None,
-            };
-
-            // Clone the data for the spawned task
-            // Note: We still need to copy here because the task needs ownership,
-            // but the receive buffer is reused via the pool
-            let data = pooled_buf.as_slice(len).to_vec();
-
-            // Spawn task to handle packet
-            let server = Server {
-                config: self.config.clone(),
-                socket: self.socket.clone(),
-                allocations: self.allocations.clone(),
-                turn_handler: self.turn_handler.clone(),
-                relay_engine: self.relay_engine.clone(),
-                rate_limiter: self.rate_limiter.clone(),
-                task_semaphore: self.task_semaphore.clone(),
-                buffer_pool: self.buffer_pool.clone(),
-            };
-
-            tokio::spawn(async move {
-                // Hold permit until task completes
-                let _permit = permit;
-                if let Err(e) = server.handle_packet(&data, src_addr).await {
-                    warn!("Error handling packet from {}: {}", src_addr, e);
-                }
-            });
+            // Process packet inline - no spawn overhead
+            if let Err(e) = self.handle_packet(&recv_buf[..len], src_addr).await {
+                warn!("Error handling packet from {}: {}", src_addr, e);
+            }
         }
     }
 
@@ -348,6 +302,9 @@ impl Server {
         // Find all allocations that have permission for our relay IP
         let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
 
+        // Pre-build the Data Indication once, reuse for all targets
+        let indication = self.build_data_indication(relay_addr, data);
+
         let mut relayed = false;
         for alloc_id in candidates {
             if let Some(target_alloc) = self.allocations.get(alloc_id) {
@@ -369,9 +326,7 @@ impl Server {
                     relay_addr
                 );
 
-                // Build and send Data indication
-                // XOR-PEER-ADDRESS = relay address (peer from receiver's perspective)
-                let indication = self.build_data_indication(relay_addr, data);
+                // Send pre-built indication
                 self.socket
                     .send_to(&indication, target_alloc.client_addr)
                     .await?;
@@ -397,6 +352,7 @@ impl Server {
     }
 
     /// Build a TURN Data Indication message
+    #[inline]
     fn build_data_indication(&self, peer_addr: SocketAddr, data: &[u8]) -> Vec<u8> {
         let mut packet = Vec::with_capacity(48 + data.len());
 
@@ -421,10 +377,9 @@ impl Server {
         packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
         packet.extend_from_slice(data);
 
-        // Pad DATA attribute to 4-byte boundary
-        while (packet.len() - 20) % 4 != 0 {
-            packet.push(0);
-        }
+        // Pad DATA attribute to 4-byte boundary (more efficient than byte-by-byte)
+        let padding = (4 - ((packet.len() - 20) % 4)) % 4;
+        packet.resize(packet.len() + padding, 0);
 
         // Update length field
         let msg_len = (packet.len() - 20) as u16;
@@ -434,6 +389,7 @@ impl Server {
     }
 
     /// Append XOR-PEER-ADDRESS attribute to buffer
+    #[inline]
     fn append_xor_peer_address(
         &self,
         buf: &mut Vec<u8>,
