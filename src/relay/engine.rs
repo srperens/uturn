@@ -13,8 +13,27 @@ use crate::config::Config;
 use crate::lookup::{Allocation, AllocationId, AllocationTable};
 
 /// Check if data looks like RTP (vs RTCP)
+/// Check if data is DTLS (content types 0x14-0x19, version 0xFExx)
+fn is_dtls(data: &[u8]) -> bool {
+    if data.len() < 3 {
+        return false;
+    }
+    // DTLS content types: 0x14=ChangeCipherSpec, 0x15=Alert, 0x16=Handshake,
+    // 0x17=ApplicationData, 0x18-0x19=Heartbeat
+    let content_type = data[0];
+    if !(0x14..=0x19).contains(&content_type) {
+        return false;
+    }
+    // DTLS version starts with 0xFE (1.0=0xFEFF, 1.2=0xFEFD)
+    data[1] == 0xFE
+}
+
 fn is_rtp(data: &[u8]) -> bool {
     if data.len() < 2 {
+        return false;
+    }
+    // DTLS should not be classified as RTP
+    if is_dtls(data) {
         return false;
     }
     // RTP payload types 0-34, 96-127 are common
@@ -164,6 +183,14 @@ impl RelayEngine {
         data: &[u8],
         src_addr: SocketAddr,
     ) -> Result<()> {
+        trace!(
+            "ChannelData ch=0x{:04x} from {} ({} bytes, first byte: 0x{:02x})",
+            channel,
+            src_addr,
+            data.len(),
+            data.first().copied().unwrap_or(0)
+        );
+
         // Find allocation by client address
         let alloc = match self.allocations.get_by_client(src_addr) {
             Some(a) => a,
@@ -239,8 +266,16 @@ impl RelayEngine {
                 self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
                     .await?;
             } else if !is_rtp(data) {
-                // RTCP - broadcast to paired allocation and others
-                self.relay_to_paired_or_all(data, src_addr, &alloc, relay_addr)
+                // Non-RTP (DTLS/RTCP) - always broadcast to all clients with relay permission
+                // DTLS handshake may start before ICE ufrags are registered, so we can't
+                // rely on ufrag-based routing. Broadcasting is safe because DTLS will only
+                // succeed with the correct peer (certificate fingerprint matching).
+                debug!(
+                    "Non-RTP ChannelData from {} ({} bytes) - broadcasting to all",
+                    src_addr,
+                    data.len()
+                );
+                self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
                     .await?;
             } else {
                 // RTP - use bi-directional ICE ufrag matching
@@ -492,14 +527,11 @@ impl RelayEngine {
 
         for alloc_id in candidates {
             if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                // Skip sender
+                // Skip sender (exact match only - same IP and port)
                 if target_alloc.client_addr == src_addr {
                     continue;
                 }
-                // Don't echo data back to the same IP it came from
-                if target_alloc.client_addr.ip() == src_addr.ip() {
-                    continue;
-                }
+                // Note: We allow relaying to same IP different port (e.g., two browser tabs)
                 // Check permission
                 if !target_alloc.is_permitted(self.config.external_ip) {
                     continue;
@@ -533,14 +565,11 @@ impl RelayEngine {
     ) -> Result<()> {
         for &alloc_id in listeners {
             if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                // Skip sender
+                // Skip sender (exact match only - same IP and port)
                 if target_alloc.client_addr == src_addr {
                     continue;
                 }
-                // Don't echo data back to the same IP it came from
-                if target_alloc.client_addr.ip() == src_addr.ip() {
-                    continue;
-                }
+                // Note: We allow relaying to same IP different port (e.g., two browser tabs)
                 // Use reverse channel if available
                 if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
                     self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
@@ -548,35 +577,6 @@ impl RelayEngine {
                     target_alloc.touch();
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Relay to ICE peer allocation if known, otherwise broadcast
-    async fn relay_to_paired_or_all(
-        &self,
-        data: &[u8],
-        src_addr: SocketAddr,
-        sender_alloc: &Allocation,
-        relay_addr: SocketAddr,
-    ) -> Result<()> {
-        // Try to route to ICE peer using bi-directional matching
-        let peers = match (
-            sender_alloc.get_ice_ufrag(),
-            sender_alloc.get_ice_remote_ufrag(),
-        ) {
-            (Some(local), Some(remote)) => self.allocations.find_ice_peers(&local, &remote),
-            _ => Vec::new(),
-        };
-
-        if !peers.is_empty() {
-            self.relay_to_listeners(data, src_addr, &peers, relay_addr)
-                .await?;
-            sender_alloc.touch_relay_success();
-        } else {
-            // Fallback to broadcast
-            self.relay_to_all_except_sender(data, src_addr, sender_alloc, relay_addr)
-                .await?;
         }
         Ok(())
     }

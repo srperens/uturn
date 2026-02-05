@@ -204,6 +204,10 @@ impl TurnHandler {
     }
 
     /// Handle STUN Binding Request
+    ///
+    /// In single-port TURN, ICE connectivity checks may arrive as direct Binding Requests
+    /// (not via Send Indication) because the remote relay address equals the TURN server address.
+    /// We detect this case and relay the Binding Request to other clients.
     async fn handle_binding_request(
         &self,
         msg: &StunInfo,
@@ -212,7 +216,85 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("Binding request from {}", src_addr);
 
-        // Build binding response with XOR-MAPPED-ADDRESS
+        // Check if sender has a TURN allocation (is a TURN client doing ICE checks)
+        if let Some(sender_alloc) = self.allocations.get_by_client(src_addr) {
+            let alloc_id = sender_alloc.id;
+
+            // Register ICE ufrags from USERNAME attribute (format: "remoteUfrag:localUfrag")
+            // This is critical for single-port TURN to route DTLS/media correctly
+            if let Some((remote_ufrag, local_ufrag)) = msg.parse_ice_username() {
+                let registered = self.allocations.register_ice_ufrags(
+                    alloc_id,
+                    local_ufrag.clone(),
+                    remote_ufrag.clone(),
+                );
+                if registered {
+                    debug!(
+                        "Registered ICE ufrags for {}: local={}, remote={}",
+                        src_addr, local_ufrag, remote_ufrag
+                    );
+                }
+            }
+
+            // Auto-grant permission for relay IP if not already granted
+            // This handles the case where Chrome doesn't send CreatePermission
+            // when remote relay == local relay (single-port TURN)
+            if !sender_alloc.is_permitted(self.config.external_ip) {
+                drop(sender_alloc); // Release lock before modifying
+                self.allocations
+                    .add_permission(alloc_id, self.config.external_ip);
+                debug!(
+                    "Auto-granted permission for relay IP to allocation {}",
+                    alloc_id
+                );
+            }
+
+            // Re-acquire the allocation reference
+            let sender_alloc = match self.allocations.get_by_client(src_addr) {
+                Some(a) => a,
+                None => {
+                    let response = self.build_binding_response(msg, src_addr);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            };
+
+            // Now sender has permission for the relay IP
+            if sender_alloc.is_permitted(self.config.external_ip) {
+                let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
+
+                // Find other allocations that have permission for the relay IP
+                let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
+
+                for alloc_id in candidates {
+                    if let Some(target_alloc) = self.allocations.get(alloc_id) {
+                        // Skip the sender's own allocation
+                        if target_alloc.client_addr == src_addr {
+                            continue;
+                        }
+
+                        // Only relay to targets that also have permission for relay IP
+                        if !target_alloc.is_permitted(self.config.external_ip) {
+                            continue;
+                        }
+
+                        debug!(
+                            "Relaying Binding Request from {} to {} via Data Indication",
+                            src_addr, target_alloc.client_addr
+                        );
+
+                        // Relay the Binding Request via Data Indication
+                        // XOR-PEER-ADDRESS = relay address (from receiver's perspective)
+                        let indication = self.build_data_indication(relay_addr, &msg.raw);
+                        socket
+                            .send_to(&indication, target_alloc.client_addr)
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        // Always send normal Binding Response back to sender
         let response = self.build_binding_response(msg, src_addr);
         socket.send_to(&response, src_addr).await?;
 
