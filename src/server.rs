@@ -9,14 +9,13 @@ use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::buffer_pool::BufferPool;
+use crate::coarse_time;
 use crate::config::Config;
 use crate::demux::{Demuxer, PacketType};
 use crate::lookup::{AllocationTable, RateLimiter};
 use crate::relay::RelayEngine;
 use crate::turn::TurnHandler;
-
-/// Maximum UDP packet size
-const MAX_PACKET_SIZE: usize = 65535;
 
 /// Interval for cleaning up expired allocations
 const CLEANUP_INTERVAL_SECS: u64 = 10;
@@ -33,11 +32,15 @@ pub struct Server {
     relay_engine: Arc<RelayEngine>,
     rate_limiter: Arc<RateLimiter>,
     task_semaphore: Option<Arc<Semaphore>>,
+    buffer_pool: Arc<BufferPool>,
 }
 
 impl Server {
     /// Create a new server with the given configuration
     pub async fn new(config: Config) -> Result<Self> {
+        // Initialize coarse time system
+        coarse_time::init();
+
         // Bind to wildcard address matching the external IP's address family
         let bind_addr = match config.external_ip {
             std::net::IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], config.port)),
@@ -59,6 +62,10 @@ impl Server {
         } else {
             None
         };
+
+        // Create and pre-allocate buffer pool
+        let buffer_pool = BufferPool::new();
+        buffer_pool.preallocate(64); // Pre-allocate some buffers
 
         let config = Arc::new(config);
         let socket = Arc::new(socket);
@@ -84,17 +91,19 @@ impl Server {
             relay_engine,
             rate_limiter,
             task_semaphore,
+            buffer_pool,
         })
     }
 
     /// Run the server main loop
     pub async fn run(self) -> Result<()> {
-        let mut buf = vec![0u8; MAX_PACKET_SIZE];
-
         info!(
             "uTURN server running - relay address: {}:{}",
             self.config.external_ip, self.config.port
         );
+
+        // Spawn coarse time updater (updates timestamp every 10ms)
+        coarse_time::spawn_updater().await;
 
         // Spawn cleanup task for expired, inactive, and orphaned allocations
         let cleanup_allocations = self.allocations.clone();
@@ -140,8 +149,12 @@ impl Server {
             }
         });
 
+        // Main receive loop - uses buffer pool to reduce allocations
         loop {
-            let (len, src_addr) = match self.socket.recv_from(&mut buf).await {
+            // Get a buffer from the pool (reused, not allocated per-packet)
+            let mut pooled_buf = self.buffer_pool.get();
+
+            let (len, src_addr) = match self.socket.recv_from(pooled_buf.as_mut_slice()).await {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Failed to receive packet: {}", e);
@@ -149,8 +162,25 @@ impl Server {
                 }
             };
 
-            let data = buf[..len].to_vec();
             trace!("Received {} bytes from {}", len, src_addr);
+
+            // Acquire semaphore permit for backpressure (if configured)
+            let permit = match &self.task_semaphore {
+                Some(sem) => match sem.clone().try_acquire_owned() {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        // At capacity - drop packet (buffer returns to pool on drop)
+                        warn!("Task queue at capacity, dropping packet from {}", src_addr);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
+            // Clone the data for the spawned task
+            // Note: We still need to copy here because the task needs ownership,
+            // but the receive buffer is reused via the pool
+            let data = pooled_buf.as_slice(len).to_vec();
 
             // Spawn task to handle packet
             let server = Server {
@@ -161,19 +191,7 @@ impl Server {
                 relay_engine: self.relay_engine.clone(),
                 rate_limiter: self.rate_limiter.clone(),
                 task_semaphore: self.task_semaphore.clone(),
-            };
-
-            // Acquire semaphore permit for backpressure (if configured)
-            let permit = match &self.task_semaphore {
-                Some(sem) => match sem.clone().try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    Err(_) => {
-                        // At capacity - drop packet to prevent unbounded growth
-                        warn!("Task queue at capacity, dropping packet from {}", src_addr);
-                        continue;
-                    }
-                },
-                None => None,
+                buffer_pool: self.buffer_pool.clone(),
             };
 
             tokio::spawn(async move {

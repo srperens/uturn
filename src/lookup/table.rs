@@ -9,10 +9,11 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
+
+use crate::coarse_time::{coarse_now_ms, is_expired_secs};
 
 /// Unique allocation identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,19 +58,25 @@ pub struct Allocation {
     /// Known peer addresses (learned from traffic)
     pub known_peers: DashMap<SocketAddr, PeerInfo>,
 
-    /// Allocation expiry time
-    pub expires_at: RwLock<Instant>,
+    /// Allocation expiry time (milliseconds since coarse_time init)
+    expires_at_ms: AtomicU64,
 
-    /// Last activity time (any direction)
-    pub last_activity: RwLock<Instant>,
+    /// Allocation lifetime in seconds (for refresh calculations)
+    lifetime_secs: AtomicU64,
 
-    /// Last time we received traffic FROM the client
+    /// Last activity time (coarse timestamp, milliseconds since init)
+    last_activity_ms: AtomicU64,
+
+    /// Last time we received traffic FROM the client (coarse timestamp)
     /// Used for inactivity detection (client gone but sender still active)
-    pub last_received: RwLock<Instant>,
+    last_received_ms: AtomicU64,
 
-    /// Last time we successfully relayed data to at least one target
-    /// Used to detect senders with no recipients
-    pub last_successful_relay: RwLock<Option<Instant>>,
+    /// Last time we successfully relayed data (coarse timestamp)
+    /// Used to detect senders with no recipients. 0 = never tried.
+    last_successful_relay_ms: AtomicU64,
+
+    /// Whether we've ever attempted a relay (for orphan detection)
+    has_relay_attempt: std::sync::atomic::AtomicBool,
 
     /// Username for authentication
     pub username: String,
@@ -89,14 +96,15 @@ pub struct Allocation {
 /// Information about a known peer
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
-    /// When we last saw traffic from this peer
-    pub last_seen: Instant,
+    /// When we last saw traffic from this peer (coarse timestamp in ms)
+    pub last_seen_ms: u64,
 }
 
 impl Allocation {
     /// Create a new allocation
     pub fn new(client_addr: SocketAddr, username: String, lifetime_secs: u32) -> Self {
-        let now = Instant::now();
+        let now_ms = coarse_now_ms();
+        let expires_ms = now_ms + (lifetime_secs as u64 * 1000);
         Self {
             id: AllocationId::new(),
             client_addr,
@@ -106,10 +114,12 @@ impl Allocation {
             channels: DashMap::new(),
             channels_reverse: DashMap::new(),
             known_peers: DashMap::new(),
-            expires_at: RwLock::new(now + std::time::Duration::from_secs(lifetime_secs as u64)),
-            last_activity: RwLock::new(now),
-            last_received: RwLock::new(now),
-            last_successful_relay: RwLock::new(None),
+            expires_at_ms: AtomicU64::new(expires_ms),
+            lifetime_secs: AtomicU64::new(lifetime_secs as u64),
+            last_activity_ms: AtomicU64::new(now_ms),
+            last_received_ms: AtomicU64::new(now_ms),
+            last_successful_relay_ms: AtomicU64::new(0),
+            has_relay_attempt: std::sync::atomic::AtomicBool::new(false),
             username,
             paired_ufrag: RwLock::new(None),
             ice_ufrag: RwLock::new(None),
@@ -190,73 +200,97 @@ impl Allocation {
         self.channels.get(&channel).map(|r| *r)
     }
 
-    /// Update last activity time
+    /// Update last activity time (lock-free, uses coarse timestamp)
+    #[inline]
     pub fn touch(&self) {
-        *self.last_activity.write() = Instant::now();
+        self.last_activity_ms
+            .store(coarse_now_ms(), Ordering::Relaxed);
     }
 
     /// Update last received time (traffic FROM client)
     /// Call this only when receiving traffic FROM the client, not when sending TO them
+    #[inline]
     pub fn touch_received(&self) {
-        let now = Instant::now();
-        *self.last_received.write() = now;
-        *self.last_activity.write() = now;
+        let now = coarse_now_ms();
+        self.last_received_ms.store(now, Ordering::Relaxed);
+        self.last_activity_ms.store(now, Ordering::Relaxed);
     }
 
     /// Check if client is inactive (no traffic FROM client for given duration)
+    #[inline]
     pub fn is_inactive(&self, timeout_secs: u64) -> bool {
-        let last = *self.last_received.read();
-        Instant::now().duration_since(last).as_secs() >= timeout_secs
+        is_expired_secs(self.last_received_ms.load(Ordering::Relaxed), timeout_secs)
     }
 
     /// Record a successful relay (data was sent to at least one target)
+    #[inline]
     pub fn touch_relay_success(&self) {
-        *self.last_successful_relay.write() = Some(Instant::now());
+        self.last_successful_relay_ms
+            .store(coarse_now_ms(), Ordering::Relaxed);
+        self.has_relay_attempt.store(true, Ordering::Relaxed);
     }
 
     /// Record a relay attempt - starts the orphan timer if not already started
+    #[inline]
     pub fn touch_relay_attempt(&self) {
-        let mut guard = self.last_successful_relay.write();
-        if guard.is_none() {
-            // First relay attempt with no prior success - start the timer
-            *guard = Some(Instant::now());
+        // Only set if we haven't recorded any relay yet
+        if !self.has_relay_attempt.swap(true, Ordering::Relaxed) {
+            self.last_successful_relay_ms
+                .store(coarse_now_ms(), Ordering::Relaxed);
         }
     }
 
     /// Check if sender is orphaned (sending but no targets for given duration)
+    #[inline]
     pub fn is_orphaned_sender(&self, timeout_secs: u64) -> bool {
-        match *self.last_successful_relay.read() {
-            Some(relay_time) => {
-                // Check if last successful relay (or first attempt) was too long ago
-                Instant::now().duration_since(relay_time).as_secs() >= timeout_secs
-            }
-            None => {
-                // Never tried to relay - not orphaned (just a receiver or new allocation)
-                false
-            }
+        if !self.has_relay_attempt.load(Ordering::Relaxed) {
+            // Never tried to relay - not orphaned
+            return false;
         }
+        is_expired_secs(
+            self.last_successful_relay_ms.load(Ordering::Relaxed),
+            timeout_secs,
+        )
     }
 
     /// Check if allocation has expired
+    #[inline]
     pub fn is_expired(&self) -> bool {
-        Instant::now() > *self.expires_at.read()
+        coarse_now_ms() > self.expires_at_ms.load(Ordering::Relaxed)
     }
 
     /// Refresh the allocation lifetime
     pub fn refresh(&self, lifetime_secs: u32) {
-        *self.expires_at.write() =
-            Instant::now() + std::time::Duration::from_secs(lifetime_secs as u64);
+        let now_ms = coarse_now_ms();
+        let expires_ms = now_ms + (lifetime_secs as u64 * 1000);
+        self.expires_at_ms.store(expires_ms, Ordering::Relaxed);
+        self.lifetime_secs
+            .store(lifetime_secs as u64, Ordering::Relaxed);
     }
 
     /// Get remaining lifetime in seconds
     pub fn remaining_lifetime(&self) -> u32 {
-        let expires = *self.expires_at.read();
-        let now = Instant::now();
-        if expires > now {
-            (expires - now).as_secs() as u32
+        let expires_ms = self.expires_at_ms.load(Ordering::Relaxed);
+        let now_ms = coarse_now_ms();
+        if expires_ms > now_ms {
+            ((expires_ms - now_ms) / 1000) as u32
         } else {
             0
         }
+    }
+}
+
+/// ICE ufrag pair for bidirectional matching
+/// Format: (local_ufrag, remote_ufrag)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IceUfragPair {
+    local: String,
+    remote: String,
+}
+
+impl IceUfragPair {
+    fn new(local: String, remote: String) -> Self {
+        Self { local, remote }
     }
 }
 
@@ -281,6 +315,10 @@ pub struct AllocationTable {
     /// Lookup by ICE ufrag (learned from STUN USERNAME attribute)
     /// This is the client's actual ICE ufrag, not server-generated
     by_ice_ufrag: DashMap<String, AllocationId>,
+
+    /// Lookup by ICE ufrag pair for O(1) bidirectional matching
+    /// Key: (local_ufrag, remote_ufrag) -> allocation that wants to receive from that pair
+    by_ice_ufrag_pair: DashMap<IceUfragPair, AllocationId>,
 }
 
 impl AllocationTable {
@@ -293,6 +331,7 @@ impl AllocationTable {
             by_permission: DashMap::new(),
             by_peer_tuple: DashMap::new(),
             by_ice_ufrag: DashMap::new(),
+            by_ice_ufrag_pair: DashMap::new(),
         }
     }
 
@@ -446,8 +485,14 @@ impl AllocationTable {
                         return false;
                     }
                     alloc.set_ice_ufrag(local_ufrag.clone());
-                    alloc.set_ice_remote_ufrag(remote_ufrag);
+                    alloc.set_ice_remote_ufrag(remote_ufrag.clone());
                     entry.insert(id);
+
+                    // Also register in the pair index for O(1) bidirectional lookup
+                    // Key is (local, remote) so find_ice_peers can lookup by reverse
+                    let pair = IceUfragPair::new(local_ufrag, remote_ufrag);
+                    self.by_ice_ufrag_pair.insert(pair, id);
+
                     true
                 } else {
                     false
@@ -478,21 +523,20 @@ impl AllocationTable {
     /// Find allocations that are ICE peers of the sender
     /// Uses bi-directional matching: if sender has (local=X, remote=Y),
     /// find allocations with (local=Y, remote=X)
+    ///
+    /// This is now O(1) using the by_ice_ufrag_pair index instead of O(n) iteration.
     pub fn find_ice_peers(&self, sender_local: &str, sender_remote: &str) -> Vec<AllocationId> {
-        let mut result = Vec::new();
-        for entry in self.allocations.iter() {
-            let alloc = entry.value();
-            // Check bi-directional match: sender's remote should be peer's local
-            // and sender's local should be peer's remote
-            if let (Some(peer_local), Some(peer_remote)) =
-                (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
-            {
-                if peer_local == sender_remote && peer_remote == sender_local {
-                    result.push(alloc.id);
-                }
-            }
+        // We want to find allocations where:
+        // - their local_ufrag == sender's remote_ufrag
+        // - their remote_ufrag == sender's local_ufrag
+        // So we look up the "reverse" pair
+        let reverse_pair = IceUfragPair::new(sender_remote.to_string(), sender_local.to_string());
+
+        if let Some(id) = self.by_ice_ufrag_pair.get(&reverse_pair) {
+            vec![*id]
+        } else {
+            Vec::new()
         }
-        result
     }
 
     /// Lookup by peer IP (may return multiple allocations)
@@ -549,7 +593,7 @@ impl AllocationTable {
                 .known_peers
                 .entry(peer_addr)
                 .or_insert_with(|| PeerInfo {
-                    last_seen: Instant::now(),
+                    last_seen_ms: coarse_now_ms(),
                 });
         }
     }
@@ -560,7 +604,14 @@ impl AllocationTable {
             self.by_client.remove(&alloc.client_addr);
             self.by_ufrag.remove(&alloc.local_ufrag);
 
-            if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+            // Remove from ICE ufrag indices
+            if let (Some(ice_ufrag), Some(ice_remote)) =
+                (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
+            {
+                self.by_ice_ufrag.remove(&ice_ufrag);
+                let pair = IceUfragPair::new(ice_ufrag, ice_remote);
+                self.by_ice_ufrag_pair.remove(&pair);
+            } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                 self.by_ice_ufrag.remove(&ice_ufrag);
             }
 
@@ -586,7 +637,14 @@ impl AllocationTable {
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
-                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                // Clean up ICE ufrag indices
+                if let (Some(ice_ufrag), Some(ice_remote)) =
+                    (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
+                {
+                    self.by_ice_ufrag.remove(&ice_ufrag);
+                    let pair = IceUfragPair::new(ice_ufrag, ice_remote);
+                    self.by_ice_ufrag_pair.remove(&pair);
+                } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(&ice_ufrag);
                 }
                 for peer_ip in alloc.permissions.read().iter() {
@@ -622,7 +680,14 @@ impl AllocationTable {
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
-                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                // Clean up ICE ufrag indices
+                if let (Some(ice_ufrag), Some(ice_remote)) =
+                    (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
+                {
+                    self.by_ice_ufrag.remove(&ice_ufrag);
+                    let pair = IceUfragPair::new(ice_ufrag, ice_remote);
+                    self.by_ice_ufrag_pair.remove(&pair);
+                } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(&ice_ufrag);
                 }
                 for peer_ip in alloc.permissions.read().iter() {
@@ -658,7 +723,14 @@ impl AllocationTable {
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
                 self.by_ufrag.remove(&alloc.local_ufrag);
-                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                // Clean up ICE ufrag indices
+                if let (Some(ice_ufrag), Some(ice_remote)) =
+                    (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
+                {
+                    self.by_ice_ufrag.remove(&ice_ufrag);
+                    let pair = IceUfragPair::new(ice_ufrag, ice_remote);
+                    self.by_ice_ufrag_pair.remove(&pair);
+                } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(&ice_ufrag);
                 }
                 for peer_ip in alloc.permissions.read().iter() {

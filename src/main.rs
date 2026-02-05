@@ -91,8 +91,10 @@ async fn main() -> Result<()> {
     };
 
     info!(
-        "Starting uTURN server on :{} (external: {})",
-        config.port, config.external_ip
+        "Starting uTURN server v{} on :{} (external: {})",
+        env!("CARGO_PKG_VERSION"),
+        config.port,
+        config.external_ip
     );
 
     let server = Server::new(config).await?;
