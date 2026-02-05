@@ -1,6 +1,6 @@
 [package]
 name = "uturn"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
 description = "A single-port TURN relay server for WebRTC"
