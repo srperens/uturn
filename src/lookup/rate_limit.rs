@@ -1,5 +1,6 @@
 //! Rate limiting and quota enforcement
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::time::Instant;
 
@@ -9,7 +10,8 @@ use dashmap::DashMap;
 #[derive(Debug, Default)]
 struct RateLimitEntry {
     /// Timestamps of recent requests (within the window)
-    request_times: Vec<Instant>,
+    /// Uses VecDeque for O(1) removal of expired timestamps from front
+    request_times: VecDeque<Instant>,
     /// Current number of active allocations
     allocation_count: u32,
 }
@@ -48,10 +50,15 @@ impl RateLimiter {
         if self.max_requests_per_minute > 0 {
             let window = std::time::Duration::from_secs(60);
 
-            // Clean up old request times
-            entry
-                .request_times
-                .retain(|&t| now.duration_since(t) < window);
+            // Clean up old request times - O(k) where k = expired entries
+            // Timestamps are ordered (oldest first), so pop from front while expired
+            while let Some(&oldest) = entry.request_times.front() {
+                if now.duration_since(oldest) >= window {
+                    entry.request_times.pop_front();
+                } else {
+                    break;
+                }
+            }
 
             // Check rate limit
             if entry.request_times.len() >= self.max_requests_per_minute as usize {
@@ -59,7 +66,7 @@ impl RateLimiter {
             }
 
             // Record the request time
-            entry.request_times.push(now);
+            entry.request_times.push_back(now);
         }
 
         // Check allocation quota
@@ -112,9 +119,14 @@ impl RateLimiter {
 
         // Remove entries with no allocations and no recent requests
         self.entries.retain(|_, entry| {
-            entry
-                .request_times
-                .retain(|&t| now.duration_since(t) < window);
+            // Pop expired timestamps from front - O(k) where k = expired entries
+            while let Some(&oldest) = entry.request_times.front() {
+                if now.duration_since(oldest) >= window {
+                    entry.request_times.pop_front();
+                } else {
+                    break;
+                }
+            }
             entry.allocation_count > 0 || !entry.request_times.is_empty()
         });
     }

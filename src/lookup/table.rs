@@ -175,11 +175,13 @@ impl Allocation {
     }
 
     /// Check if a peer IP is permitted
+    #[inline]
     pub fn is_permitted(&self, peer_ip: IpAddr) -> bool {
         self.permissions.read().contains(&peer_ip)
     }
 
     /// Add a permission for a peer IP
+    #[inline]
     pub fn add_permission(&self, peer_ip: IpAddr) {
         self.permissions.write().insert(peer_ip);
     }
@@ -191,11 +193,13 @@ impl Allocation {
     }
 
     /// Get channel for a peer address
+    #[inline]
     pub fn channel_for_peer(&self, peer_addr: SocketAddr) -> Option<u16> {
         self.channels_reverse.get(&peer_addr).map(|r| *r)
     }
 
     /// Get peer address for a channel
+    #[inline]
     pub fn peer_for_channel(&self, channel: u16) -> Option<SocketAddr> {
         self.channels.get(&channel).map(|r| *r)
     }
@@ -384,6 +388,7 @@ impl AllocationTable {
     }
 
     /// Get allocation by ID
+    #[inline]
     pub fn get(
         &self,
         id: AllocationId,
@@ -392,6 +397,7 @@ impl AllocationTable {
     }
 
     /// Get allocation by client address
+    #[inline]
     pub fn get_by_client(
         &self,
         addr: SocketAddr,
@@ -402,12 +408,14 @@ impl AllocationTable {
 
     /// Check if address is a known client (has an allocation)
     /// Use this to determine if traffic is from a client vs a peer
+    #[inline]
     pub fn is_client(&self, addr: SocketAddr) -> bool {
         self.by_client.contains_key(&addr)
     }
 
     /// Lookup allocation ID by peer tuple (for relay traffic from peers)
     /// Returns the allocation that should receive traffic from this peer
+    #[inline]
     pub fn lookup_by_peer_tuple(&self, addr: SocketAddr) -> Option<AllocationId> {
         self.by_peer_tuple.get(&addr).map(|r| *r)
     }
@@ -540,6 +548,7 @@ impl AllocationTable {
     }
 
     /// Lookup by peer IP (may return multiple allocations)
+    #[inline]
     pub fn lookup_by_peer_ip(&self, ip: IpAddr) -> Vec<AllocationId> {
         self.by_permission
             .get(&ip)
@@ -557,6 +566,7 @@ impl AllocationTable {
     /// if is_unique is true, the caller should register the tuple for future
     /// direct lookups. This avoids bandwidth multiplication when multiple
     /// allocations share the same peer IP permission.
+    #[inline]
     pub fn lookup_by_peer_addr(&self, addr: SocketAddr) -> (Vec<AllocationId>, bool) {
         // Fast path: direct tuple lookup (already registered)
         if let Some(id) = self.by_peer_tuple.get(&addr) {
