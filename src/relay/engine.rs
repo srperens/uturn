@@ -304,9 +304,14 @@ impl RelayEngine {
 
                 if !peers.is_empty() {
                     // Route to ICE peer allocations only
-                    self.relay_to_listeners(data, src_addr, &peers, relay_addr)
+                    let relayed = self
+                        .relay_to_listeners(data, src_addr, &peers, relay_addr)
                         .await?;
-                    alloc.touch_relay_success();
+                    if relayed {
+                        alloc.touch_relay_success();
+                    } else {
+                        alloc.touch_relay_attempt();
+                    }
                 } else {
                     // No ICE peers found - broadcast (fallback)
                     self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
@@ -556,13 +561,15 @@ impl RelayEngine {
     }
 
     /// Relay data to specific listeners (ufrag-paired routing)
+    /// Returns true if data was sent to at least one target
     async fn relay_to_listeners(
         &self,
         data: &[u8],
         src_addr: SocketAddr,
         listeners: &[AllocationId],
         relay_addr: SocketAddr,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut relayed = false;
         for &alloc_id in listeners {
             if let Some(target_alloc) = self.allocations.get(alloc_id) {
                 // Skip sender (exact match only - same IP and port)
@@ -575,10 +582,11 @@ impl RelayEngine {
                     self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
                         .await?;
                     target_alloc.touch();
+                    relayed = true;
                 }
             }
         }
-        Ok(())
+        Ok(relayed)
     }
 
     /// Send TURN ChannelData to client

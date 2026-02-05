@@ -292,9 +292,13 @@ impl TurnHandler {
                     }
                 }
             }
+
+            // For TURN clients: don't respond ourselves - let the peer respond
+            // This allows consent freshness to work correctly (timeout if peer is gone)
+            return Ok(());
         }
 
-        // Always send normal Binding Response back to sender
+        // Non-TURN client: respond with normal Binding Response (server reflexive)
         let response = self.build_binding_response(msg, src_addr);
         socket.send_to(&response, src_addr).await?;
 
