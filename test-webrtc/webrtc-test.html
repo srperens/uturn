@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>uTURN WebRTC Test</title>
+  <style>
+    body { font-family: monospace; padding: 20px; max-width: 800px; margin: 0 auto; }
+    .config { background: #f0f0f0; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+    .config input { width: 200px; margin: 5px; padding: 5px; }
+    .config label { display: inline-block; width: 100px; }
+    button { padding: 10px 20px; margin: 5px; cursor: pointer; font-size: 16px; }
+    #log { background: #1e1e1e; color: #0f0; padding: 15px; height: 400px; overflow-y: auto;
+           border-radius: 5px; white-space: pre-wrap; font-size: 12px; }
+    .success { color: #0f0; }
+    .error { color: #f00; }
+    .info { color: #0af; }
+    .warn { color: #fa0; }
+    h2 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <h1>uTURN WebRTC Test <small style="font-size:12px;color:#888">v2.0</small></h1>
+
+  <div class="config">
+    <h2>TURN Server Config</h2>
+    <div>
+      <label>Server:</label>
+      <input type="text" id="turnServer" value="localhost:3478">
+    </div>
+    <div>
+      <label>Username:</label>
+      <input type="text" id="turnUser" value="test">
+    </div>
+    <div>
+      <label>Password:</label>
+      <input type="password" id="turnPass" value="test123">
+    </div>
+  </div>
+
+  <div>
+    <button onclick="startAsPeer1()">Start as Peer 1 (Caller)</button>
+    <button onclick="startAsPeer2()">Start as Peer 2 (Answerer)</button>
+    <button onclick="clearLog()">Clear Log</button>
+    <button onclick="copyLog()" style="background:#0af;color:white">Copy Log</button>
+  </div>
+
+  <p><strong>Instructions:</strong> Open this page in two browser tabs. Click "Peer 1" in one tab, then "Peer 2" in the other.</p>
+
+  <div id="log"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    let pc = null;
+    let dc = null;
+    let role = null;
+
+    // BroadcastChannel for signaling between tabs
+    const signaling = new BroadcastChannel('webrtc-signaling');
+
+    // Queue for ICE candidates that arrive before remote description is set
+    let pendingCandidates = [];
+    let remoteDescriptionSet = false;
+
+    function log(msg, type = 'info') {
+      const time = new Date().toISOString().substr(11, 12);
+      logEl.innerHTML += `<span class="${type}">[${time}] ${msg}</span>\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    function clearLog() {
+      logEl.innerHTML = '';
+    }
+
+    function copyLog() {
+      const text = logEl.innerText;
+      navigator.clipboard.writeText(text).then(() => {
+        log('Log copied to clipboard', 'success');
+      });
+    }
+
+    function getConfig() {
+      const server = document.getElementById('turnServer').value;
+      const user = document.getElementById('turnUser').value;
+      const pass = document.getElementById('turnPass').value;
+
+      return {
+        iceServers: [{
+          urls: `turn:${server}`,
+          username: user,
+          credential: pass
+        }],
+        iceTransportPolicy: 'relay'  // Force TURN relay
+      };
+    }
+
+    function createPeerConnection() {
+      const config = getConfig();
+      log(`Creating PeerConnection with TURN: ${config.iceServers[0].urls}`, 'info');
+      log(`iceTransportPolicy: relay (forcing all traffic through TURN)`, 'info');
+
+      pc = new RTCPeerConnection(config);
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          log(`ICE candidate: ${e.candidate.candidate.substring(0, 80)}...`, 'info');
+          signaling.postMessage({ type: 'candidate', candidate: e.candidate, from: role });
+        } else {
+          log('ICE gathering complete', 'success');
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE connection state: ${pc.iceConnectionState}`,
+            pc.iceConnectionState === 'connected' ? 'success' :
+            pc.iceConnectionState === 'failed' ? 'error' : 'info');
+      };
+
+      pc.onconnectionstatechange = () => {
+        log(`Connection state: ${pc.connectionState}`,
+            pc.connectionState === 'connected' ? 'success' :
+            pc.connectionState === 'failed' ? 'error' : 'info');
+
+        if (pc.connectionState === 'connected') {
+          log('=== CONNECTION ESTABLISHED VIA TURN! ===', 'success');
+        }
+      };
+
+      pc.onicegatheringstatechange = () => {
+        log(`ICE gathering state: ${pc.iceGatheringState}`, 'info');
+      };
+
+      pc.ondatachannel = (e) => {
+        log('Received data channel', 'success');
+        dc = e.channel;
+        setupDataChannel();
+      };
+
+      return pc;
+    }
+
+    function setupDataChannel() {
+      dc.onopen = () => {
+        log('Data channel OPEN!', 'success');
+        // Send test message
+        const msg = `Hello from ${role} at ${new Date().toISOString()}`;
+        dc.send(msg);
+        log(`Sent: "${msg}"`, 'success');
+      };
+
+      dc.onmessage = (e) => {
+        log(`Received: "${e.data}"`, 'success');
+        log('=== TEST PASSED - BIDIRECTIONAL COMMUNICATION WORKING! ===', 'success');
+      };
+
+      dc.onerror = (e) => {
+        log(`Data channel error: ${e}`, 'error');
+      };
+
+      dc.onclose = () => {
+        log('Data channel closed', 'warn');
+      };
+    }
+
+    let pendingOffer = null;
+
+    signaling.onmessage = async (e) => {
+      try {
+        const msg = e.data;
+
+        // Ignore our own messages or if no role set yet
+        if (msg.from === role || !role) return;
+
+      if (msg.type === 'offer') {
+        if (role === 'peer2') {
+          log('Received offer from Peer 1', 'info');
+          await pc.setRemoteDescription(msg.sdp);
+          remoteDescriptionSet = true;
+          // Add any queued candidates (from peer1)
+          for (const candidate of pendingCandidates) {
+            log(`Adding queued ICE candidate from ${candidate.from}`, 'info');
+            try {
+              await pc.addIceCandidate(candidate.candidate);
+            } catch (e) {
+              log(`Failed to add queued candidate: ${e}`, 'error');
+            }
+          }
+          pendingCandidates = [];
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          log('Waiting for ICE gathering...', 'info');
+          const answerWithCandidates = await waitForIceGathering();
+          log('Sending answer with candidates to Peer 1', 'info');
+          signaling.postMessage({ type: 'answer', sdp: answerWithCandidates.toJSON(), from: role });
+        } else {
+          // Store offer in case peer2 isn't ready yet
+          pendingOffer = msg;
+        }
+      }
+
+      if (msg.type === 'answer' && role === 'peer1') {
+        log('Received answer from Peer 2', 'info');
+        await pc.setRemoteDescription(msg.sdp);
+        remoteDescriptionSet = true;
+        // Add any queued candidates
+        for (const candidate of pendingCandidates) {
+          log(`Adding queued ICE candidate from ${candidate.from}`, 'info');
+          try {
+            await pc.addIceCandidate(candidate.candidate);
+          } catch (e) {
+            log(`Failed to add queued candidate: ${e}`, 'error');
+          }
+        }
+        pendingCandidates = [];
+      }
+
+      if (msg.type === 'candidate' && msg.from !== role) {
+        log(`Received ICE candidate from ${msg.from}`, 'info');
+        if (!remoteDescriptionSet) {
+          log(`Queueing candidate (remote description not set yet)`, 'warn');
+          pendingCandidates.push(msg);
+        } else {
+          try {
+            await pc.addIceCandidate(msg.candidate);
+          } catch (e) {
+            log(`Failed to add ICE candidate: ${e}`, 'error');
+          }
+        }
+      }
+
+      // Peer 2 is ready, Peer 1 should resend offer (already has candidates)
+      if (msg.type === 'ready' && role === 'peer1') {
+        log('Peer 2 is ready, resending offer with candidates...', 'info');
+        signaling.postMessage({ type: 'offer', sdp: pc.localDescription.toJSON(), from: role });
+      }
+      } catch (err) {
+        log(`[signaling] Error: ${err}`, 'error');
+      }
+    };
+
+    // Wait for ICE gathering to complete, returns the local description with candidates
+    function waitForIceGathering() {
+      return new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') {
+          resolve(pc.localDescription);
+        } else {
+          const checkState = () => {
+            if (pc.iceGatheringState === 'complete') {
+              pc.removeEventListener('icegatheringstatechange', checkState);
+              resolve(pc.localDescription);
+            }
+          };
+          pc.addEventListener('icegatheringstatechange', checkState);
+        }
+      });
+    }
+
+    async function startAsPeer1() {
+      if (pc) { pc.close(); }
+      role = 'peer1';
+      pendingCandidates = [];
+      remoteDescriptionSet = false;
+      log('=== Starting as PEER 1 (Caller) ===', 'info');
+
+      createPeerConnection();
+
+      // Create data channel
+      dc = pc.createDataChannel('test');
+      setupDataChannel();
+      log('Created data channel', 'info');
+
+      // Create offer and wait for ICE gathering to include candidates in SDP
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      log('Waiting for ICE gathering...', 'info');
+      const offerWithCandidates = await waitForIceGathering();
+      log('Created offer with candidates, sending to Peer 2...', 'info');
+      signaling.postMessage({ type: 'offer', sdp: offerWithCandidates.toJSON(), from: role });
+
+      log('Waiting for Peer 2 to connect (open another tab and click "Peer 2")...', 'warn');
+    }
+
+    async function startAsPeer2() {
+      if (pc) { pc.close(); }
+      role = 'peer2';
+      pendingCandidates = [];
+      remoteDescriptionSet = false;
+      log('=== Starting as PEER 2 (Answerer) ===', 'info');
+
+      createPeerConnection();
+      log('Waiting for offer from Peer 1...', 'warn');
+
+      // Request offer from Peer 1
+      signaling.postMessage({ type: 'ready', from: role });
+    }
+  </script>
+</body>
+</html>
