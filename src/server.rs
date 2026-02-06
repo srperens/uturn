@@ -341,45 +341,14 @@ impl Server {
                 sender_alloc.touch_relay_attempt();
             }
         } else {
-            // No ICE pairing yet - broadcast to all permitted clients (fallback)
-            let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
-            let indication = self.build_data_indication(relay_addr, data);
-            let mut relayed = false;
-
-            for alloc_id in candidates {
-                if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                    if target_alloc.client_addr == src_addr {
-                        continue;
-                    }
-                    if !target_alloc.is_permitted(self.config.external_ip) {
-                        continue;
-                    }
-
-                    debug!(
-                        "Relaying {} bytes from client {} to client {} (broadcast, via relay {})",
-                        data.len(),
-                        src_addr,
-                        target_alloc.client_addr,
-                        relay_addr
-                    );
-
-                    self.socket
-                        .send_to(&indication, target_alloc.client_addr)
-                        .await?;
-                    target_alloc.touch();
-                    relayed = true;
-                }
-            }
-
-            if relayed {
-                sender_alloc.touch_relay_success();
-            } else {
-                sender_alloc.touch_relay_attempt();
-            }
-
-            if !relayed {
-                trace!("No target clients found for relay from {}", src_addr);
-            }
+            // No ICE pairing yet - drop RTP (no broadcast fallback)
+            trace!(
+                "RTP from {} dropped: no ICE ufrag match (local={:?}, remote={:?})",
+                src_addr,
+                sender_local,
+                sender_remote,
+            );
+            sender_alloc.touch_relay_attempt();
         }
 
         Ok(())

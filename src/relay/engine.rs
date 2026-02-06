@@ -359,9 +359,14 @@ impl RelayEngine {
                         alloc.touch_relay_attempt();
                     }
                 } else {
-                    // No ICE peers found - broadcast (fallback)
-                    self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                        .await?;
+                    // No ICE peers found - drop RTP (no broadcast fallback)
+                    trace!(
+                        "RTP from {} dropped: no ICE ufrag match (local={:?}, remote={:?})",
+                        src_addr,
+                        sender_local,
+                        sender_remote,
+                    );
+                    alloc.touch_relay_attempt();
                 }
             }
         }
