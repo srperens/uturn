@@ -863,14 +863,17 @@ impl TurnHandler {
                 None => return Ok(()),
             };
 
-            // Register ICE ufrags from STUN Binding Requests inside Send Indications.
-            // ICE connectivity checks arrive via Send Indication (before channel binding),
-            // so this is the primary path for ufrag registration.
+            // Try targeted routing via ICE ufrags to avoid cross-talk between
+            // unrelated calls. Only fall back to broadcast for the very first
+            // STUN packet before any ufrag is registered.
+            let alloc_id = alloc.id;
+            let mut sent = false;
+
+            // For STUN Binding Requests: register sender ufrags and route by target ufrag
             if let Some(stun_info) = StunInfo::parse(data) {
                 if stun_info.method == StunMethod::Binding && stun_info.class == StunClass::Request
                 {
                     if let Some((remote_ufrag, local_ufrag)) = stun_info.parse_ice_username() {
-                        let alloc_id = alloc.id;
                         let registered = self.allocations.register_ice_ufrags(
                             alloc_id,
                             local_ufrag.clone(),
@@ -882,44 +885,70 @@ impl TurnHandler {
                                 src_addr, local_ufrag, remote_ufrag
                             );
                         }
+
+                        // Route to target by their ICE ufrag
+                        if let Some(target_id) = self.allocations.lookup_by_ice_ufrag(&remote_ufrag)
+                        {
+                            if let Some(target_alloc) = self.allocations.get(target_id) {
+                                if target_alloc.client_addr != src_addr
+                                    && target_alloc.is_permitted(self.config.external_ip)
+                                {
+                                    let indication = self.build_data_indication(our_addr, data);
+                                    socket
+                                        .send_to(&indication, target_alloc.client_addr)
+                                        .await?;
+                                    sent = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            // Find all allocations that have permission for our relay IP (excluding sender)
-            let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
-            let mut sent = false;
-
-            for alloc_id in candidates {
-                if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                    // Skip the sender's own allocation
-                    if target_alloc.client_addr == src_addr {
-                        continue;
-                    }
-
-                    debug!(
-                        "Internal relay: {} bytes from {} to {}",
-                        data.len(),
-                        src_addr,
-                        target_alloc.client_addr
-                    );
-
-                    // Build and send Data Indication to target client
-                    // The peer address from target's perspective is the relay address
-                    // (since they created permission for the relay, not the sender)
-                    let indication = self.build_data_indication(our_addr, data);
-                    socket
-                        .send_to(&indication, target_alloc.client_addr)
-                        .await?;
-                    sent = true;
-                }
-            }
-
+            // For non-STUN or STUN responses: use ICE peer matching
             if !sent {
-                trace!(
-                    "No target allocation found for internal routing from {}",
-                    src_addr
-                );
+                let sender_local = alloc.get_ice_ufrag();
+                let sender_remote = alloc.get_ice_remote_ufrag();
+                if let (Some(local), Some(remote)) = (&sender_local, &sender_remote) {
+                    let peers = self.allocations.find_ice_peers(local, remote);
+                    let indication = self.build_data_indication(our_addr, data);
+                    for &peer_id in &peers {
+                        if let Some(target_alloc) = self.allocations.get(peer_id) {
+                            if target_alloc.client_addr != src_addr
+                                && target_alloc.is_permitted(self.config.external_ip)
+                            {
+                                socket
+                                    .send_to(&indication, target_alloc.client_addr)
+                                    .await?;
+                                sent = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Last resort: broadcast only if no ufrag routing available yet
+            // (very first STUN packet before peer has registered)
+            if !sent {
+                let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
+                let indication = self.build_data_indication(our_addr, data);
+                for alloc_id in candidates {
+                    if let Some(target_alloc) = self.allocations.get(alloc_id) {
+                        if target_alloc.client_addr == src_addr {
+                            continue;
+                        }
+                        socket
+                            .send_to(&indication, target_alloc.client_addr)
+                            .await?;
+                        sent = true;
+                    }
+                }
+                if !sent {
+                    trace!(
+                        "No target allocation found for internal routing from {}",
+                        src_addr
+                    );
+                }
             }
 
             // Touch sender's allocation - they're actively sending data
