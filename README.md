@@ -30,8 +30,8 @@ Standard TURN:                    Single-Port TURN (uTURN):
 
 When Client A sends data to the relay address, uTURN:
 1. Identifies the sender by source address
-2. Finds other clients that have permission for the relay IP
-3. Relays data to those clients via Data Indication or ChannelData
+2. Routes to the correct peer via ICE ufrag matching (bi-directional pairing)
+3. Delivers via Data Indication or ChannelData
 
 ## Quick Start
 
@@ -61,9 +61,8 @@ docker run -p 3478:3478/udp \
 | `--realm` | `UTURN_REALM` | uturn | TURN realm for authentication |
 | `--user` | `UTURN_USERS` | - | Credentials in `user:pass` format (repeatable) |
 | `--log-level` | `UTURN_LOG_LEVEL` | info | Log level: trace, debug, info, warn, error |
-| `--max-allocations-per-ip` | `UTURN_MAX_ALLOC_PER_IP` | 100 | Max concurrent allocations per IP (0 = unlimited) |
-| `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 120 | Max allocation requests per IP per minute (0 = unlimited) |
-| `--max-concurrent-tasks` | `UTURN_MAX_TASKS` | 1000 | Max concurrent packet handlers (0 = unlimited) |
+| `--max-allocations-per-ip` | `UTURN_MAX_ALLOC_PER_IP` | 200 | Max concurrent allocations per IP (0 = unlimited) |
+| `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 30 | Max allocation requests per IP per minute (0 = unlimited) |
 | `--nonce-lifetime-secs` | `UTURN_NONCE_LIFETIME` | 3600 | Nonce validity period in seconds |
 
 ## Testing

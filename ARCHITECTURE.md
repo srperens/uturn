@@ -184,60 +184,63 @@ impl TurnHandler {
 
 ### 5. Relay Engine
 
-Forwards media between peers and clients, with ICE ufrag-based routing.
+Forwards media between peers and clients using targeted ICE ufrag-based routing.
+No broadcast is used — all packets are routed to the specific matched peer, or dropped
+if no match exists. This prevents cross-talk between unrelated calls.
+
+**ChannelData routing (STUN)** — 3-tier targeted routing:
 
 ```rust
-impl RelayEngine {
-    /// Handle ChannelData from client - may contain STUN for ICE pairing
-    pub async fn handle_channel_data(&self, data: &[u8], alloc: &Allocation) {
-        // If this is a STUN Binding Request, learn ICE credentials
-        if let Some((remote_ufrag, local_ufrag)) = extract_stun_ufrags(data) {
-            // Atomically register this allocation's ICE ufrags
-            self.allocations.register_ice_ufrags(alloc.id, local_ufrag, remote_ufrag);
-
-            // Find peer allocations using bi-directional matching
-            let ice_peers = self.allocations.find_ice_peers(&local, &remote);
-            // Route to matched peers...
-        }
+// Tier 1: Targeted send via USERNAME attribute (STUN Binding Requests)
+if let Some((remote_ufrag, local_ufrag)) = extract_stun_ufrags(data) {
+    register_ice_ufrags(alloc.id, local_ufrag, remote_ufrag);
+    if let Some(target) = lookup_by_ice_ufrag(&remote_ufrag) {
+        send_to(target);  // Targeted delivery
     }
+}
+// Tier 2: ICE peer matching (STUN responses without USERNAME)
+if !sent {
+    let peers = find_ice_peers(sender_local, sender_remote);
+    send_to(peers);  // Targeted delivery
+}
+// Tier 3: Drop (ufrags registered via Send Indication before channel binding)
+```
 
-    /// Peer → Client: Media arriving from a peer for relay to client
-    pub async fn relay_to_client(
-        &self,
-        data: &[u8],
-        peer_addr: SocketAddr,
-        allocation: &Allocation,
-    ) {
-        // Check permission
-        if !allocation.has_permission(&peer_addr.ip()) {
-            return; // Drop: no permission
-        }
+**ChannelData routing (RTP/DTLS)** — ufrag match or drop:
 
-        // Check for channel binding (more efficient)
-        if let Some(channel) = allocation.channel_for_peer(peer_addr) {
-            // Send as ChannelData
-            self.send_channel_data(channel, data, allocation.client_addr).await;
-        } else {
-            // Send as Data indication
-            self.send_data_indication(peer_addr, data, allocation.client_addr).await;
-        }
+```rust
+let peers = find_ice_peers(sender_local, sender_remote);
+if !peers.is_empty() {
+    relay_to_listeners(data, peers);  // Targeted delivery
+} else {
+    drop;  // No broadcast fallback
+}
+```
+
+**Send Indication routing** — targeted with first-packet broadcast fallback:
+
+```rust
+// ICE checks arrive here before channel binding. Register ufrags and
+// route to target by ufrag lookup. Only the very first STUN packet
+// (before peer has registered) falls back to broadcast.
+if is_stun_binding_request(data) {
+    register_ice_ufrags(alloc.id, local_ufrag, remote_ufrag);
+    if let Some(target) = lookup_by_ice_ufrag(&remote_ufrag) {
+        send_to(target);  // Targeted delivery
     }
+}
+if !sent { find_ice_peers() → send_to(peers); }
+if !sent { broadcast();  /* first-packet only */ }
+```
 
-    /// Client → Peer: Client sending via TURN to peer
-    pub async fn relay_to_peer(
-        &self,
-        data: &[u8],
-        peer_addr: SocketAddr,
-        allocation: &Allocation,
-    ) {
-        // Check permission
-        if !allocation.has_permission(&peer_addr.ip()) {
-            return;
-        }
+**Peer → Client relay:**
 
-        // Send directly to peer
-        self.socket.send_to(data, peer_addr).await;
-    }
+```rust
+// Check for channel binding (more efficient) or use Data Indication
+if let Some(channel) = allocation.channel_for_peer(peer_addr) {
+    send_channel_data(channel, data, allocation.client_addr);
+} else {
+    send_data_indication(peer_addr, data, allocation.client_addr);
 }
 ```
 
@@ -351,9 +354,15 @@ When Client A sends a STUN Binding Request, we:
 3. Look for allocations where `ice_ufrag=Y` and `ice_remote_ufrag=X` (the inverse)
 4. Found match = Client B is Client A's peer
 
+### Registration Timing
+
+ICE connectivity checks arrive via **Send Indication** (before channel binding is established).
+The Send Indication handler parses STUN Binding Requests from the relayed data and registers
+ICE ufrags. This ensures ufrags are available by the time media flows via ChannelData.
+
 ### Atomic Registration
 
-Since STUN Binding Requests may be broadcast to multiple allocations (via IP-based permission lookup), we use atomic registration with DashMap's entry API:
+Registration uses DashMap's entry API to ensure each ICE ufrag is claimed exactly once:
 
 ```rust
 match self.by_ice_ufrag.entry(local_ufrag) {
@@ -361,12 +370,19 @@ match self.by_ice_ufrag.entry(local_ufrag) {
     Entry::Vacant(entry) => {
         // First one wins - register atomically
         entry.insert(id);
+        // Also register in pair index for O(1) bidirectional lookup
+        self.by_ice_ufrag_pair.insert((local, remote), id);
         true
     }
 }
 ```
 
-This ensures each ICE ufrag is registered exactly once, preventing duplicate routing.
+### No Broadcast Routing
+
+After ICE ufrag registration, all packet types (STUN, DTLS, RTP) are routed exclusively
+to the matched peer. Unmatched RTP and DTLS are dropped, not broadcast. The only remaining
+broadcast path is for the very first STUN packet in a new call, before the peer has registered
+its ufrag. This eliminates cross-talk between concurrent unrelated calls.
 
 ## State Machine
 
@@ -406,7 +422,8 @@ uturn/
 │   ├── main.rs              # Entry point, CLI
 │   ├── lib.rs               # Library root
 │   ├── config.rs            # Configuration
-│   ├── server.rs            # Main server loop
+│   ├── server.rs            # Main server loop, packet dispatch
+│   ├── coarse_time.rs       # Low-overhead monotonic timestamps
 │   │
 │   ├── transport/
 │   │   ├── mod.rs
@@ -414,27 +431,27 @@ uturn/
 │   │
 │   ├── demux/
 │   │   ├── mod.rs           # Demultiplexer
-│   │   └── protocol.rs      # Protocol detection (RFC 7983)
+│   │   ├── protocol.rs      # Protocol detection (RFC 7983)
+│   │   ├── stun.rs          # STUN message parsing
+│   │   └── rtp.rs           # RTP/RTCP header parsing
 │   │
 │   ├── turn/
 │   │   ├── mod.rs
 │   │   ├── message.rs       # TURN message types
-│   │   ├── handler.rs       # Request/response handling
-│   │   ├── allocation.rs    # Allocation state
+│   │   ├── handler.rs       # Request/response handling + Send Indication routing
 │   │   └── auth.rs          # Long-term credentials
 │   │
 │   ├── relay/
 │   │   ├── mod.rs
-│   │   └── engine.rs        # Media relay logic
+│   │   └── engine.rs        # Media relay logic (ufrag-based routing)
 │   │
 │   └── lookup/
 │       ├── mod.rs
 │       ├── table.rs         # Allocation table & ICE ufrag indexes
 │       └── rate_limit.rs    # Per-client rate limiting
 │
-└── tests/
-    ├── integration.rs
-    └── demux_tests.rs
+└── test-webrtc/
+    └── webrtc-test.html     # Browser-based WebRTC test page
 ```
 
 ## Performance Considerations

@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, trace};
 
 use crate::config::Config;
-use crate::lookup::{Allocation, AllocationId, AllocationTable};
+use crate::lookup::{AllocationId, AllocationTable};
 
 /// Check if data looks like RTP (vs RTCP)
 /// Check if data is DTLS (content types 0x14-0x19, version 0xFExx)
@@ -226,13 +226,11 @@ impl RelayEngine {
         if peer_addr == relay_addr {
             // Check if this is STUN (ICE connectivity check)
             if is_stun(data) {
-                // STUN Binding Request - extract both ufrags for pairing and forwarding
-                // USERNAME format is "remoteUfrag:localUfrag"
-                // - remote_ufrag = who sender wants to talk to (receiver's ICE ufrag)
-                // - local_ufrag = sender's own ICE ufrag
+                let mut sent = false;
+
+                // Try 1: Targeted send via USERNAME attribute (STUN Binding Requests)
                 if let Some((remote_ufrag, local_ufrag)) = extract_stun_ufrags(data) {
-                    // Register both local and remote ICE ufrags for this allocation
-                    // local_ufrag = this client's ufrag, remote_ufrag = peer they want to talk to
+                    // Register sender's ICE ufrags for future lookups
                     let registered = self.allocations.register_ice_ufrags(
                         alloc.id,
                         local_ufrag.clone(),
@@ -246,26 +244,61 @@ impl RelayEngine {
                         );
                     }
 
-                    // Forward STUN to the target allocation (if we can find it by ICE ufrag)
+                    // Forward to target by their ICE ufrag
                     if let Some(target_id) = self.allocations.lookup_by_ice_ufrag(&remote_ufrag) {
                         if let Some(target_alloc) = self.allocations.get(target_id) {
-                            if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr)
-                            {
-                                self.send_channel_data(
-                                    reverse_channel,
-                                    data,
-                                    target_alloc.client_addr,
-                                )
-                                .await?;
+                            if target_alloc.client_addr != src_addr {
+                                if let Some(reverse_channel) =
+                                    target_alloc.channel_for_peer(relay_addr)
+                                {
+                                    self.send_channel_data(
+                                        reverse_channel,
+                                        data,
+                                        target_alloc.client_addr,
+                                    )
+                                    .await?;
+                                } else {
+                                    self.send_data_indication(
+                                        relay_addr,
+                                        data,
+                                        target_alloc.client_addr,
+                                    )
+                                    .await?;
+                                }
                                 target_alloc.touch();
+                                sent = true;
                             }
                         }
                     }
                 }
-                // Also broadcast STUN for ICE to work properly
-                self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                    .await?;
+
+                // Try 2: ICE peer matching (for STUN responses without USERNAME)
+                if !sent {
+                    let sender_local = alloc.get_ice_ufrag();
+                    let sender_remote = alloc.get_ice_remote_ufrag();
+                    if let (Some(local), Some(remote)) = (&sender_local, &sender_remote) {
+                        let peers = self.allocations.find_ice_peers(local, remote);
+                        if !peers.is_empty() {
+                            let relayed = self
+                                .relay_to_listeners(data, src_addr, &peers, relay_addr)
+                                .await?;
+                            if relayed {
+                                sent = true;
+                            }
+                        }
+                    }
+                }
+
+                // No broadcast fallback - ufrags are registered via Send Indication
+                // before channel binding, so ufrag routing should always work here.
+                if !sent {
+                    trace!(
+                        "STUN via ChannelData from {} dropped: no ufrag match",
+                        src_addr,
+                    );
+                }
             } else if !is_rtp(data) {
+<<<<<<< HEAD
                 // Non-RTP (DTLS/RTCP) - always broadcast to all clients with relay permission
                 // DTLS handshake may start before ICE ufrags are registered, so we can't
                 // rely on ufrag-based routing. Broadcasting is safe because DTLS will only
@@ -277,6 +310,36 @@ impl RelayEngine {
                 );
                 self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
                     .await?;
+=======
+                // Non-RTP (DTLS/RTCP) - try ufrag routing first, broadcast as fallback
+                let sender_local = alloc.get_ice_ufrag();
+                let sender_remote = alloc.get_ice_remote_ufrag();
+
+                let peers = match (&sender_local, &sender_remote) {
+                    (Some(local), Some(remote)) => self.allocations.find_ice_peers(local, remote),
+                    _ => Vec::new(),
+                };
+
+                if !peers.is_empty() {
+                    let relayed = self
+                        .relay_to_listeners(data, src_addr, &peers, relay_addr)
+                        .await?;
+                    if relayed {
+                        alloc.touch_relay_success();
+                    } else {
+                        alloc.touch_relay_attempt();
+                    }
+                } else {
+                    // No broadcast fallback - ufrags are registered via Send Indication
+                    // before channel binding, so ufrag routing should always work here.
+                    trace!(
+                        "Non-RTP ChannelData from {} ({} bytes) dropped: no ufrag match",
+                        src_addr,
+                        data.len()
+                    );
+                    alloc.touch_relay_attempt();
+                }
+>>>>>>> upstream/main
             } else {
                 // RTP - use bi-directional ICE ufrag matching
                 // If sender has (local=X, remote=Y), find allocations with (local=Y, remote=X)
@@ -313,9 +376,14 @@ impl RelayEngine {
                         alloc.touch_relay_attempt();
                     }
                 } else {
-                    // No ICE peers found - broadcast (fallback)
-                    self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                        .await?;
+                    // No ICE peers found - drop RTP (no broadcast fallback)
+                    trace!(
+                        "RTP from {} dropped: no ICE ufrag match (local={:?}, remote={:?})",
+                        src_addr,
+                        sender_local,
+                        sender_remote,
+                    );
+                    alloc.touch_relay_attempt();
                 }
             }
         }
@@ -519,6 +587,7 @@ impl RelayEngine {
         Ok(())
     }
 
+<<<<<<< HEAD
     /// Relay data to all clients except the sender (broadcast mode)
     async fn relay_to_all_except_sender(
         &self,
@@ -560,6 +629,8 @@ impl RelayEngine {
         Ok(())
     }
 
+=======
+>>>>>>> upstream/main
     /// Relay data to specific listeners (ufrag-paired routing)
     /// Returns true if data was sent to at least one target
     async fn relay_to_listeners(
@@ -577,26 +648,41 @@ impl RelayEngine {
                     continue;
                 }
                 // Note: We allow relaying to same IP different port (e.g., two browser tabs)
+<<<<<<< HEAD
                 // Use reverse channel if available
                 if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
                     self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
                         .await?;
                     target_alloc.touch();
                     relayed = true;
+=======
+                // Use reverse channel if available, fall back to Data Indication
+                if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
+                    self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
+                        .await?;
+                } else {
+                    self.send_data_indication(relay_addr, data, target_alloc.client_addr)
+                        .await?;
+>>>>>>> upstream/main
                 }
+                target_alloc.touch();
+                relayed = true;
             }
         }
         Ok(relayed)
     }
 
     /// Send TURN ChannelData to client
+    #[inline]
     async fn send_channel_data(
         &self,
         channel: u16,
         data: &[u8],
         client_addr: SocketAddr,
     ) -> Result<()> {
-        let mut packet = Vec::with_capacity(4 + data.len());
+        // Pre-calculate padded size
+        let padding = (4 - ((4 + data.len()) % 4)) % 4;
+        let mut packet = Vec::with_capacity(4 + data.len() + padding);
 
         // Channel number
         packet.extend_from_slice(&channel.to_be_bytes());
@@ -607,16 +693,15 @@ impl RelayEngine {
         // Data
         packet.extend_from_slice(data);
 
-        // Pad to 4-byte boundary
-        while packet.len() % 4 != 0 {
-            packet.push(0);
-        }
+        // Pad to 4-byte boundary (more efficient than byte-by-byte)
+        packet.resize(packet.len() + padding, 0);
 
         self.socket.send_to(&packet, client_addr).await?;
         Ok(())
     }
 
     /// Send TURN Data Indication to client
+    #[inline]
     async fn send_data_indication(
         &self,
         peer_addr: SocketAddr,
@@ -646,10 +731,9 @@ impl RelayEngine {
         packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
         packet.extend_from_slice(data);
 
-        // Pad DATA attribute
-        while (packet.len() - 20) % 4 != 0 {
-            packet.push(0);
-        }
+        // Pad DATA attribute to 4-byte boundary
+        let padding = (4 - ((packet.len() - 20) % 4)) % 4;
+        packet.resize(packet.len() + padding, 0);
 
         // Update length
         let msg_len = (packet.len() - 20) as u16;

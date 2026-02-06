@@ -26,9 +26,6 @@ pub struct Config {
     /// Rate limit: max allocation requests per IP per minute (0 = unlimited)
     pub rate_limit_per_minute: u32,
 
-    /// Maximum concurrent packet handling tasks (0 = unlimited)
-    pub max_concurrent_tasks: u32,
-
     /// Nonce validity period in seconds
     pub nonce_lifetime_secs: u64,
 
@@ -49,7 +46,6 @@ impl Config {
             credentials: Vec::new(),
             max_allocations_per_ip: 100,
             rate_limit_per_minute: 120,
-            max_concurrent_tasks: 1000,
             nonce_lifetime_secs: 3600,
             nonce_secret,
         }
