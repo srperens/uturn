@@ -226,13 +226,11 @@ impl RelayEngine {
         if peer_addr == relay_addr {
             // Check if this is STUN (ICE connectivity check)
             if is_stun(data) {
-                // STUN Binding Request - extract both ufrags for pairing and forwarding
-                // USERNAME format is "remoteUfrag:localUfrag"
-                // - remote_ufrag = who sender wants to talk to (receiver's ICE ufrag)
-                // - local_ufrag = sender's own ICE ufrag
+                let mut sent = false;
+
+                // Try 1: Targeted send via USERNAME attribute (STUN Binding Requests)
                 if let Some((remote_ufrag, local_ufrag)) = extract_stun_ufrags(data) {
-                    // Register both local and remote ICE ufrags for this allocation
-                    // local_ufrag = this client's ufrag, remote_ufrag = peer they want to talk to
+                    // Register sender's ICE ufrags for future lookups
                     let registered = self.allocations.register_ice_ufrags(
                         alloc.id,
                         local_ufrag.clone(),
@@ -246,37 +244,85 @@ impl RelayEngine {
                         );
                     }
 
-                    // Forward STUN to the target allocation (if we can find it by ICE ufrag)
+                    // Forward to target by their ICE ufrag
                     if let Some(target_id) = self.allocations.lookup_by_ice_ufrag(&remote_ufrag) {
                         if let Some(target_alloc) = self.allocations.get(target_id) {
-                            if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr)
-                            {
-                                self.send_channel_data(
-                                    reverse_channel,
-                                    data,
-                                    target_alloc.client_addr,
-                                )
-                                .await?;
+                            if target_alloc.client_addr != src_addr {
+                                if let Some(reverse_channel) =
+                                    target_alloc.channel_for_peer(relay_addr)
+                                {
+                                    self.send_channel_data(
+                                        reverse_channel,
+                                        data,
+                                        target_alloc.client_addr,
+                                    )
+                                    .await?;
+                                } else {
+                                    self.send_data_indication(
+                                        relay_addr,
+                                        data,
+                                        target_alloc.client_addr,
+                                    )
+                                    .await?;
+                                }
                                 target_alloc.touch();
+                                sent = true;
                             }
                         }
                     }
                 }
-                // Also broadcast STUN for ICE to work properly
-                self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                    .await?;
+
+                // Try 2: ICE peer matching (for STUN responses without USERNAME)
+                if !sent {
+                    let sender_local = alloc.get_ice_ufrag();
+                    let sender_remote = alloc.get_ice_remote_ufrag();
+                    if let (Some(local), Some(remote)) = (&sender_local, &sender_remote) {
+                        let peers = self.allocations.find_ice_peers(local, remote);
+                        if !peers.is_empty() {
+                            let relayed = self
+                                .relay_to_listeners(data, src_addr, &peers, relay_addr)
+                                .await?;
+                            if relayed {
+                                sent = true;
+                            }
+                        }
+                    }
+                }
+
+                // Try 3: Broadcast as last resort (initial discovery, no ufrags yet)
+                if !sent {
+                    self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
+                        .await?;
+                }
             } else if !is_rtp(data) {
-                // Non-RTP (DTLS/RTCP) - always broadcast to all clients with relay permission
-                // DTLS handshake may start before ICE ufrags are registered, so we can't
-                // rely on ufrag-based routing. Broadcasting is safe because DTLS will only
-                // succeed with the correct peer (certificate fingerprint matching).
-                debug!(
-                    "Non-RTP ChannelData from {} ({} bytes) - broadcasting to all",
-                    src_addr,
-                    data.len()
-                );
-                self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                    .await?;
+                // Non-RTP (DTLS/RTCP) - try ufrag routing first, broadcast as fallback
+                let sender_local = alloc.get_ice_ufrag();
+                let sender_remote = alloc.get_ice_remote_ufrag();
+
+                let peers = match (&sender_local, &sender_remote) {
+                    (Some(local), Some(remote)) => self.allocations.find_ice_peers(local, remote),
+                    _ => Vec::new(),
+                };
+
+                if !peers.is_empty() {
+                    let relayed = self
+                        .relay_to_listeners(data, src_addr, &peers, relay_addr)
+                        .await?;
+                    if relayed {
+                        alloc.touch_relay_success();
+                    } else {
+                        alloc.touch_relay_attempt();
+                    }
+                } else {
+                    // No ICE pairing yet (e.g., early DTLS handshake) - broadcast
+                    debug!(
+                        "Non-RTP ChannelData from {} ({} bytes) - no ICE pairing, broadcasting",
+                        src_addr,
+                        data.len()
+                    );
+                    self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
+                        .await?;
+                }
             } else {
                 // RTP - use bi-directional ICE ufrag matching
                 // If sender has (local=X, remote=Y), find allocations with (local=Y, remote=X)
@@ -577,13 +623,16 @@ impl RelayEngine {
                     continue;
                 }
                 // Note: We allow relaying to same IP different port (e.g., two browser tabs)
-                // Use reverse channel if available
+                // Use reverse channel if available, fall back to Data Indication
                 if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
                     self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
                         .await?;
-                    target_alloc.touch();
-                    relayed = true;
+                } else {
+                    self.send_data_indication(relay_addr, data, target_alloc.client_addr)
+                        .await?;
                 }
+                target_alloc.touch();
+                relayed = true;
             }
         }
         Ok(relayed)
