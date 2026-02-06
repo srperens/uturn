@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, trace};
 
 use crate::config::Config;
-use crate::lookup::{Allocation, AllocationId, AllocationTable};
+use crate::lookup::{AllocationId, AllocationTable};
 
 /// Check if data looks like RTP (vs RTCP)
 /// Check if data is DTLS (content types 0x14-0x19, version 0xFExx)
@@ -289,10 +289,13 @@ impl RelayEngine {
                     }
                 }
 
-                // Try 3: Broadcast as last resort (initial discovery, no ufrags yet)
+                // No broadcast fallback - ufrags are registered via Send Indication
+                // before channel binding, so ufrag routing should always work here.
                 if !sent {
-                    self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                        .await?;
+                    trace!(
+                        "STUN via ChannelData from {} dropped: no ufrag match",
+                        src_addr,
+                    );
                 }
             } else if !is_rtp(data) {
                 // Non-RTP (DTLS/RTCP) - try ufrag routing first, broadcast as fallback
@@ -314,14 +317,14 @@ impl RelayEngine {
                         alloc.touch_relay_attempt();
                     }
                 } else {
-                    // No ICE pairing yet (e.g., early DTLS handshake) - broadcast
-                    debug!(
-                        "Non-RTP ChannelData from {} ({} bytes) - no ICE pairing, broadcasting",
+                    // No broadcast fallback - ufrags are registered via Send Indication
+                    // before channel binding, so ufrag routing should always work here.
+                    trace!(
+                        "Non-RTP ChannelData from {} ({} bytes) dropped: no ufrag match",
                         src_addr,
                         data.len()
                     );
-                    self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                        .await?;
+                    alloc.touch_relay_attempt();
                 }
             } else {
                 // RTP - use bi-directional ICE ufrag matching
@@ -565,47 +568,6 @@ impl RelayEngine {
                 .await?;
 
             alloc.touch();
-        }
-
-        Ok(())
-    }
-
-    /// Relay data to all clients except the sender (broadcast mode)
-    async fn relay_to_all_except_sender(
-        &self,
-        data: &[u8],
-        src_addr: SocketAddr,
-        sender_alloc: &Allocation,
-        relay_addr: SocketAddr,
-    ) -> Result<()> {
-        let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
-        let mut relayed = false;
-
-        for alloc_id in candidates {
-            if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                // Skip sender (exact match only - same IP and port)
-                if target_alloc.client_addr == src_addr {
-                    continue;
-                }
-                // Note: We allow relaying to same IP different port (e.g., two browser tabs)
-                // Check permission
-                if !target_alloc.is_permitted(self.config.external_ip) {
-                    continue;
-                }
-                // Use reverse channel if available
-                if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
-                    self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
-                        .await?;
-                    target_alloc.touch();
-                    relayed = true;
-                }
-            }
-        }
-
-        if relayed {
-            sender_alloc.touch_relay_success();
-        } else {
-            sender_alloc.touch_relay_attempt();
         }
 
         Ok(())
