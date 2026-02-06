@@ -273,8 +273,8 @@ impl Server {
     ///
     /// In single-port TURN, all clients share the same relay address. When client A
     /// sends data to the server, we relay it to other clients that have permission
-    /// for the relay IP. The Data indication uses XOR-PEER-ADDRESS = relay address,
-    /// because from the receiver's perspective, the peer is at the relay address.
+    /// for the relay IP. Uses ICE ufrag matching to route to the correct peer,
+    /// falling back to broadcast only when pairing is not yet established.
     async fn relay_client_data(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
         let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
 
@@ -296,56 +296,59 @@ impl Server {
             return Ok(());
         }
 
-        // Keep reference for tracking relay success
-        let sender_alloc = Some(sender_alloc);
+        // Try ufrag-based routing first to avoid bandwidth multiplication
+        let sender_local = sender_alloc.get_ice_ufrag();
+        let sender_remote = sender_alloc.get_ice_remote_ufrag();
 
-        // Find all allocations that have permission for our relay IP
-        let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
+        let peers = match (&sender_local, &sender_remote) {
+            (Some(local), Some(remote)) => self.allocations.find_ice_peers(local, remote),
+            _ => Vec::new(),
+        };
 
-        // Pre-build the Data Indication once, reuse for all targets
-        let indication = self.build_data_indication(relay_addr, data);
+        if !peers.is_empty() {
+            // Route to specific ICE peer only
+            let indication = self.build_data_indication(relay_addr, data);
+            let mut relayed = false;
 
-        let mut relayed = false;
-        for alloc_id in candidates {
-            if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                // Skip the sender's own allocation
-                if target_alloc.client_addr == src_addr {
-                    continue;
+            for &peer_id in &peers {
+                if let Some(target_alloc) = self.allocations.get(peer_id) {
+                    if target_alloc.client_addr == src_addr {
+                        continue;
+                    }
+                    if !target_alloc.is_permitted(self.config.external_ip) {
+                        continue;
+                    }
+
+                    debug!(
+                        "Relaying {} bytes from client {} to ICE peer {} (via relay {})",
+                        data.len(),
+                        src_addr,
+                        target_alloc.client_addr,
+                        relay_addr
+                    );
+
+                    self.socket
+                        .send_to(&indication, target_alloc.client_addr)
+                        .await?;
+                    target_alloc.touch();
+                    relayed = true;
                 }
-
-                // Check that target has permission for relay IP
-                if !target_alloc.is_permitted(self.config.external_ip) {
-                    continue;
-                }
-
-                debug!(
-                    "Relaying {} bytes from client {} to client {} (via relay {})",
-                    data.len(),
-                    src_addr,
-                    target_alloc.client_addr,
-                    relay_addr
-                );
-
-                // Send pre-built indication
-                self.socket
-                    .send_to(&indication, target_alloc.client_addr)
-                    .await?;
-                target_alloc.touch();
-                relayed = true;
             }
-        }
 
-        // Track relay success/failure for orphan detection
-        if let Some(alloc) = sender_alloc {
             if relayed {
-                alloc.touch_relay_success();
+                sender_alloc.touch_relay_success();
             } else {
-                alloc.touch_relay_attempt();
+                sender_alloc.touch_relay_attempt();
             }
-        }
-
-        if !relayed {
-            trace!("No target clients found for relay from {}", src_addr);
+        } else {
+            // No ICE pairing yet - drop RTP (no broadcast fallback)
+            trace!(
+                "RTP from {} dropped: no ICE ufrag match (local={:?}, remote={:?})",
+                src_addr,
+                sender_local,
+                sender_remote,
+            );
+            sender_alloc.touch_relay_attempt();
         }
 
         Ok(())

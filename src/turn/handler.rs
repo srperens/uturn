@@ -8,7 +8,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
-use crate::demux::StunInfo;
+use crate::demux::{StunClass, StunInfo, StunMethod};
 use crate::lookup::{AllocationTable, RateLimitError, RateLimiter};
 
 use super::auth::TurnAuth;
@@ -862,6 +862,29 @@ impl TurnHandler {
                 Some(d) => d,
                 None => return Ok(()),
             };
+
+            // Register ICE ufrags from STUN Binding Requests inside Send Indications.
+            // ICE connectivity checks arrive via Send Indication (before channel binding),
+            // so this is the primary path for ufrag registration.
+            if let Some(stun_info) = StunInfo::parse(data) {
+                if stun_info.method == StunMethod::Binding && stun_info.class == StunClass::Request
+                {
+                    if let Some((remote_ufrag, local_ufrag)) = stun_info.parse_ice_username() {
+                        let alloc_id = alloc.id;
+                        let registered = self.allocations.register_ice_ufrags(
+                            alloc_id,
+                            local_ufrag.clone(),
+                            remote_ufrag.clone(),
+                        );
+                        if registered {
+                            debug!(
+                                "ICE registration (Send indication): {} local={}, remote={}",
+                                src_addr, local_ufrag, remote_ufrag
+                            );
+                        }
+                    }
+                }
+            }
 
             // Find all allocations that have permission for our relay IP (excluding sender)
             let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
