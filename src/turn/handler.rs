@@ -927,14 +927,19 @@ impl TurnHandler {
                 }
             }
 
-            // Last resort: broadcast only if no ufrag routing available yet
-            // (very first STUN packet before peer has registered)
+            // Last resort: send only to unpaired allocations (no ice_ufrag set yet).
+            // This limits the broadcast to allocations that haven't completed ICE,
+            // preventing leakage to already-established calls.
             if !sent {
                 let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
                 let indication = self.build_data_indication(our_addr, data);
                 for alloc_id in candidates {
                     if let Some(target_alloc) = self.allocations.get(alloc_id) {
                         if target_alloc.client_addr == src_addr {
+                            continue;
+                        }
+                        // Skip allocations that already have ICE ufrags (established calls)
+                        if target_alloc.get_ice_ufrag().is_some() {
                             continue;
                         }
                         socket
@@ -945,7 +950,7 @@ impl TurnHandler {
                 }
                 if !sent {
                     trace!(
-                        "No target allocation found for internal routing from {}",
+                        "No unpaired target found for internal routing from {}",
                         src_addr
                     );
                 }
