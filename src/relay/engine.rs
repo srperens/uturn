@@ -298,19 +298,6 @@ impl RelayEngine {
                     );
                 }
             } else if !is_rtp(data) {
-<<<<<<< HEAD
-                // Non-RTP (DTLS/RTCP) - always broadcast to all clients with relay permission
-                // DTLS handshake may start before ICE ufrags are registered, so we can't
-                // rely on ufrag-based routing. Broadcasting is safe because DTLS will only
-                // succeed with the correct peer (certificate fingerprint matching).
-                debug!(
-                    "Non-RTP ChannelData from {} ({} bytes) - broadcasting to all",
-                    src_addr,
-                    data.len()
-                );
-                self.relay_to_all_except_sender(data, src_addr, &alloc, relay_addr)
-                    .await?;
-=======
                 // Non-RTP (DTLS/RTCP) - try ufrag routing first, broadcast as fallback
                 let sender_local = alloc.get_ice_ufrag();
                 let sender_remote = alloc.get_ice_remote_ufrag();
@@ -339,7 +326,6 @@ impl RelayEngine {
                     );
                     alloc.touch_relay_attempt();
                 }
->>>>>>> upstream/main
             } else {
                 // RTP - use bi-directional ICE ufrag matching
                 // If sender has (local=X, remote=Y), find allocations with (local=Y, remote=X)
@@ -587,50 +573,6 @@ impl RelayEngine {
         Ok(())
     }
 
-<<<<<<< HEAD
-    /// Relay data to all clients except the sender (broadcast mode)
-    async fn relay_to_all_except_sender(
-        &self,
-        data: &[u8],
-        src_addr: SocketAddr,
-        sender_alloc: &Allocation,
-        relay_addr: SocketAddr,
-    ) -> Result<()> {
-        let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
-        let mut relayed = false;
-
-        for alloc_id in candidates {
-            if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                // Skip sender (exact match only - same IP and port)
-                if target_alloc.client_addr == src_addr {
-                    continue;
-                }
-                // Note: We allow relaying to same IP different port (e.g., two browser tabs)
-                // Check permission
-                if !target_alloc.is_permitted(self.config.external_ip) {
-                    continue;
-                }
-                // Use reverse channel if available
-                if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
-                    self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
-                        .await?;
-                    target_alloc.touch();
-                    relayed = true;
-                }
-            }
-        }
-
-        if relayed {
-            sender_alloc.touch_relay_success();
-        } else {
-            sender_alloc.touch_relay_attempt();
-        }
-
-        Ok(())
-    }
-
-=======
->>>>>>> upstream/main
     /// Relay data to specific listeners (ufrag-paired routing)
     /// Returns true if data was sent to at least one target
     async fn relay_to_listeners(
@@ -648,14 +590,6 @@ impl RelayEngine {
                     continue;
                 }
                 // Note: We allow relaying to same IP different port (e.g., two browser tabs)
-<<<<<<< HEAD
-                // Use reverse channel if available
-                if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
-                    self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
-                        .await?;
-                    target_alloc.touch();
-                    relayed = true;
-=======
                 // Use reverse channel if available, fall back to Data Indication
                 if let Some(reverse_channel) = target_alloc.channel_for_peer(relay_addr) {
                     self.send_channel_data(reverse_channel, data, target_alloc.client_addr)
@@ -663,7 +597,6 @@ impl RelayEngine {
                 } else {
                     self.send_data_indication(relay_addr, data, target_alloc.client_addr)
                         .await?;
->>>>>>> upstream/main
                 }
                 target_alloc.touch();
                 relayed = true;
