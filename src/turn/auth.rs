@@ -86,25 +86,23 @@ impl TurnAuth {
             Err(_) => return false,
         };
 
-        // Verify HMAC using constant-time comparison to prevent timing attacks
+        // Verify HMAC and freshness without early-returning on either check.
+        // Both branches are always evaluated and combined bitwise so timing
+        // does not reveal which check (or both) failed.
         let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC key length");
         mac.update(&timestamp.to_be_bytes());
         let hmac_result = mac.finalize().into_bytes();
         let expected_hmac = u64::from_be_bytes(hmac_result[..8].try_into().unwrap());
 
-        // Constant-time comparison
-        let mut diff = 0u64;
-        diff |= provided_hmac ^ expected_hmac;
-        if diff != 0 {
-            return false;
-        }
+        let hmac_ok = (provided_hmac ^ expected_hmac) == 0;
 
-        // Check timestamp freshness
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        now.saturating_sub(timestamp) < max_age_secs
+        let fresh = now.saturating_sub(timestamp) < max_age_secs;
+
+        hmac_ok & fresh
     }
 }
 
