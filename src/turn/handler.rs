@@ -1,6 +1,6 @@
 //! TURN message handler
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -29,6 +29,25 @@ enum AuthResult {
     NotRequired,
     /// Authentication failed, send this error response
     Failed(Vec<u8>),
+}
+
+/// Peer addresses we refuse to relay to, regardless of permission.
+///
+/// Loopback, multicast, broadcast and unspecified addresses either enable
+/// reflection to services on the relay host or fan out amplification to the
+/// local network. IPv4 link-local (169.254.0.0/16) covers AWS/GCE instance
+/// metadata services.
+pub(crate) fn is_forbidden_peer_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_link_local()
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast() || v6.is_unspecified(),
+    }
 }
 
 impl TurnHandler {
@@ -689,6 +708,22 @@ impl TurnHandler {
             return Ok(());
         }
 
+        // Reject forbidden peer IPs before doing anything else. RFC 5766 §9.2
+        // permits the server to reject any peer address it does not wish to
+        // relay to. Sending 403 covers loopback/multicast/etc.
+        for peer_addr in &msg.xor_peer_addresses {
+            if is_forbidden_peer_ip(peer_addr.ip()) {
+                warn!(
+                    "CreatePermission with forbidden peer {} from {}",
+                    peer_addr.ip(),
+                    src_addr
+                );
+                let response = self.build_error_response(msg, TurnErrorCode::Forbidden);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        }
+
         let (alloc_id, key) = {
             let alloc = match self.allocations.get_by_client(src_addr) {
                 Some(a) => a,
@@ -715,19 +750,28 @@ impl TurnHandler {
             (alloc.id, key)
         };
 
-        // Add permissions for each peer IP (must use table method to update index)
-        for peer_addr in &msg.xor_peer_addresses {
-            let peer_ip = peer_addr.ip();
-            self.allocations.add_permission(alloc_id, peer_ip);
-            debug!(
-                "Added permission for {} to allocation {}",
-                peer_ip, alloc_id
+        // Atomically enforce the per-allocation permission cap and insert the
+        // new peer IPs. Re-adds of existing permissions are always allowed
+        // (refresh semantics). Holding the write lock across the count check
+        // and insert avoids TOCTOU against concurrent CreatePermission requests.
+        let peer_ips: Vec<IpAddr> = msg.xor_peer_addresses.iter().map(|a| a.ip()).collect();
+        if !self.allocations.try_add_permissions_capped(
+            alloc_id,
+            &peer_ips,
+            self.config.max_permissions_per_alloc,
+        ) {
+            warn!(
+                "CreatePermission cap exceeded for {} (alloc {}, max {})",
+                src_addr, alloc_id, self.config.max_permissions_per_alloc
             );
+            let response = self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
+            socket.send_to(&response, src_addr).await?;
+            return Ok(());
         }
 
         info!(
-            "CreatePermission: added {} peer(s) for {} (alloc {})",
-            msg.xor_peer_addresses.len(),
+            "CreatePermission: added/refreshed {} peer(s) for {} (alloc {})",
+            peer_ips.len(),
             src_addr,
             alloc_id
         );
@@ -769,6 +813,17 @@ impl TurnHandler {
             }
         };
 
+        if is_forbidden_peer_ip(peer_addr.ip()) {
+            warn!(
+                "ChannelBind with forbidden peer {} from {}",
+                peer_addr.ip(),
+                src_addr
+            );
+            let response = self.build_error_response(msg, TurnErrorCode::Forbidden);
+            socket.send_to(&response, src_addr).await?;
+            return Ok(());
+        }
+
         let (alloc_id, key) = {
             let alloc = match self.allocations.get_by_client(src_addr) {
                 Some(a) => a,
@@ -792,6 +847,22 @@ impl TurnHandler {
             };
 
             let alloc_id = alloc.id;
+
+            // Enforce per-allocation channel cap. A rebind of an existing
+            // channel id or peer does not consume a new slot.
+            let is_rebind = alloc.peer_for_channel(channel).is_some()
+                || alloc.channel_for_peer(peer_addr).is_some();
+            if !is_rebind && alloc.channels_count() >= self.config.max_channels_per_alloc {
+                warn!(
+                    "ChannelBind cap exceeded for {}: {} >= {}",
+                    src_addr,
+                    alloc.channels_count(),
+                    self.config.max_channels_per_alloc
+                );
+                let response = self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
 
             // Bind channel (this can be done while holding the ref)
             alloc.bind_channel(channel, peer_addr);
@@ -840,6 +911,26 @@ impl TurnHandler {
                 return Ok(());
             }
         };
+
+        // Reject forbidden peer targets (loopback, multicast, broadcast, etc.)
+        if is_forbidden_peer_ip(peer_addr.ip()) {
+            warn!(
+                "Send indication to forbidden peer {} from {}",
+                peer_addr.ip(),
+                src_addr
+            );
+            return Ok(());
+        }
+
+        // Drop sends to our own external IP on a non-relay port. Same IP + relay
+        // port is the legitimate single-port internal-routing case handled below.
+        if peer_addr.ip() == self.config.external_ip && peer_addr.port() != self.config.port {
+            warn!(
+                "Send indication to own external IP on non-relay port {} from {}",
+                peer_addr, src_addr
+            );
+            return Ok(());
+        }
 
         // Prevent sending to ourselves (would create a loop)
         let our_addr = SocketAddr::new(self.config.external_ip, self.config.port);
@@ -1462,5 +1553,67 @@ impl TurnHandler {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_forbidden_peer_ip;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn forbidden_ipv4_loopback() {
+        assert!(is_forbidden_peer_ip(ip("127.0.0.1")));
+        assert!(is_forbidden_peer_ip(ip("127.0.0.2")));
+        assert!(is_forbidden_peer_ip(ip("127.255.255.254")));
+    }
+
+    #[test]
+    fn forbidden_ipv4_multicast_and_broadcast() {
+        assert!(is_forbidden_peer_ip(ip("224.0.0.1")));
+        assert!(is_forbidden_peer_ip(ip("239.255.255.255")));
+        assert!(is_forbidden_peer_ip(ip("255.255.255.255")));
+    }
+
+    #[test]
+    fn forbidden_ipv4_unspecified() {
+        assert!(is_forbidden_peer_ip(ip("0.0.0.0")));
+    }
+
+    #[test]
+    fn forbidden_ipv4_link_local_covers_cloud_metadata() {
+        // AWS/GCE/Azure instance metadata: 169.254.169.254
+        assert!(is_forbidden_peer_ip(ip("169.254.169.254")));
+        assert!(is_forbidden_peer_ip(ip("169.254.0.1")));
+    }
+
+    #[test]
+    fn forbidden_ipv6_loopback_and_multicast_and_unspecified() {
+        assert!(is_forbidden_peer_ip(ip("::1")));
+        assert!(is_forbidden_peer_ip(ip("ff02::1")));
+        assert!(is_forbidden_peer_ip(ip("::")));
+    }
+
+    #[test]
+    fn allowed_global_unicast_not_forbidden() {
+        assert!(!is_forbidden_peer_ip(ip("8.8.8.8")));
+        assert!(!is_forbidden_peer_ip(ip("203.0.113.5"))); // TEST-NET-3
+        assert!(!is_forbidden_peer_ip(ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn private_networks_not_forbidden_by_default() {
+        // Policy call: private ranges are common in legit on-prem/lab
+        // deployments. is_forbidden_peer_ip intentionally allows them.
+        assert!(!is_forbidden_peer_ip(ip("10.0.0.1")));
+        assert!(!is_forbidden_peer_ip(ip("192.168.1.1")));
+        assert!(!is_forbidden_peer_ip(ip("172.16.0.1")));
+        // CGNAT and IPv6 ULA are likewise allowed by default.
+        assert!(!is_forbidden_peer_ip(ip("100.64.0.1")));
+        assert!(!is_forbidden_peer_ip(ip("fc00::1")));
     }
 }

@@ -31,6 +31,18 @@ pub struct Config {
 
     /// Secret key for nonce generation (randomly generated at startup)
     pub nonce_secret: [u8; 16],
+
+    /// Opt-in for running without any credentials configured (open relay).
+    /// The binary refuses to start when `credentials` is empty unless this is true.
+    pub allow_anonymous: bool,
+
+    /// Maximum number of permission entries (peer IPs) per allocation.
+    /// Exceeding this returns 508 Insufficient Capacity. (RFC 5766 §9.2)
+    pub max_permissions_per_alloc: usize,
+
+    /// Maximum number of bound channels per allocation.
+    /// Exceeding this returns 508 Insufficient Capacity. (RFC 5766 §11.2)
+    pub max_channels_per_alloc: usize,
 }
 
 impl Config {
@@ -48,6 +60,9 @@ impl Config {
             rate_limit_per_minute: 120,
             nonce_lifetime_secs: 3600,
             nonce_secret,
+            allow_anonymous: false,
+            max_permissions_per_alloc: 64,
+            max_channels_per_alloc: 128,
         }
     }
 

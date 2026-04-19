@@ -186,10 +186,22 @@ impl Allocation {
         self.permissions.write().insert(peer_ip);
     }
 
+    /// Number of permission entries currently held.
+    #[inline]
+    pub fn permissions_count(&self) -> usize {
+        self.permissions.read().len()
+    }
+
     /// Bind a channel to a peer address
     pub fn bind_channel(&self, channel: u16, peer_addr: SocketAddr) {
         self.channels.insert(channel, peer_addr);
         self.channels_reverse.insert(peer_addr, channel);
+    }
+
+    /// Number of channels currently bound.
+    #[inline]
+    pub fn channels_count(&self) -> usize {
+        self.channels.len()
     }
 
     /// Get channel for a peer address
@@ -592,6 +604,50 @@ impl AllocationTable {
         }
     }
 
+    /// Atomically check the permission cap and insert new peer IPs.
+    ///
+    /// Holds the allocation's permissions write lock across the count check
+    /// and insert, preventing TOCTOU races between concurrent CreatePermission
+    /// requests. Returns `false` if the allocation does not exist or if adding
+    /// the new IPs would exceed `cap`; in both cases no state is modified.
+    pub fn try_add_permissions_capped(
+        &self,
+        id: AllocationId,
+        peer_ips: &[IpAddr],
+        cap: usize,
+    ) -> bool {
+        let alloc = match self.allocations.get(&id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        let to_add: Vec<IpAddr> = {
+            let mut perms = alloc.permissions.write();
+            let new_ips: Vec<IpAddr> = peer_ips
+                .iter()
+                .filter(|ip| !perms.contains(*ip))
+                .copied()
+                .collect();
+            if perms.len() + new_ips.len() > cap {
+                return false;
+            }
+            for ip in &new_ips {
+                perms.insert(*ip);
+            }
+            new_ips
+        };
+
+        // Update reverse index outside the per-allocation lock.
+        for ip in to_add {
+            let mut entry = self.by_permission.entry(ip).or_default();
+            if !entry.contains(&id) {
+                entry.push(id);
+            }
+        }
+
+        true
+    }
+
     /// Register peer tuple for fast path lookup
     /// Also records in known_peers so it gets cleaned up with the allocation
     pub fn register_peer_tuple(&self, id: AllocationId, peer_addr: SocketAddr) {
@@ -815,5 +871,94 @@ mod tests {
         let found = table.lookup_by_peer_ip(peer_ip);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], id);
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn try_add_permissions_capped_rejects_when_over_cap() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peers = [ip("10.0.0.1"), ip("10.0.0.2"), ip("10.0.0.3")];
+        // Cap of 2 with 3 new IPs -> reject, no state modification.
+        assert!(!table.try_add_permissions_capped(id, &peers, 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 0);
+        for p in &peers {
+            assert!(table.lookup_by_peer_ip(*p).is_empty());
+        }
+    }
+
+    #[test]
+    fn try_add_permissions_capped_allows_refresh_at_cap() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peers = [ip("10.0.0.1"), ip("10.0.0.2")];
+        assert!(table.try_add_permissions_capped(id, &peers, 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+
+        // Refresh the same IPs -- must not count as new additions.
+        assert!(table.try_add_permissions_capped(id, &peers, 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+    }
+
+    #[test]
+    fn try_add_permissions_capped_mixed_new_and_existing() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        assert!(table.try_add_permissions_capped(id, &[ip("10.0.0.1")], 2));
+        // Existing 10.0.0.1 plus new 10.0.0.2 -> total 2, within cap of 2.
+        assert!(table.try_add_permissions_capped(id, &[ip("10.0.0.1"), ip("10.0.0.2")], 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+        // Adding a third distinct IP now exceeds cap.
+        assert!(!table.try_add_permissions_capped(id, &[ip("10.0.0.3")], 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+    }
+
+    #[test]
+    fn try_add_permissions_capped_is_atomic_under_concurrent_callers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let table = Arc::new(AllocationTable::new());
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        const CAP: usize = 64;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 16;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let table = table.clone();
+                thread::spawn(move || {
+                    let peers: Vec<IpAddr> = (0..PER_THREAD)
+                        .map(|i| ip(&format!("10.{}.{}.1", t, i)))
+                        .collect();
+                    // Each thread tries to add 16 unique IPs. 8*16 = 128 > cap 64,
+                    // so some must fail. The cap must never be exceeded regardless.
+                    let _ = table.try_add_permissions_capped(id, &peers, CAP);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = table.get(id).unwrap().permissions_count();
+        assert!(
+            total <= CAP,
+            "permissions_count {} exceeded cap {}",
+            total,
+            CAP
+        );
     }
 }

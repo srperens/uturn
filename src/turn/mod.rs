@@ -1,7 +1,7 @@
 //! TURN protocol handling
 
 mod auth;
-mod handler;
+pub(crate) mod handler;
 mod message;
 
 pub use auth::TurnAuth;
