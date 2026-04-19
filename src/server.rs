@@ -18,7 +18,7 @@ use crate::relay::RelayEngine;
 use crate::turn::TurnHandler;
 
 /// Interval for cleaning up expired allocations
-const CLEANUP_INTERVAL_SECS: u64 = 10;
+const CLEANUP_INTERVAL_SECS: u64 = 2;
 
 /// Inactivity timeout - remove allocation if no traffic FROM client for this long
 const INACTIVITY_TIMEOUT_SECS: u64 = 45;
@@ -97,6 +97,9 @@ impl Server {
         let cleanup_rate_limiter = self.rate_limiter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
+            // If a cleanup ever takes longer than the interval, don't spin
+            // through queued catch-up ticks; resume on the next aligned tick.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
 

@@ -205,60 +205,53 @@ impl StunInfo {
             let value = &attrs[offset + 4..offset + 4 + attr_len];
 
             match attr_type {
-                ATTR_USERNAME => {
+                ATTR_USERNAME
                     // RFC 5389: USERNAME must be less than 513 bytes
-                    if value.len() <= MAX_USERNAME_LEN {
+                    if value.len() <= MAX_USERNAME_LEN => {
                         result.username = String::from_utf8(value.to_vec()).ok();
                     }
-                }
                 ATTR_XOR_PEER_ADDRESS => {
                     if let Some(addr) = Self::decode_xor_address(value, transaction_id) {
                         result.xor_peer_addresses.push(addr);
                     }
                 }
-                ATTR_CHANNEL_NUMBER => {
-                    if value.len() >= 2 {
+                ATTR_CHANNEL_NUMBER
+                    if value.len() >= 2 => {
                         let channel = u16::from_be_bytes([value[0], value[1]]);
                         // Valid channel range: 0x4000-0x7FFF
                         if (0x4000..=0x7FFF).contains(&channel) {
                             result.channel_number = Some(channel);
                         }
                     }
-                }
-                ATTR_LIFETIME => {
-                    if value.len() >= 4 {
+                ATTR_LIFETIME
+                    if value.len() >= 4 => {
                         result.lifetime =
                             Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
                     }
-                }
                 ATTR_DATA => {
                     result.data = Some(value.to_vec());
                 }
-                ATTR_REALM => {
+                ATTR_REALM
                     // RFC 5389: REALM must be less than 763 bytes
-                    if value.len() <= MAX_REALM_LEN {
+                    if value.len() <= MAX_REALM_LEN => {
                         result.realm = String::from_utf8(value.to_vec()).ok();
                     }
-                }
-                ATTR_NONCE => {
+                ATTR_NONCE
                     // RFC 5389: NONCE must be less than 763 bytes
-                    if value.len() <= MAX_NONCE_LEN {
+                    if value.len() <= MAX_NONCE_LEN => {
                         result.nonce = String::from_utf8(value.to_vec()).ok();
                     }
-                }
-                ATTR_MESSAGE_INTEGRITY => {
-                    if value.len() == 20 {
+                ATTR_MESSAGE_INTEGRITY
+                    if value.len() == 20 => {
                         result.message_integrity = Some(value.to_vec());
                         // Offset from start of attributes section + 20 bytes header
                         result.message_integrity_offset = Some(20 + offset);
                     }
-                }
-                ATTR_REQUESTED_TRANSPORT => {
+                ATTR_REQUESTED_TRANSPORT
                     // REQUESTED-TRANSPORT is 4 bytes: protocol (1 byte) + RFFU (3 bytes)
-                    if !value.is_empty() {
+                    if !value.is_empty() => {
                         result.requested_transport = Some(value[0]);
                     }
-                }
                 _ => {}
             }
 
