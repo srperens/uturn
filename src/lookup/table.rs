@@ -311,6 +311,15 @@ impl IceUfragPair {
 }
 
 /// Multi-index lookup table for allocations
+///
+/// LOCK ORDER (must hold globally to avoid ABBA deadlocks):
+/// `allocations` is the primary map; every other field is a secondary index.
+/// Any code that needs guards on both the primary map and a secondary index
+/// MUST acquire the `allocations` guard FIRST. The `cleanup_*` paths rely on
+/// this: they hold an `allocations` shard write lock (via `retain`) and then
+/// mutate the secondary indices. A path that locked a secondary index first
+/// and then `allocations` would deadlock against a concurrent cleanup on the
+/// multi-thread runtime.
 pub struct AllocationTable {
     /// All allocations by ID
     allocations: DashMap<AllocationId, Allocation>,
@@ -489,34 +498,40 @@ impl AllocationTable {
         local_ufrag: String,
         remote_ufrag: String,
     ) -> bool {
-        // Atomic check: try to insert into by_ice_ufrag index
-        // If already exists for DIFFERENT allocation, this is broadcast duplicate
         use dashmap::mapref::entry::Entry;
+
+        // Lock-order invariant: `allocations` MUST be locked before any secondary
+        // index, never the reverse. The cleanup paths (`cleanup_expired` /
+        // `cleanup_inactive` / `cleanup_orphaned_senders`) hold an `allocations`
+        // shard write lock via `retain` and then reach into `by_ice_ufrag`. If we
+        // locked `by_ice_ufrag` first and then `allocations` here, a concurrent
+        // cleanup on the multi-thread runtime would deadlock (ABBA). So acquire
+        // the allocation ref first and hold it across the by_ice_ufrag claim.
+        let alloc = match self.allocations.get(&id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        // Atomic check: try to claim local_ufrag in the by_ice_ufrag index.
+        // If already present (this or another allocation), it's a broadcast
+        // duplicate and we skip registration.
         match self.by_ice_ufrag.entry(local_ufrag.clone()) {
-            Entry::Occupied(_) => {
-                // Already registered by this or another allocation - skip
-                false
-            }
+            Entry::Occupied(_) => false,
             Entry::Vacant(entry) => {
-                // Not registered yet - this allocation wins
-                if let Some(alloc) = self.allocations.get(&id) {
-                    if alloc.get_ice_ufrag().is_some() {
-                        // Allocation already has different ufrag, don't overwrite
-                        return false;
-                    }
-                    alloc.set_ice_ufrag(local_ufrag.clone());
-                    alloc.set_ice_remote_ufrag(remote_ufrag.clone());
-                    entry.insert(id);
-
-                    // Also register in the pair index for O(1) bidirectional lookup
-                    // Key is (local, remote) so find_ice_peers can lookup by reverse
-                    let pair = IceUfragPair::new(local_ufrag, remote_ufrag);
-                    self.by_ice_ufrag_pair.insert(pair, id);
-
-                    true
-                } else {
-                    false
+                if alloc.get_ice_ufrag().is_some() {
+                    // Allocation already has a ufrag, don't overwrite
+                    return false;
                 }
+                alloc.set_ice_ufrag(local_ufrag.clone());
+                alloc.set_ice_remote_ufrag(remote_ufrag.clone());
+                entry.insert(id);
+
+                // Also register in the pair index for O(1) bidirectional lookup
+                // Key is (local, remote) so find_ice_peers can lookup by reverse
+                let pair = IceUfragPair::new(local_ufrag, remote_ufrag);
+                self.by_ice_ufrag_pair.insert(pair, id);
+
+                true
             }
         }
     }
@@ -960,5 +975,86 @@ mod tests {
             total,
             CAP
         );
+    }
+
+    /// Regression guard for the ABBA deadlock between `register_ice_ufrags`
+    /// (locks `by_ice_ufrag` then `allocations`) and the `cleanup_*` paths
+    /// (lock `allocations` via `retain`, then `by_ice_ufrag`). The lock-order
+    /// invariant requires `allocations` to be acquired first everywhere. If a
+    /// future change reintroduces the inverse order, the writer and cleanup
+    /// threads deadlock and never observe `stop`, so the watchdog fails the test
+    /// instead of hanging the whole suite.
+    #[test]
+    fn register_and_cleanup_do_not_deadlock_under_contention() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        let table = Arc::new(AllocationTable::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+
+        // Writers: create an allocation and register a fresh ICE ufrag. The
+        // fresh ufrag forces the `Vacant` arm of `register_ice_ufrags`, which is
+        // where it holds a `by_ice_ufrag` write lock while touching `allocations`.
+        const WRITERS: usize = 8;
+        for t in 0..WRITERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            let progress = Arc::clone(&progress);
+            handles.push(thread::spawn(move || {
+                let mut n: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    // Small, recycled client-port space so shards collide often.
+                    let port = 20000 + ((t as u64 * 251 + n) % 512) as u16;
+                    let client: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+                    let id = table.create(client, "strom".to_string(), 600);
+                    table.register_ice_ufrags(id, format!("L{}-{}", t, n), format!("R{}-{}", t, n));
+                    n += 1;
+                }
+                progress.fetch_add(n, Ordering::Relaxed);
+            }));
+        }
+
+        // Cleaners: `cleanup_inactive(0)` removes every allocation unconditionally
+        // (now - last_received >= 0 always holds), exercising the removal branch
+        // that locks `by_ice_ufrag` while holding the `allocations` retain lock.
+        const CLEANERS: usize = 2;
+        for _ in 0..CLEANERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    table.cleanup_inactive(0);
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(1500));
+        stop.store(true, Ordering::Relaxed);
+
+        // Watchdog: a separate thread joins the workers. If they deadlocked they
+        // never exit, the join blocks, and `recv_timeout` fails the test loudly.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = tx.send(());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => assert!(
+                progress.load(Ordering::Relaxed) > 0,
+                "writers made no progress"
+            ),
+            Err(_) => panic!(
+                "deadlock: register_ice_ufrags and cleanup_* threads did not finish \
+                 after stop -- lock-order inversion reintroduced (allocations must be \
+                 locked before any secondary index; see AllocationTable lock-order doc)"
+            ),
+        }
     }
 }
