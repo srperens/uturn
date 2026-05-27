@@ -235,95 +235,107 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("Binding request from {}", src_addr);
 
-        // Check if sender has a TURN allocation (is a TURN client doing ICE checks)
-        if let Some(sender_alloc) = self.allocations.get_by_client(src_addr) {
-            let alloc_id = sender_alloc.id;
-
-            // Register ICE ufrags from USERNAME attribute (format: "remoteUfrag:localUfrag")
-            // This is critical for single-port TURN to route DTLS/media correctly
-            if let Some((remote_ufrag, local_ufrag)) = msg.parse_ice_username() {
-                let registered = self.allocations.register_ice_ufrags(
-                    alloc_id,
-                    local_ufrag.clone(),
-                    remote_ufrag.clone(),
-                );
-                if registered {
-                    debug!(
-                        "Registered ICE ufrags for {}: local={}, remote={}",
-                        src_addr, local_ufrag, remote_ufrag
-                    );
-                }
-            }
-
-            // Auto-grant permission for relay IP if not already granted
-            // This handles the case where Chrome doesn't send CreatePermission
-            // when remote relay == local relay (single-port TURN)
-            if !sender_alloc.is_permitted(self.config.external_ip) {
-                drop(sender_alloc); // Release lock before modifying
-                self.allocations
-                    .add_permission(alloc_id, self.config.external_ip);
-                debug!(
-                    "Auto-granted permission for relay IP to allocation {}",
-                    alloc_id
-                );
-            }
-
-            // Re-acquire the allocation reference
-            let sender_alloc = match self.allocations.get_by_client(src_addr) {
-                Some(a) => a,
-                None => {
-                    let response = self.build_binding_response(msg, src_addr);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
-
-            // Now sender has permission for the relay IP
-            if sender_alloc.is_permitted(self.config.external_ip) {
-                let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
-
-                // Find other allocations that have permission for the relay IP
-                let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
-
-                for alloc_id in candidates {
-                    if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                        // Skip the sender's own allocation
-                        if target_alloc.client_addr == src_addr {
-                            continue;
-                        }
-
-                        // Only relay to targets that also have permission for relay IP
-                        if !target_alloc.is_permitted(self.config.external_ip) {
-                            continue;
-                        }
-
-                        debug!(
-                            "Relaying Binding Request from {} to {} via Data Indication",
-                            src_addr, target_alloc.client_addr
-                        );
-
-                        // Relay the Binding Request via Data Indication
-                        // XOR-PEER-ADDRESS = relay address (from receiver's perspective)
-                        let indication = self.build_data_indication(relay_addr, &msg.raw);
-                        socket
-                            .send_to(&indication, target_alloc.client_addr)
-                            .await?;
-                    }
-                }
-            }
-
-            // Update inactivity timer - client is actively sending ICE checks
-            sender_alloc.touch_received();
-
-            // For TURN clients: don't respond ourselves - let the peer respond
-            // This allows consent freshness to work correctly (timeout if peer is gone)
+        // Non-TURN client (no allocation): respond with a normal Binding Response
+        // (server reflexive). Membership is checked without holding a guard.
+        if !self.allocations.is_client(src_addr) {
+            let response = self.build_binding_response(msg, src_addr);
+            socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
 
-        // Non-TURN client: respond with normal Binding Response (server reflexive)
-        let response = self.build_binding_response(msg, src_addr);
-        socket.send_to(&response, src_addr).await?;
+        // Sender is a TURN client doing ICE checks. Snapshot its id and current
+        // relay permission, releasing the guard immediately: the relay paths below
+        // await socket sends, and a guard must never be held across I/O.
+        let (alloc_id, already_permitted) = match self.allocations.get_by_client(src_addr) {
+            Some(a) => (a.id, a.is_permitted(self.config.external_ip)),
+            None => {
+                let response = self.build_binding_response(msg, src_addr);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
 
+        // Register ICE ufrags from USERNAME attribute (format: "remoteUfrag:localUfrag").
+        // This is critical for single-port TURN to route DTLS/media correctly.
+        if let Some((remote_ufrag, local_ufrag)) = msg.parse_ice_username() {
+            let registered = self.allocations.register_ice_ufrags(
+                alloc_id,
+                local_ufrag.clone(),
+                remote_ufrag.clone(),
+            );
+            if registered {
+                debug!(
+                    "Registered ICE ufrags for {}: local={}, remote={}",
+                    src_addr, local_ufrag, remote_ufrag
+                );
+            }
+        }
+
+        // Auto-grant permission for relay IP if not already granted. This handles
+        // the case where Chrome doesn't send CreatePermission when remote relay ==
+        // local relay (single-port TURN).
+        if !already_permitted {
+            self.allocations
+                .add_permission(alloc_id, self.config.external_ip);
+            debug!(
+                "Auto-granted permission for relay IP to allocation {}",
+                alloc_id
+            );
+        }
+
+        // Update the sender's activity timer and snapshot whether it is permitted
+        // for the relay IP, then release the guard before any await.
+        let sender_permitted = match self.allocations.get_by_client(src_addr) {
+            Some(a) => {
+                // Client is actively sending ICE checks
+                a.touch_received();
+                a.is_permitted(self.config.external_ip)
+            }
+            None => {
+                let response = self.build_binding_response(msg, src_addr);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
+        // Relay to other allocations that share the relay-IP permission.
+        if sender_permitted {
+            let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
+
+            // Snapshot the relay targets' client addresses without holding any
+            // allocation guard across the awaits below.
+            let targets: Vec<SocketAddr> = self
+                .allocations
+                .lookup_by_peer_ip(self.config.external_ip)
+                .into_iter()
+                .filter_map(|alloc_id| {
+                    let target = self.allocations.get(alloc_id)?;
+                    // Skip the sender's own allocation and targets without
+                    // permission for the relay IP.
+                    if target.client_addr == src_addr
+                        || !target.is_permitted(self.config.external_ip)
+                    {
+                        None
+                    } else {
+                        Some(target.client_addr)
+                    }
+                })
+                .collect();
+
+            // Relay the Binding Request via Data Indication.
+            // XOR-PEER-ADDRESS = relay address (from receiver's perspective).
+            let indication = self.build_data_indication(relay_addr, &msg.raw);
+            for target_addr in targets {
+                debug!(
+                    "Relaying Binding Request from {} to {} via Data Indication",
+                    src_addr, target_addr
+                );
+                socket.send_to(&indication, target_addr).await?;
+            }
+        }
+
+        // For TURN clients: don't respond ourselves - let the peer respond. This
+        // allows consent freshness to work correctly (timeout if peer is gone).
         Ok(())
     }
 
@@ -336,27 +348,31 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("Client response from {} - relaying to peers", src_addr);
 
-        // Find allocations that have permission for this client's IP
-        let candidates = self.allocations.lookup_by_peer_ip(src_addr.ip());
-
-        for alloc_id in candidates {
-            if let Some(target_alloc) = self.allocations.get(alloc_id) {
+        // Snapshot the target client addresses, then release all allocation
+        // guards before awaiting the sends (never hold a guard across I/O).
+        let targets: Vec<SocketAddr> = self
+            .allocations
+            .lookup_by_peer_ip(src_addr.ip())
+            .into_iter()
+            .filter_map(|alloc_id| {
+                let target = self.allocations.get(alloc_id)?;
                 // Skip if target is same as source
-                if target_alloc.client_addr == src_addr {
-                    continue;
+                if target.client_addr == src_addr {
+                    None
+                } else {
+                    Some(target.client_addr)
                 }
+            })
+            .collect();
 
-                debug!(
-                    "Relaying response from {} to {} via Data Indication",
-                    src_addr, target_alloc.client_addr
-                );
-
-                // Build and send Data Indication with the raw STUN response
-                let indication = self.build_data_indication(src_addr, &msg.raw);
-                socket
-                    .send_to(&indication, target_alloc.client_addr)
-                    .await?;
-            }
+        // Build and send Data Indication with the raw STUN response
+        let indication = self.build_data_indication(src_addr, &msg.raw);
+        for target_addr in targets {
+            debug!(
+                "Relaying response from {} to {} via Data Indication",
+                src_addr, target_addr
+            );
+            socket.send_to(&indication, target_addr).await?;
         }
 
         Ok(())
@@ -633,8 +649,10 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("Refresh request from {}", src_addr);
 
-        let alloc = match self.allocations.get_by_client(src_addr) {
-            Some(a) => a,
+        // Snapshot id + username, then drop the guard so none of the awaits
+        // below run while an allocation lock is held.
+        let (alloc_id, username) = match self.allocations.get_by_client(src_addr) {
+            Some(a) => (a.id, a.username.clone()),
             None => {
                 let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
                 socket.send_to(&response, src_addr).await?;
@@ -643,7 +661,7 @@ impl TurnHandler {
         };
 
         // Validate authentication (RFC 5766 Section 10.1)
-        let key = match self.validate_request_auth(msg, &alloc.username) {
+        let key = match self.validate_request_auth(msg, &username) {
             AuthResult::Success(k) => Some(k),
             AuthResult::NotRequired => None,
             AuthResult::Failed(response) => {
@@ -658,8 +676,6 @@ impl TurnHandler {
 
         if requested_lifetime == 0 {
             // Client wants to delete the allocation
-            let alloc_id = alloc.id;
-            drop(alloc); // Release the ref before removing
             self.allocations.remove(alloc_id);
             self.rate_limiter.record_deallocation(src_addr.ip());
             info!(
@@ -674,8 +690,12 @@ impl TurnHandler {
 
         // Cap lifetime at 60 seconds max, minimum 10 seconds
         let lifetime = requested_lifetime.clamp(10, 60);
-        alloc.refresh(lifetime);
-        alloc.touch_received();
+        // Re-acquire briefly to extend the lifetime and activity timer; if the
+        // allocation was reaped concurrently we simply skip the update.
+        if let Some(alloc) = self.allocations.get_by_client(src_addr) {
+            alloc.refresh(lifetime);
+            alloc.touch_received();
+        }
 
         debug!(
             "Refreshed allocation for {} (lifetime={}s)",
@@ -725,8 +745,10 @@ impl TurnHandler {
         }
 
         let (alloc_id, key) = {
-            let alloc = match self.allocations.get_by_client(src_addr) {
-                Some(a) => a,
+            // Snapshot the username, then drop the guard so auth's await never
+            // runs while an allocation lock is held.
+            let username = match self.allocations.get_by_client(src_addr) {
+                Some(a) => a.username.clone(),
                 None => {
                     let response =
                         self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
@@ -736,7 +758,7 @@ impl TurnHandler {
             };
 
             // Validate authentication (RFC 5766 Section 10.1)
-            let key = match self.validate_request_auth(msg, &alloc.username) {
+            let key = match self.validate_request_auth(msg, &username) {
                 AuthResult::Success(k) => Some(k),
                 AuthResult::NotRequired => None,
                 AuthResult::Failed(response) => {
@@ -746,8 +768,19 @@ impl TurnHandler {
                 }
             };
 
-            alloc.touch_received();
-            (alloc.id, key)
+            // Re-acquire briefly to update the activity timer and read the id.
+            match self.allocations.get_by_client(src_addr) {
+                Some(alloc) => {
+                    alloc.touch_received();
+                    (alloc.id, key)
+                }
+                None => {
+                    let response =
+                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            }
         };
 
         // Atomically enforce the per-allocation permission cap and insert the
@@ -825,8 +858,10 @@ impl TurnHandler {
         }
 
         let (alloc_id, key) = {
-            let alloc = match self.allocations.get_by_client(src_addr) {
-                Some(a) => a,
+            // Snapshot the username, then drop the guard so auth's await never
+            // runs while an allocation lock is held.
+            let username = match self.allocations.get_by_client(src_addr) {
+                Some(a) => a.username.clone(),
                 None => {
                     let response =
                         self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
@@ -836,7 +871,7 @@ impl TurnHandler {
             };
 
             // Validate authentication (RFC 5766 Section 10.1)
-            let key = match self.validate_request_auth(msg, &alloc.username) {
+            let key = match self.validate_request_auth(msg, &username) {
                 AuthResult::Success(k) => Some(k),
                 AuthResult::NotRequired => None,
                 AuthResult::Failed(response) => {
@@ -846,29 +881,46 @@ impl TurnHandler {
                 }
             };
 
-            let alloc_id = alloc.id;
+            // Enforce the per-allocation channel cap and bind under a single
+            // short-lived guard with no await held. `Err(Some(n))` => cap exceeded
+            // (n = current channel count); `Err(None)` => allocation gone.
+            let bind_result = match self.allocations.get_by_client(src_addr) {
+                Some(alloc) => {
+                    // A rebind of an existing channel id or peer does not consume
+                    // a new slot.
+                    let is_rebind = alloc.peer_for_channel(channel).is_some()
+                        || alloc.channel_for_peer(peer_addr).is_some();
+                    if !is_rebind && alloc.channels_count() >= self.config.max_channels_per_alloc
+                    {
+                        Err(Some(alloc.channels_count()))
+                    } else {
+                        alloc.bind_channel(channel, peer_addr);
+                        alloc.touch_received();
+                        Ok(alloc.id)
+                    }
+                }
+                None => Err(None),
+            };
 
-            // Enforce per-allocation channel cap. A rebind of an existing
-            // channel id or peer does not consume a new slot.
-            let is_rebind = alloc.peer_for_channel(channel).is_some()
-                || alloc.channel_for_peer(peer_addr).is_some();
-            if !is_rebind && alloc.channels_count() >= self.config.max_channels_per_alloc {
-                warn!(
-                    "ChannelBind cap exceeded for {}: {} >= {}",
-                    src_addr,
-                    alloc.channels_count(),
-                    self.config.max_channels_per_alloc
-                );
-                let response = self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
+            match bind_result {
+                Ok(id) => (id, key),
+                Err(Some(count)) => {
+                    warn!(
+                        "ChannelBind cap exceeded for {}: {} >= {}",
+                        src_addr, count, self.config.max_channels_per_alloc
+                    );
+                    let response =
+                        self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+                Err(None) => {
+                    let response =
+                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
             }
-
-            // Bind channel (this can be done while holding the ref)
-            alloc.bind_channel(channel, peer_addr);
-            alloc.touch_received();
-
-            (alloc_id, key)
         };
 
         // Add permission through the table method to update index
@@ -894,14 +946,14 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("Send indication from {}", src_addr);
 
-        // Get allocation for this client
-        let alloc = match self.allocations.get_by_client(src_addr) {
-            Some(a) => a,
-            None => {
-                trace!("Send indication from unknown client: {}", src_addr);
-                return Ok(());
-            }
-        };
+        // This client must have an allocation. We deliberately do NOT hold the
+        // allocation guard across this function: the relay paths below await
+        // socket sends, and an allocation guard must never be held across I/O.
+        // Each branch re-acquires the allocation briefly as needed.
+        if !self.allocations.is_client(src_addr) {
+            trace!("Send indication from unknown client: {}", src_addr);
+            return Ok(());
+        }
 
         // Get peer address
         let peer_addr = match msg.xor_peer_addresses.first() {
@@ -940,8 +992,15 @@ impl TurnHandler {
             // and send the data to them
             debug!("Send to our own relay address - routing internally");
 
+            // Snapshot the sender's permission + id, then release the guard before
+            // any await below (never hold an allocation guard across socket I/O).
+            let (sender_permitted, alloc_id) = match self.allocations.get_by_client(src_addr) {
+                Some(a) => (a.is_permitted(self.config.external_ip), a.id),
+                None => return Ok(()),
+            };
+
             // Check that the SENDER has permission for the relay IP (RFC 5766 requirement)
-            if !alloc.is_permitted(self.config.external_ip) {
+            if !sender_permitted {
                 warn!(
                     "Send indication to relay address from {} without permission",
                     src_addr
@@ -957,7 +1016,6 @@ impl TurnHandler {
             // Try targeted routing via ICE ufrags to avoid cross-talk between
             // unrelated calls. Only fall back to broadcast for the very first
             // STUN packet before any ufrag is registered.
-            let alloc_id = alloc.id;
             let mut sent = false;
 
             // For STUN Binding Requests: register sender ufrags and route by target ufrag
@@ -977,42 +1035,59 @@ impl TurnHandler {
                             );
                         }
 
-                        // Route to target by their ICE ufrag
-                        if let Some(target_id) = self.allocations.lookup_by_ice_ufrag(&remote_ufrag)
-                        {
-                            if let Some(target_alloc) = self.allocations.get(target_id) {
-                                if target_alloc.client_addr != src_addr
-                                    && target_alloc.is_permitted(self.config.external_ip)
+                        // Route to target by their ICE ufrag: snapshot its address,
+                        // release the guard, then await.
+                        let target_addr = self
+                            .allocations
+                            .lookup_by_ice_ufrag(&remote_ufrag)
+                            .and_then(|target_id| {
+                                let target = self.allocations.get(target_id)?;
+                                if target.client_addr != src_addr
+                                    && target.is_permitted(self.config.external_ip)
                                 {
-                                    let indication = self.build_data_indication(our_addr, data);
-                                    socket
-                                        .send_to(&indication, target_alloc.client_addr)
-                                        .await?;
-                                    sent = true;
+                                    Some(target.client_addr)
+                                } else {
+                                    None
                                 }
-                            }
+                            });
+                        if let Some(target_addr) = target_addr {
+                            let indication = self.build_data_indication(our_addr, data);
+                            socket.send_to(&indication, target_addr).await?;
+                            sent = true;
                         }
                     }
                 }
             }
 
-            // For non-STUN or STUN responses: use ICE peer matching
+            // For non-STUN or STUN responses: use ICE peer matching. Read the
+            // sender's ufrags fresh (the block above may have just registered
+            // them), then snapshot peer addresses before awaiting.
             if !sent {
-                let sender_local = alloc.get_ice_ufrag();
-                let sender_remote = alloc.get_ice_remote_ufrag();
+                let (sender_local, sender_remote) = match self.allocations.get_by_client(src_addr) {
+                    Some(a) => (a.get_ice_ufrag(), a.get_ice_remote_ufrag()),
+                    None => (None, None),
+                };
                 if let (Some(local), Some(remote)) = (&sender_local, &sender_remote) {
-                    let peers = self.allocations.find_ice_peers(local, remote);
-                    let indication = self.build_data_indication(our_addr, data);
-                    for &peer_id in &peers {
-                        if let Some(target_alloc) = self.allocations.get(peer_id) {
-                            if target_alloc.client_addr != src_addr
-                                && target_alloc.is_permitted(self.config.external_ip)
+                    let targets: Vec<SocketAddr> = self
+                        .allocations
+                        .find_ice_peers(local, remote)
+                        .into_iter()
+                        .filter_map(|peer_id| {
+                            let target = self.allocations.get(peer_id)?;
+                            if target.client_addr != src_addr
+                                && target.is_permitted(self.config.external_ip)
                             {
-                                socket
-                                    .send_to(&indication, target_alloc.client_addr)
-                                    .await?;
-                                sent = true;
+                                Some(target.client_addr)
+                            } else {
+                                None
                             }
+                        })
+                        .collect();
+                    if !targets.is_empty() {
+                        let indication = self.build_data_indication(our_addr, data);
+                        for target_addr in targets {
+                            socket.send_to(&indication, target_addr).await?;
+                            sent = true;
                         }
                     }
                 }
@@ -1022,22 +1097,26 @@ impl TurnHandler {
             // This limits the broadcast to allocations that haven't completed ICE,
             // preventing leakage to already-established calls.
             if !sent {
-                let candidates = self.allocations.lookup_by_peer_ip(self.config.external_ip);
+                // Snapshot unpaired target addresses before awaiting.
+                let targets: Vec<SocketAddr> = self
+                    .allocations
+                    .lookup_by_peer_ip(self.config.external_ip)
+                    .into_iter()
+                    .filter_map(|alloc_id| {
+                        let target = self.allocations.get(alloc_id)?;
+                        // Skip the sender and allocations that already have ICE
+                        // ufrags (established calls).
+                        if target.client_addr == src_addr || target.get_ice_ufrag().is_some() {
+                            None
+                        } else {
+                            Some(target.client_addr)
+                        }
+                    })
+                    .collect();
                 let indication = self.build_data_indication(our_addr, data);
-                for alloc_id in candidates {
-                    if let Some(target_alloc) = self.allocations.get(alloc_id) {
-                        if target_alloc.client_addr == src_addr {
-                            continue;
-                        }
-                        // Skip allocations that already have ICE ufrags (established calls)
-                        if target_alloc.get_ice_ufrag().is_some() {
-                            continue;
-                        }
-                        socket
-                            .send_to(&indication, target_alloc.client_addr)
-                            .await?;
-                        sent = true;
-                    }
+                for target_addr in targets {
+                    socket.send_to(&indication, target_addr).await?;
+                    sent = true;
                 }
                 if !sent {
                     trace!(
@@ -1048,7 +1127,9 @@ impl TurnHandler {
             }
 
             // Touch sender's allocation - they're actively sending data
-            alloc.touch_received();
+            if let Some(a) = self.allocations.get_by_client(src_addr) {
+                a.touch_received();
+            }
             return Ok(());
         }
 
@@ -1061,8 +1142,12 @@ impl TurnHandler {
             }
         };
 
-        // Check permission
-        if !alloc.is_permitted(peer_addr.ip()) {
+        // Check permission (snapshot, then release the guard before the await).
+        let permitted = match self.allocations.get_by_client(src_addr) {
+            Some(a) => a.is_permitted(peer_addr.ip()),
+            None => return Ok(()),
+        };
+        if !permitted {
             warn!(
                 "Send indication to unpermitted peer {} from {}",
                 peer_addr, src_addr
@@ -1078,7 +1163,11 @@ impl TurnHandler {
             peer_addr
         );
         socket.send_to(data, peer_addr).await?;
-        alloc.touch_received();
+
+        // Touch sender's allocation - they're actively sending data
+        if let Some(a) = self.allocations.get_by_client(src_addr) {
+            a.touch_received();
+        }
 
         Ok(())
     }
