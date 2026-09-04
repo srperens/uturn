@@ -675,13 +675,22 @@ impl TurnHandler {
         let requested_lifetime = msg.lifetime.unwrap_or(60);
 
         if requested_lifetime == 0 {
-            // Client wants to delete the allocation
-            self.allocations.remove(alloc_id);
-            self.rate_limiter.record_deallocation(src_addr.ip());
-            info!(
-                "Deleted allocation {} for {} (lifetime=0)",
-                alloc_id, src_addr
-            );
+            // Client wants to delete the allocation. Only release the quota
+            // slot if *we* removed it: if cleanup reaped it concurrently, the
+            // cleanup task already released the slot and a second decrement
+            // would let this IP exceed its allocation quota.
+            if self.allocations.remove(alloc_id) {
+                self.rate_limiter.record_deallocation(src_addr.ip());
+                info!(
+                    "Deleted allocation {} for {} (lifetime=0)",
+                    alloc_id, src_addr
+                );
+            } else {
+                debug!(
+                    "Allocation {} for {} already removed before lifetime=0 refresh",
+                    alloc_id, src_addr
+                );
+            }
 
             let response = self.build_refresh_response(msg, 0, key.as_ref());
             socket.send_to(&response, src_addr).await?;
@@ -890,8 +899,7 @@ impl TurnHandler {
                     // a new slot.
                     let is_rebind = alloc.peer_for_channel(channel).is_some()
                         || alloc.channel_for_peer(peer_addr).is_some();
-                    if !is_rebind && alloc.channels_count() >= self.config.max_channels_per_alloc
-                    {
+                    if !is_rebind && alloc.channels_count() >= self.config.max_channels_per_alloc {
                         Err(Some(alloc.channels_count()))
                     } else {
                         alloc.bind_channel(channel, peer_addr);
@@ -1126,9 +1134,17 @@ impl TurnHandler {
                 }
             }
 
-            // Touch sender's allocation - they're actively sending data
+            // Touch sender's allocation - they're actively sending data - and
+            // feed the orphan-sender timer exactly like the ChannelData and raw
+            // media paths do, so a Send-indication-only client that never finds
+            // a recipient is reaped by cleanup_orphaned_senders as well.
             if let Some(a) = self.allocations.get_by_client(src_addr) {
                 a.touch_received();
+                if sent {
+                    a.touch_relay_success();
+                } else {
+                    a.touch_relay_attempt();
+                }
             }
             return Ok(());
         }

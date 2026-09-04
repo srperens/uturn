@@ -374,23 +374,38 @@ impl AllocationTable {
     ) -> (AllocationId, bool) {
         use dashmap::mapref::entry::Entry;
 
-        // Use entry API for atomic check-and-insert
-        match self.by_client.entry(client_addr) {
-            Entry::Occupied(entry) => {
-                // Allocation already exists for this client
-                (*entry.get(), false)
-            }
+        // Fast path: an allocation already exists. The guard is dropped at the
+        // end of this statement, before any other map is touched.
+        if let Some(id) = self.by_client.get(&client_addr).map(|r| *r) {
+            return (id, false);
+        }
+
+        // Lock-order invariant: `allocations` before any secondary index, and
+        // never hold guards on both at once. Insert into the primary map first
+        // (guard released immediately), then claim the by_client slot. If we
+        // lose the race for the slot, roll back our primary insert.
+        let alloc = Allocation::new(client_addr, username, lifetime_secs);
+        let id = alloc.id;
+        let ufrag = alloc.local_ufrag.clone();
+        self.allocations.insert(id, alloc);
+
+        let claimed = match self.by_client.entry(client_addr) {
+            Entry::Occupied(entry) => Err(*entry.get()),
             Entry::Vacant(entry) => {
-                // No allocation exists - create one atomically
-                let alloc = Allocation::new(client_addr, username, lifetime_secs);
-                let id = alloc.id;
-                let ufrag = alloc.local_ufrag.clone();
-
                 entry.insert(id);
-                self.by_ufrag.insert(ufrag, id);
-                self.allocations.insert(id, alloc);
+                Ok(())
+            }
+        };
 
+        match claimed {
+            Ok(()) => {
+                self.by_ufrag.insert(ufrag, id);
                 (id, true)
+            }
+            Err(existing) => {
+                // Concurrent request won the race - discard ours.
+                self.allocations.remove(&id);
+                (existing, false)
             }
         }
     }
@@ -423,8 +438,12 @@ impl AllocationTable {
         &self,
         addr: SocketAddr,
     ) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
-        let id = self.by_client.get(&addr)?;
-        self.allocations.get(&*id)
+        // Copy the id out so the by_client guard is released before we take
+        // an `allocations` guard. Holding both inverts the documented lock
+        // order (cleanup holds `allocations` then removes from `by_client`)
+        // and can deadlock against a concurrent cleanup.
+        let id = *self.by_client.get(&addr)?;
+        self.allocations.get(&id)
     }
 
     /// Check if address is a known client (has an allocation)
@@ -679,8 +698,13 @@ impl AllocationTable {
         }
     }
 
-    /// Remove an allocation
-    pub fn remove(&self, id: AllocationId) {
+    /// Remove an allocation.
+    ///
+    /// Returns `true` if the allocation existed and was removed by this call,
+    /// `false` if it was already gone (e.g. reaped concurrently by cleanup).
+    /// Callers that account for the removal elsewhere (rate limiter quota)
+    /// must only do so when this returns `true`.
+    pub fn remove(&self, id: AllocationId) -> bool {
         if let Some((_, alloc)) = self.allocations.remove(&id) {
             self.by_client.remove(&alloc.client_addr);
             self.by_ufrag.remove(&alloc.local_ufrag);
@@ -705,6 +729,9 @@ impl AllocationTable {
             for entry in alloc.known_peers.iter() {
                 self.by_peer_tuple.remove(entry.key());
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -975,6 +1002,90 @@ mod tests {
             total,
             CAP
         );
+    }
+
+    /// Regression guard for the ABBA deadlock between `get_by_client` /
+    /// `create_or_get` (previously: `by_client` guard held while locking
+    /// `allocations`) and the `cleanup_*` paths (`allocations` retain lock held
+    /// while removing from `by_client`). Same watchdog shape as the test below.
+    #[test]
+    fn client_lookup_and_cleanup_do_not_deadlock_under_contention() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        let table = Arc::new(AllocationTable::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+
+        const WRITERS: usize = 8;
+        for t in 0..WRITERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            let progress = Arc::clone(&progress);
+            handles.push(thread::spawn(move || {
+                let mut n: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    // Tiny port space so both maps collide on shards constantly.
+                    let port = 30000 + ((t as u64 * 131 + n) % 64) as u16;
+                    let client: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+                    let (id, _) = table.create_or_get(client, "u".to_string(), 600);
+                    if let Some(a) = table.get_by_client(client) {
+                        assert_eq!(a.client_addr, client);
+                    }
+                    let _ = table.is_client(client);
+                    let _ = table.get(id);
+                    n += 1;
+                }
+                progress.fetch_add(n, Ordering::Relaxed);
+            }));
+        }
+
+        const CLEANERS: usize = 2;
+        for _ in 0..CLEANERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    table.cleanup_inactive(0);
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(1500));
+        stop.store(true, Ordering::Relaxed);
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = tx.send(());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => assert!(
+                progress.load(Ordering::Relaxed) > 0,
+                "writers made no progress"
+            ),
+            Err(_) => panic!(
+                "deadlock: get_by_client/create_or_get and cleanup_* threads did not \
+                 finish after stop -- a by_client guard is being held while locking \
+                 allocations (see AllocationTable lock-order doc)"
+            ),
+        }
+    }
+
+    #[test]
+    fn remove_reports_whether_it_removed() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+        assert!(table.remove(id));
+        assert!(!table.remove(id));
+        assert!(table.get_by_client(client).is_none());
     }
 
     /// Regression guard for the ABBA deadlock between `register_ice_ufrags`
