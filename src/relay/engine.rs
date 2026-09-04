@@ -11,7 +11,7 @@ use tracing::{debug, trace};
 
 use crate::config::Config;
 use crate::lookup::{AllocationId, AllocationTable};
-use crate::turn::handler::is_forbidden_peer_ip;
+use crate::turn::handler::is_forbidden_peer_addr;
 
 /// Check if data looks like RTP (vs RTCP)
 /// Check if data is DTLS (content types 0x14-0x19, version 0xFExx)
@@ -444,7 +444,7 @@ impl RelayEngine {
                 // External peer - send raw data. Defense-in-depth: handle_channel_bind
                 // already rejects forbidden peer IPs, so this branch should only hit
                 // legitimate destinations. If a forbidden peer ever reaches here, drop.
-                if is_forbidden_peer_ip(peer_addr.ip()) {
+                if is_forbidden_peer_addr(&self.config, peer_addr) {
                     trace!(
                         "ChannelData to forbidden peer {} from {} dropped",
                         peer_addr,

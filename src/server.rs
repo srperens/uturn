@@ -23,8 +23,14 @@ const CLEANUP_INTERVAL_SECS: u64 = 2;
 /// Inactivity timeout - remove allocation if no traffic FROM client for this long
 const INACTIVITY_TIMEOUT_SECS: u64 = 45;
 
-/// Receive buffer size - MTU is typically 1500, but allow for jumbo frames
-const RECV_BUFFER_SIZE: usize = 2048;
+/// Receive buffer size.
+///
+/// Sized for the largest possible UDP payload (65 507 bytes over IPv4). A
+/// datagram larger than the buffer is silently truncated by recv_from, which
+/// would corrupt a relayed payload or make a STUN message unparseable without
+/// any error. Allocated once for the lifetime of the receive loop, so the
+/// generous size costs nothing per packet.
+const RECV_BUFFER_SIZE: usize = 65_535;
 
 /// uTURN server
 pub struct Server {

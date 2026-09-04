@@ -81,6 +81,11 @@ pub struct Allocation {
     /// Username for authentication
     pub username: String,
 
+    /// Transaction id of the Allocate request that created this allocation.
+    /// Used to tell a retransmitted Allocate (same id: resend success) from a
+    /// new Allocate over an existing 5-tuple (437 Allocation Mismatch).
+    pub allocate_txn_id: [u8; 12],
+
     /// Remote ufrag this allocation wants to communicate with (from ICE)
     /// Set when we see a STUN Binding Request with USERNAME attribute
     pub paired_ufrag: RwLock<Option<String>>,
@@ -102,7 +107,12 @@ pub struct PeerInfo {
 
 impl Allocation {
     /// Create a new allocation
-    pub fn new(client_addr: SocketAddr, username: String, lifetime_secs: u32) -> Self {
+    pub fn new(
+        client_addr: SocketAddr,
+        username: String,
+        lifetime_secs: u32,
+        allocate_txn_id: [u8; 12],
+    ) -> Self {
         let now_ms = coarse_now_ms();
         let expires_ms = now_ms + (lifetime_secs as u64 * 1000);
         Self {
@@ -121,6 +131,7 @@ impl Allocation {
             last_successful_relay_ms: AtomicU64::new(0),
             has_relay_attempt: std::sync::atomic::AtomicBool::new(false),
             username,
+            allocate_txn_id,
             paired_ufrag: RwLock::new(None),
             ice_ufrag: RwLock::new(None),
             ice_remote_ufrag: RwLock::new(None),
@@ -192,10 +203,25 @@ impl Allocation {
         self.permissions.read().len()
     }
 
-    /// Bind a channel to a peer address
+    /// Bind a channel to a peer address.
+    ///
+    /// Keeps `channels` and `channels_reverse` consistent: if the channel was
+    /// previously bound to another peer, or the peer to another channel, the
+    /// stale entries are removed. Otherwise traffic from the old peer would
+    /// still be framed with a channel number the client now associates with
+    /// the new peer. (The handler rejects such conflicting binds with 400 per
+    /// RFC 5766 §11.2; this is defense-in-depth.)
     pub fn bind_channel(&self, channel: u16, peer_addr: SocketAddr) {
-        self.channels.insert(channel, peer_addr);
-        self.channels_reverse.insert(peer_addr, channel);
+        if let Some(old_peer) = self.channels.insert(channel, peer_addr) {
+            if old_peer != peer_addr {
+                self.channels_reverse.remove(&old_peer);
+            }
+        }
+        if let Some(old_channel) = self.channels_reverse.insert(peer_addr, channel) {
+            if old_channel != channel {
+                self.channels.remove(&old_channel);
+            }
+        }
     }
 
     /// Number of channels currently bound.
@@ -371,6 +397,7 @@ impl AllocationTable {
         client_addr: SocketAddr,
         username: String,
         lifetime_secs: u32,
+        allocate_txn_id: [u8; 12],
     ) -> (AllocationId, bool) {
         use dashmap::mapref::entry::Entry;
 
@@ -384,7 +411,7 @@ impl AllocationTable {
         // never hold guards on both at once. Insert into the primary map first
         // (guard released immediately), then claim the by_client slot. If we
         // lose the race for the slot, roll back our primary insert.
-        let alloc = Allocation::new(client_addr, username, lifetime_secs);
+        let alloc = Allocation::new(client_addr, username, lifetime_secs, allocate_txn_id);
         let id = alloc.id;
         let ufrag = alloc.local_ufrag.clone();
         self.allocations.insert(id, alloc);
@@ -419,7 +446,7 @@ impl AllocationTable {
         username: String,
         lifetime_secs: u32,
     ) -> AllocationId {
-        let (id, _created) = self.create_or_get(client_addr, username, lifetime_secs);
+        let (id, _created) = self.create_or_get(client_addr, username, lifetime_secs, [0u8; 12]);
         id
     }
 
@@ -1031,7 +1058,7 @@ mod tests {
                     // Tiny port space so both maps collide on shards constantly.
                     let port = 30000 + ((t as u64 * 131 + n) % 64) as u16;
                     let client: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-                    let (id, _) = table.create_or_get(client, "u".to_string(), 600);
+                    let (id, _) = table.create_or_get(client, "u".to_string(), 600, [0u8; 12]);
                     if let Some(a) = table.get_by_client(client) {
                         assert_eq!(a.client_addr, client);
                     }
@@ -1076,6 +1103,36 @@ mod tests {
                  allocations (see AllocationTable lock-order doc)"
             ),
         }
+    }
+
+    #[test]
+    fn bind_channel_removes_stale_reverse_and_forward_entries() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+        let a: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:5000".parse().unwrap();
+        let alloc = table.get(id).unwrap();
+
+        // Rebind the channel to another peer: the old peer must no longer map
+        // to the channel.
+        alloc.bind_channel(0x4000, a);
+        alloc.bind_channel(0x4000, b);
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(b));
+        assert_eq!(alloc.channel_for_peer(a), None);
+        assert_eq!(alloc.channel_for_peer(b), Some(0x4000));
+        assert_eq!(alloc.channels_count(), 1);
+
+        // Rebind the peer to another channel: the old channel must be freed.
+        alloc.bind_channel(0x4001, b);
+        assert_eq!(alloc.peer_for_channel(0x4000), None);
+        assert_eq!(alloc.peer_for_channel(0x4001), Some(b));
+        assert_eq!(alloc.channel_for_peer(b), Some(0x4001));
+        assert_eq!(alloc.channels_count(), 1);
+
+        // Refreshing an identical binding is a no-op.
+        alloc.bind_channel(0x4001, b);
+        assert_eq!(alloc.channels_count(), 1);
     }
 
     #[test]
