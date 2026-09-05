@@ -475,7 +475,8 @@ impl TurnHandler {
                     "Allocate from {} with a new transaction id over an existing allocation - 437",
                     src_addr
                 );
-                let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::AllocationMismatch, key);
                 socket.send_to(&response, src_addr).await?;
             }
             return Ok(());
@@ -488,7 +489,8 @@ impl TurnHandler {
             }
             Some(other) => {
                 warn!("Unsupported transport protocol {} from {}", other, src_addr);
-                let response = self.build_error_response(msg, TurnErrorCode::UnsupportedTransport);
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::UnsupportedTransport, key);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
@@ -507,7 +509,7 @@ impl TurnHandler {
                 RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
                 RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
             };
-            let response = self.build_error_response(msg, error_code);
+            let response = self.build_signed_error_response(msg, error_code, key);
             socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
@@ -700,8 +702,11 @@ impl TurnHandler {
                     (alloc.id, key)
                 }
                 None => {
-                    let response =
-                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
+                    let response = self.build_signed_error_response(
+                        msg,
+                        TurnErrorCode::AllocationMismatch,
+                        key.as_ref(),
+                    );
                     socket.send_to(&response, src_addr).await?;
                     return Ok(());
                 }
@@ -722,7 +727,11 @@ impl TurnHandler {
                 "CreatePermission cap exceeded for {} (alloc {}, max {})",
                 src_addr, alloc_id, self.config.max_permissions_per_alloc
             );
-            let response = self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
+            let response = self.build_signed_error_response(
+                msg,
+                TurnErrorCode::InsufficientCapacity,
+                key.as_ref(),
+            );
             socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
@@ -803,6 +812,78 @@ impl TurnHandler {
             }
         };
 
+        /// Outcome of the bind check, decided under one short-lived guard.
+        enum Bind {
+            /// Admissible. `needs_bind` is false for a refresh of the same pair.
+            Ok {
+                needs_bind: bool,
+            },
+            /// Channel bound to another peer, or peer bound to another channel.
+            Conflict,
+            CapExceeded(usize),
+            Gone,
+        }
+
+        // Decide the outcome before mutating anything. RFC 5766 §11.2 requires an
+        // error response to leave the allocation untouched; installing the implied
+        // permission up front let a client fill its permission table with IPs
+        // through ChannelBinds the server goes on to reject.
+        let outcome = match self.allocations.get(alloc_id) {
+            Some(alloc) => {
+                let bound_peer = alloc.peer_for_channel(channel);
+                let bound_channel = alloc.channel_for_peer(peer_addr);
+                match (bound_peer, bound_channel) {
+                    // RFC 5766 §11.2: a channel may not be rebound to a different
+                    // peer, nor a peer to a different channel, while bound.
+                    (Some(p), _) if p != peer_addr => Bind::Conflict,
+                    (_, Some(c)) if c != channel => Bind::Conflict,
+                    // Identical binding: refresh, consumes no new slot.
+                    (Some(_), Some(_)) => Bind::Ok { needs_bind: false },
+                    _ if alloc.channels_count() >= self.config.max_channels_per_alloc => {
+                        Bind::CapExceeded(alloc.channels_count())
+                    }
+                    _ => Bind::Ok { needs_bind: true },
+                }
+            }
+            None => Bind::Gone,
+        };
+
+        let needs_bind = match outcome {
+            Bind::Ok { needs_bind } => needs_bind,
+            Bind::Conflict => {
+                warn!(
+                    "ChannelBind conflict from {}: channel 0x{:04x} / peer {} already bound elsewhere",
+                    src_addr, channel, peer_addr
+                );
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::BadRequest, key.as_ref());
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+            Bind::CapExceeded(count) => {
+                warn!(
+                    "ChannelBind cap exceeded for {}: {} >= {}",
+                    src_addr, count, self.config.max_channels_per_alloc
+                );
+                let response = self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::InsufficientCapacity,
+                    key.as_ref(),
+                );
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+            Bind::Gone => {
+                let response = self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::AllocationMismatch,
+                    key.as_ref(),
+                );
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
         // ChannelBind also installs (or refreshes) a permission for the peer IP
         // (RFC 5766 §11.2). Go through the capped path so ChannelBind cannot be
         // used to bypass the per-allocation permission cap.
@@ -820,70 +901,26 @@ impl TurnHandler {
                 )
             };
             warn!("ChannelBind from {} rejected: {}", src_addr, what);
-            let response = self.build_error_response(msg, code);
+            let response = self.build_signed_error_response(msg, code, key.as_ref());
             socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
 
-        /// Outcome of the bind attempt, decided under one short-lived guard.
-        enum Bind {
-            Bound,
-            /// Channel bound to another peer, or peer bound to another channel.
-            Conflict,
-            CapExceeded(usize),
-            Gone,
-        }
-
-        let outcome = match self.allocations.get(alloc_id) {
+        // Commit the binding. The permission is in place, so a client that gets
+        // a success response can use the channel immediately.
+        match self.allocations.get(alloc_id) {
             Some(alloc) => {
-                let bound_peer = alloc.peer_for_channel(channel);
-                let bound_channel = alloc.channel_for_peer(peer_addr);
-                match (bound_peer, bound_channel) {
-                    // RFC 5766 §11.2: a channel may not be rebound to a different
-                    // peer, nor a peer to a different channel, while bound.
-                    (Some(p), _) if p != peer_addr => Bind::Conflict,
-                    (_, Some(c)) if c != channel => Bind::Conflict,
-                    // Identical binding: refresh, consumes no new slot.
-                    (Some(_), Some(_)) => {
-                        alloc.touch_received();
-                        Bind::Bound
-                    }
-                    _ => {
-                        if alloc.channels_count() >= self.config.max_channels_per_alloc {
-                            Bind::CapExceeded(alloc.channels_count())
-                        } else {
-                            alloc.bind_channel(channel, peer_addr);
-                            alloc.touch_received();
-                            Bind::Bound
-                        }
-                    }
+                if needs_bind {
+                    alloc.bind_channel(channel, peer_addr);
                 }
+                alloc.touch_received();
             }
-            None => Bind::Gone,
-        };
-
-        match outcome {
-            Bind::Bound => {}
-            Bind::Conflict => {
-                warn!(
-                    "ChannelBind conflict from {}: channel 0x{:04x} / peer {} already bound elsewhere",
-                    src_addr, channel, peer_addr
+            None => {
+                let response = self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::AllocationMismatch,
+                    key.as_ref(),
                 );
-                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-            Bind::CapExceeded(count) => {
-                warn!(
-                    "ChannelBind cap exceeded for {}: {} >= {}",
-                    src_addr, count, self.config.max_channels_per_alloc
-                );
-                let response = self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-            Bind::Gone => {
-                let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
@@ -1080,16 +1117,18 @@ impl TurnHandler {
                 }
             }
 
-            // Touch sender's allocation - they're actively sending data - and
-            // feed the orphan-sender timer exactly like the ChannelData and raw
-            // media paths do, so a Send-indication-only client that never finds
-            // a recipient is reaped by cleanup_orphaned_senders as well.
+            // Touch sender's allocation - they're actively sending data. A
+            // successful internal route also feeds the orphan-sender timer, but a
+            // failed one deliberately does not: this path runs during ICE, before
+            // a peer exists, so arming the timer here would have
+            // cleanup_orphaned_senders reap the allocation of whoever joins first
+            // (ringing, waiting room, slow signalling) 45s later, while it is
+            // actively sending and refreshing. The ChannelData and raw media paths
+            // only run once media flows, so they can arm it on a failed attempt.
             if let Some(a) = self.allocations.get_by_client(src_addr) {
                 a.touch_received();
                 if sent {
                     a.touch_relay_success();
-                } else {
-                    a.touch_relay_attempt();
                 }
             }
             return Ok(());
@@ -1284,8 +1323,28 @@ impl TurnHandler {
         response
     }
 
-    /// Build an error response
+    /// Build an error response without MESSAGE-INTEGRITY.
+    ///
+    /// Only for errors raised before the credentials were verified, where no
+    /// key is available. Anything answered after authentication goes through
+    /// [`Self::build_signed_error_response`].
     fn build_error_response(&self, request: &StunInfo, error: TurnErrorCode) -> Vec<u8> {
+        self.build_signed_error_response(request, error, None)
+    }
+
+    /// Build an error response, signed when the request was authenticated.
+    ///
+    /// RFC 5389 Section 10.2.3: a client using long-term credentials discards an
+    /// error response that carries no MESSAGE-INTEGRITY, except for 400, 401 and
+    /// 438. An unsigned 437 or 508 is therefore invisible to the client - it keeps
+    /// retransmitting until its RTO schedule runs out (~39.5s) and then reports a
+    /// plain timeout instead of the error we sent.
+    fn build_signed_error_response(
+        &self,
+        request: &StunInfo,
+        error: TurnErrorCode,
+        key: Option<&[u8; 16]>,
+    ) -> Vec<u8> {
         let mut response = Vec::with_capacity(48);
 
         // Error response: set bits 4 and 8 of method
@@ -1314,8 +1373,14 @@ impl TurnHandler {
             response.push(0);
         }
 
-        let attr_len = (response.len() - 20) as u16;
-        response[2..4].copy_from_slice(&attr_len.to_be_bytes());
+        // MESSAGE-INTEGRITY (if authenticated)
+        if let Some(key) = key {
+            self.append_message_integrity(&mut response, key);
+        } else {
+            // Update length (no MESSAGE-INTEGRITY)
+            let attr_len = (response.len() - 20) as u16;
+            response[2..4].copy_from_slice(&attr_len.to_be_bytes());
+        }
 
         response
     }
@@ -1732,6 +1797,200 @@ mod tests {
         assert!(!is_forbidden_peer_ip(ip("8.8.8.8")));
         assert!(!is_forbidden_peer_ip(ip("203.0.113.5"))); // TEST-NET-3
         assert!(!is_forbidden_peer_ip(ip("2001:db8::1")));
+    }
+
+    // ---- helpers for the handler-level tests below -------------------------
+
+    use super::{
+        AllocationTable, Config, RateLimiter, StunClass, StunInfo, StunMethod, TurnAuth,
+        TurnErrorCode, TurnHandler,
+    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    const RELAY_IP: &str = "203.0.113.10";
+    const RELAY_PORT: u16 = 3478;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Handler over an anonymous (no credentials) config, so the tests exercise
+    /// the request logic rather than the authentication path.
+    fn handler() -> (TurnHandler, Arc<AllocationTable>) {
+        let config = Arc::new(Config::new(ip(RELAY_IP)).with_port(RELAY_PORT));
+        let allocations = Arc::new(AllocationTable::new());
+        let rate_limiter = Arc::new(RateLimiter::new(120, 100));
+        (
+            TurnHandler::new(config, Arc::clone(&allocations), rate_limiter),
+            allocations,
+        )
+    }
+
+    /// Minimal parsed request. Attributes are set by the caller; only `raw`'s
+    /// message type and transaction id matter for building a response.
+    fn request(method: StunMethod, msg_type: u16) -> StunInfo {
+        let transaction_id = [7u8; 12];
+        let mut raw = Vec::with_capacity(20);
+        raw.extend_from_slice(&msg_type.to_be_bytes());
+        raw.extend_from_slice(&[0x00, 0x00]);
+        raw.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        raw.extend_from_slice(&transaction_id);
+        StunInfo {
+            class: StunClass::Request,
+            method,
+            transaction_id,
+            username: None,
+            xor_peer_addresses: Vec::new(),
+            channel_number: None,
+            lifetime: None,
+            data: None,
+            realm: None,
+            nonce: None,
+            message_integrity: None,
+            message_integrity_offset: None,
+            requested_transport: None,
+            raw,
+        }
+    }
+
+    // ---- error responses ----------------------------------------------------
+
+    #[test]
+    fn signed_error_response_carries_verifiable_message_integrity() {
+        // RFC 5389 §10.2.3: a client that authenticated discards an error
+        // response without MESSAGE-INTEGRITY (except 400/401/438), so a 437 has
+        // to be signed or the client just retransmits until it times out.
+        let (h, _) = handler();
+        let msg = request(StunMethod::Allocate, 0x0003);
+        let key = TurnAuth::compute_key("user", "uturn", "pass");
+
+        let resp =
+            h.build_signed_error_response(&msg, TurnErrorCode::AllocationMismatch, Some(&key));
+
+        // Header length covers everything after the 20-byte header.
+        let declared = u16::from_be_bytes([resp[2], resp[3]]) as usize;
+        assert_eq!(declared, resp.len() - 20);
+
+        // MESSAGE-INTEGRITY is the trailing 24-byte attribute (4 + 20).
+        let mi_start = resp.len() - 24;
+        assert_eq!(&resp[mi_start..mi_start + 2], &[0x00, 0x08]);
+        assert_eq!(&resp[mi_start + 2..mi_start + 4], &[0x00, 0x14]);
+        assert!(TurnAuth::verify_message_integrity(
+            &resp[..mi_start],
+            &resp[mi_start + 4..],
+            &key
+        ));
+
+        // ERROR-CODE still says 437.
+        assert_eq!(&resp[20..22], &[0x00, 0x09]);
+        assert_eq!(resp[24 + 2], 4);
+        assert_eq!(resp[24 + 3], 37);
+    }
+
+    #[test]
+    fn unsigned_error_response_has_no_message_integrity() {
+        let (h, _) = handler();
+        let msg = request(StunMethod::Allocate, 0x0003);
+        let resp = h.build_error_response(&msg, TurnErrorCode::AllocationMismatch);
+        let declared = u16::from_be_bytes([resp[2], resp[3]]) as usize;
+        assert_eq!(declared, resp.len() - 20);
+
+        // Same message, 24 bytes shorter than the signed one, and its trailing
+        // attribute is the ERROR-CODE rather than a MESSAGE-INTEGRITY.
+        let key = TurnAuth::compute_key("user", "uturn", "pass");
+        let signed =
+            h.build_signed_error_response(&msg, TurnErrorCode::AllocationMismatch, Some(&key));
+        assert_eq!(signed.len(), resp.len() + 24);
+        assert_eq!(&resp[20..22], &[0x00, 0x09]);
+        let attr_len = u16::from_be_bytes([resp[22], resp[23]]) as usize;
+        assert_eq!(resp.len(), 20 + 4 + attr_len.div_ceil(4) * 4);
+    }
+
+    // ---- ChannelBind --------------------------------------------------------
+
+    #[tokio::test]
+    async fn channel_bind_conflict_installs_no_permission() {
+        // RFC 5766 §11.2: an error response must leave the allocation unchanged.
+        // The permission implied by ChannelBind used to be installed before the
+        // binding was validated, so a client could fill its permission table
+        // with IPs through requests the server went on to reject with 400.
+        let (h, table) = handler();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = sa("127.0.0.1:40001");
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peer_a = sa("203.0.113.20:5000");
+        let peer_b = sa("203.0.113.21:5000");
+
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![peer_a];
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer_a));
+        assert_eq!(alloc.permissions_count(), 1);
+        drop(alloc);
+
+        // Same channel, different peer -> 400, and no trace of peer_b.
+        bind.xor_peer_addresses = vec![peer_b];
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer_a));
+        assert_eq!(alloc.channel_for_peer(peer_b), None);
+        assert!(!alloc.is_permitted(peer_b.ip()));
+        assert_eq!(alloc.permissions_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_bind_refresh_of_same_pair_is_idempotent() {
+        let (h, table) = handler();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = sa("127.0.0.1:40002");
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peer = sa("203.0.113.20:5000");
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![peer];
+
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+        assert_eq!(alloc.permissions_count(), 1);
+    }
+
+    // ---- Send indication ----------------------------------------------------
+
+    #[tokio::test]
+    async fn send_indication_without_target_does_not_arm_orphan_timer() {
+        // Internal routing runs during ICE, before a peer exists. Arming the
+        // orphan-sender timer here would have cleanup_orphaned_senders reap the
+        // allocation of whoever joins the call first, 45s later, while it is
+        // still actively sending and refreshing.
+        let (h, table) = handler();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = sa("127.0.0.1:40003");
+        let id = table.create(client, "u".to_string(), 600);
+        table.add_permission(id, ip(RELAY_IP));
+
+        let mut send = request(StunMethod::Send, 0x0006);
+        send.class = StunClass::Indication;
+        send.xor_peer_addresses = vec![sa(&format!("{}:{}", RELAY_IP, RELAY_PORT))];
+        // Not a STUN message, so the ICE-ufrag routing branch is skipped and the
+        // broadcast fallback finds no unpaired target but the sender itself.
+        send.data = Some(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        h.handle_send(&send, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        // A zero timeout would report any armed timer as orphaned.
+        assert!(!alloc.is_orphaned_sender(0));
     }
 
     #[test]
