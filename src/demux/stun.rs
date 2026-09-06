@@ -246,6 +246,12 @@ impl StunInfo {
                         result.message_integrity = Some(value.to_vec());
                         // Offset from start of attributes section + 20 bytes header
                         result.message_integrity_offset = Some(20 + offset);
+                        // RFC 5389 §15.4: MESSAGE-INTEGRITY covers everything before
+                        // it; any attribute after it (other than FINGERPRINT, which
+                        // we do not use) MUST be ignored. Stop here so that nothing
+                        // outside the HMAC-protected region can influence auth,
+                        // permissions, channel bindings or lifetimes.
+                        break;
                     }
                 ATTR_REQUESTED_TRANSPORT
                     // REQUESTED-TRANSPORT is 4 bytes: protocol (1 byte) + RFFU (3 bytes)
@@ -365,6 +371,72 @@ mod tests {
         let info = StunInfo::parse(&data).unwrap();
         assert_eq!(info.method, StunMethod::Allocate);
         assert!(info.is_turn());
+    }
+
+    /// Build a minimal STUN message with the given attribute list.
+    fn build_stun(msg_type: u16, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (t, v) in attrs {
+            body.extend_from_slice(&t.to_be_bytes());
+            body.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            body.extend_from_slice(v);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&msg_type.to_be_bytes());
+        msg.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        msg.extend_from_slice(&[0u8; 12]);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    #[test]
+    fn attributes_after_message_integrity_are_ignored() {
+        // XOR-PEER-ADDRESS for 192.0.2.1:1234 (IPv4, XORed with magic cookie).
+        let peer_before: Vec<u8> = {
+            let mut v = vec![0x00, 0x01];
+            v.extend_from_slice(&(1234u16 ^ 0x2112).to_be_bytes());
+            for (b, m) in [192u8, 0, 2, 1].iter().zip([0x21u8, 0x12, 0xa4, 0x42]) {
+                v.push(b ^ m);
+            }
+            v
+        };
+        // A second XOR-PEER-ADDRESS (192.0.2.2), a LIFETIME and a USERNAME appended
+        // *after* MESSAGE-INTEGRITY, i.e. outside the HMAC-protected region.
+        let peer_after: Vec<u8> = {
+            let mut v = vec![0x00, 0x01];
+            v.extend_from_slice(&(4321u16 ^ 0x2112).to_be_bytes());
+            for (b, m) in [192u8, 0, 2, 2].iter().zip([0x21u8, 0x12, 0xa4, 0x42]) {
+                v.push(b ^ m);
+            }
+            v
+        };
+        let hmac = [0xAAu8; 20];
+        let msg = build_stun(
+            0x0008, // CreatePermission request
+            &[
+                (0x0006, b"alice"),
+                (0x0012, &peer_before),
+                (0x0008, &hmac),
+                (0x0012, &peer_after),
+                (0x000D, &0u32.to_be_bytes()),
+                (0x0006, b"mallory"),
+            ],
+        );
+
+        let info = StunInfo::parse(&msg).unwrap();
+        assert_eq!(info.message_integrity.as_deref(), Some(&hmac[..]));
+        // Only the attributes covered by MESSAGE-INTEGRITY are visible.
+        assert_eq!(info.username.as_deref(), Some("alice"));
+        assert_eq!(info.xor_peer_addresses.len(), 1);
+        assert_eq!(
+            info.xor_peer_addresses[0],
+            "192.0.2.1:1234".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(info.lifetime, None);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
 use crate::demux::{StunClass, StunInfo, StunMethod};
-use crate::lookup::{AllocationTable, RateLimitError, RateLimiter};
+use crate::lookup::{AllocationId, AllocationTable, RateLimitError, RateLimiter};
 
 use super::auth::TurnAuth;
 use super::message::TurnErrorCode;
@@ -19,16 +19,6 @@ pub struct TurnHandler {
     config: Arc<Config>,
     allocations: Arc<AllocationTable>,
     rate_limiter: Arc<RateLimiter>,
-}
-
-/// Result of authentication validation
-enum AuthResult {
-    /// Authentication successful, here's the key for response
-    Success([u8; 16]),
-    /// No authentication required (anonymous mode)
-    NotRequired,
-    /// Authentication failed, send this error response
-    Failed(Vec<u8>),
 }
 
 /// Peer addresses we refuse to relay to, regardless of permission.
@@ -46,8 +36,32 @@ pub(crate) fn is_forbidden_peer_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_link_local()
         }
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast() || v6.is_unspecified(),
+        IpAddr::V6(v6) => {
+            // An IPv4-mapped address (::ffff:a.b.c.d) reaches the IPv4 host on
+            // a dual-stack socket, so it must be judged by the IPv4 rules:
+            // ::ffff:127.0.0.1 is loopback even though Ipv6Addr::is_loopback
+            // says otherwise.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_peer_ip(IpAddr::V4(v4));
+            }
+            // fe80::/10 unicast link-local (no stable std predicate yet).
+            let unicast_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            v6.is_loopback() || v6.is_multicast() || v6.is_unspecified() || unicast_link_local
+        }
     }
+}
+
+/// Peer *transport addresses* we refuse to relay to.
+///
+/// Extends [`is_forbidden_peer_ip`] with the relay host's own external IP on
+/// any port other than the relay port: `external_ip:relay_port` is the
+/// legitimate single-port internal-routing target, everything else on that IP
+/// would let a client reach other UDP services on the relay host. Applied to
+/// Send indications, ChannelBind and the ChannelData egress alike so the two
+/// data paths cannot be played against each other.
+pub(crate) fn is_forbidden_peer_addr(config: &Config, addr: SocketAddr) -> bool {
+    is_forbidden_peer_ip(addr.ip())
+        || (addr.ip() == config.external_ip && addr.port() != config.port)
 }
 
 impl TurnHandler {
@@ -64,75 +78,64 @@ impl TurnHandler {
         }
     }
 
-    /// Validate authentication for requests that require it (Refresh, CreatePermission, ChannelBind)
+    /// Verify RFC 5389 long-term credentials on a request.
     ///
-    /// Per RFC 5766 Section 10.1: All requests after the initial Allocate must be
-    /// authenticated using the same credentials as the Allocate request.
-    fn validate_request_auth(&self, msg: &StunInfo, expected_username: &str) -> AuthResult {
-        // If no credentials configured, authentication is not required
-        if self.config.credentials.is_empty() {
-            return AuthResult::NotRequired;
-        }
-
-        // Check MESSAGE-INTEGRITY is present
+    /// Returns the authenticated username and its key on success, or the error
+    /// response to send (401 with fresh REALM/NONCE, 438 Stale Nonce, or 400).
+    /// Callers must have checked that credentials are configured at all.
+    fn verify_long_term_credentials(&self, msg: &StunInfo) -> Result<(String, [u8; 16]), Vec<u8>> {
+        // MESSAGE-INTEGRITY must be present: first contact gets a 401 challenge.
         if msg.message_integrity.is_none() {
-            return AuthResult::Failed(self.build_unauthorized_response(msg));
+            debug!("Request missing MESSAGE-INTEGRITY, sending 401 challenge");
+            return Err(self.build_unauthorized_response(msg));
         }
 
-        // Check USERNAME matches the allocation's username
         let username = match &msg.username {
             Some(u) => u,
             None => {
-                return AuthResult::Failed(
-                    self.build_error_response(msg, TurnErrorCode::BadRequest),
-                );
+                warn!("Request has MESSAGE-INTEGRITY but no USERNAME");
+                return Err(self.build_error_response(msg, TurnErrorCode::BadRequest));
             }
         };
 
-        if username != expected_username {
-            warn!(
-                "Username mismatch: expected '{}', got '{}'",
-                expected_username, username
-            );
-            return AuthResult::Failed(self.build_unauthorized_response(msg));
-        }
-
-        // Get password for this user
         let password = match self.config.get_password(username) {
             Some(p) => p,
             None => {
-                return AuthResult::Failed(self.build_unauthorized_response(msg));
+                warn!("Unknown username in authenticated request: {}", username);
+                return Err(self.build_unauthorized_response(msg));
             }
         };
 
         // Validate nonce freshness
-        if let Some(ref nonce) = msg.nonce {
-            if !TurnAuth::validate_nonce(
-                nonce,
-                self.config.nonce_lifetime_secs,
-                &self.config.nonce_secret,
-            ) {
-                // 438 Stale Nonce must include REALM and fresh NONCE per RFC 5389
-                return AuthResult::Failed(self.build_stale_nonce_response(msg));
+        match &msg.nonce {
+            Some(nonce) => {
+                if !TurnAuth::validate_nonce(
+                    nonce,
+                    self.config.nonce_lifetime_secs,
+                    &self.config.nonce_secret,
+                ) {
+                    // 438 Stale Nonce must include REALM and fresh NONCE per RFC 5389
+                    return Err(self.build_stale_nonce_response(msg));
+                }
             }
-        } else {
-            return AuthResult::Failed(self.build_error_response(msg, TurnErrorCode::BadRequest));
+            None => {
+                warn!("Missing NONCE in authenticated request");
+                return Err(self.build_error_response(msg, TurnErrorCode::BadRequest));
+            }
         }
 
         // Validate REALM - required for long-term credentials per RFC 5389
-        let client_realm = msg.realm.as_deref();
-        match client_realm {
+        match msg.realm.as_deref() {
             Some(realm) if realm != self.config.realm => {
                 warn!(
                     "Realm mismatch: client sent '{}', expected '{}'",
                     realm, self.config.realm
                 );
-                return AuthResult::Failed(self.build_unauthorized_response(msg));
+                return Err(self.build_unauthorized_response(msg));
             }
             None => {
-                // REALM is required for long-term credentials per RFC 5389
                 warn!("Missing REALM attribute in authenticated request");
-                return AuthResult::Failed(self.build_unauthorized_response(msg));
+                return Err(self.build_unauthorized_response(msg));
             }
             _ => {} // Realm matches
         }
@@ -140,21 +143,83 @@ impl TurnHandler {
         // Always use server's realm for key computation
         let key = TurnAuth::compute_key(username, &self.config.realm, password);
 
-        if let (Some(integrity), Some(offset)) =
-            (&msg.message_integrity, msg.message_integrity_offset)
-        {
-            // Build message up to MESSAGE-INTEGRITY for validation
-            let mut msg_for_hmac = msg.raw[..offset].to_vec();
-            let new_len = (offset - 20 + 24) as u16;
-            msg_for_hmac[2..4].copy_from_slice(&new_len.to_be_bytes());
-
-            if !TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, &key) {
-                return AuthResult::Failed(self.build_unauthorized_response(msg));
+        let (integrity, offset) = match (&msg.message_integrity, msg.message_integrity_offset) {
+            (Some(i), Some(o)) => (i, o),
+            _ => {
+                warn!("MESSAGE-INTEGRITY parsing error");
+                return Err(self.build_error_response(msg, TurnErrorCode::BadRequest));
             }
+        };
 
-            AuthResult::Success(key)
+        // Build message up to MESSAGE-INTEGRITY for validation. The header
+        // length must be adjusted to end right after the MESSAGE-INTEGRITY
+        // attribute: offset - 20 (header) + 24 (MESSAGE-INTEGRITY attr size).
+        let mut msg_for_hmac = msg.raw[..offset].to_vec();
+        let new_len = (offset - 20 + 24) as u16;
+        msg_for_hmac[2..4].copy_from_slice(&new_len.to_be_bytes());
+
+        if !TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, &key) {
+            warn!("Invalid MESSAGE-INTEGRITY for user {}", username);
+            return Err(self.build_unauthorized_response(msg));
+        }
+
+        debug!("MESSAGE-INTEGRITY validated for user {}", username);
+        Ok((username.clone(), key))
+    }
+
+    /// Authenticate a request that operates on an existing allocation
+    /// (Refresh, CreatePermission, ChannelBind) and resolve that allocation.
+    ///
+    /// RFC 5766 §10.1: every request after the initial Allocate carries the same
+    /// credentials as the Allocate did, so the username must match the one on
+    /// the allocation.
+    ///
+    /// Authentication deliberately runs *before* the allocation lookup. The
+    /// lookup's own failure is a 437, and RFC 5389 §10.2.3 has an authenticated
+    /// client discard an error response that carries no MESSAGE-INTEGRITY - so a
+    /// 437 built without a key is invisible: the client retransmits through its
+    /// whole RTO schedule (~39.5s) and reports a timeout instead of reallocating.
+    /// Allocations here live at most 60s, so a client that loses one Refresh hits
+    /// this on its next one.
+    ///
+    /// Returns the allocation id and the key every response on this request must
+    /// be signed with (`None` in anonymous mode), or the error response to send.
+    fn authenticate_for_allocation(
+        &self,
+        msg: &StunInfo,
+        src_addr: SocketAddr,
+    ) -> Result<(AllocationId, Option<[u8; 16]>), Vec<u8>> {
+        let auth = if self.config.credentials.is_empty() {
+            None
         } else {
-            AuthResult::Failed(self.build_error_response(msg, TurnErrorCode::BadRequest))
+            Some(self.verify_long_term_credentials(msg)?)
+        };
+        let key = auth.as_ref().map(|(_, k)| *k);
+
+        // Snapshot id + username, then drop the guard: the caller awaits a send
+        // on every path out of here and must not hold an allocation guard.
+        let found = self
+            .allocations
+            .get_by_client(src_addr)
+            .map(|a| (a.id, a.username.clone()));
+
+        match (found, &auth) {
+            (None, _) => {
+                debug!("Request from {} has no allocation - 437", src_addr);
+                Err(self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::AllocationMismatch,
+                    key.as_ref(),
+                ))
+            }
+            (Some((_, allocated_to)), Some((username, _))) if allocated_to != *username => {
+                warn!(
+                    "Username mismatch: allocation for {} belongs to '{}', request says '{}'",
+                    src_addr, allocated_to, username
+                );
+                Err(self.build_unauthorized_response(msg))
+            }
+            (Some((id, _)), _) => Ok((id, key)),
         }
     }
 
@@ -379,6 +444,10 @@ impl TurnHandler {
     }
 
     /// Handle TURN Allocate Request
+    ///
+    /// Order follows RFC 5766 §6.2: authenticate first, then check the 5-tuple
+    /// for an existing allocation, then validate the request, then admission
+    /// control, then create.
     async fn handle_allocate(
         &self,
         msg: &StunInfo,
@@ -387,38 +456,84 @@ impl TurnHandler {
     ) -> Result<()> {
         info!("Allocate request from {}", src_addr);
 
-        // 1. Check if already allocated - treat as retransmission and return success
-        if let Some(alloc) = self.allocations.get_by_client(src_addr) {
-            debug!(
-                "Allocation already exists for {} - returning success for retransmission",
-                src_addr
-            );
-            let lifetime = alloc.remaining_lifetime();
-            let username = alloc.username.clone();
-            drop(alloc);
+        // 1. Authenticate. Nothing below - including the retransmission shortcut -
+        //    may act on a request whose MESSAGE-INTEGRITY has not been verified.
+        let auth: Option<(String, [u8; 16])> = if self.config.credentials.is_empty() {
+            None
+        } else {
+            match self.verify_long_term_credentials(msg) {
+                Ok(v) => Some(v),
+                Err(response) => {
+                    debug!("Allocate auth failed from {}", src_addr);
+                    socket.send_to(&response, src_addr).await?;
+                    return Ok(());
+                }
+            }
+        };
+        let key = auth.as_ref().map(|(_, k)| k);
+        let username: String = match &auth {
+            Some((u, _)) => u.clone(),
+            // Anonymous mode: the (unauthenticated) USERNAME is informational only.
+            None => msg.username.as_deref().unwrap_or("anonymous").to_string(),
+        };
 
-            // For retransmission, we need to include MESSAGE-INTEGRITY if auth is enabled
-            let key = if !self.config.credentials.is_empty() {
-                self.config
-                    .get_password(&username)
-                    .map(|password| TurnAuth::compute_key(&username, &self.config.realm, password))
+        // 2. Existing *live* allocation on this 5-tuple. A retransmission carries
+        //    the same transaction id and gets the success response again; a *new*
+        //    Allocate over a live allocation is a 437 Allocation Mismatch.
+        //
+        //    An allocation whose lifetime has run out but which cleanup_expired
+        //    (2s interval) has not reaped yet is not live.
+        let existing = self.allocations.get_by_client(src_addr).map(|a| {
+            (
+                a.id,
+                a.is_expired(),
+                a.allocate_txn_id == msg.transaction_id,
+                a.remaining_lifetime(),
+            )
+        });
+
+        // Reap a lapsed allocation rather than answer it: 437 would leave a
+        // client that lets its allocation expire and reconnects unable to
+        // allocate until the reaper catches up, and the success-with-lifetime-0
+        // it used to get is just as dead. Releasing the quota slot here mirrors
+        // what cleanup_expired would have done.
+        if let Some((id, true, _, _)) = existing {
+            if self.allocations.remove(id) {
+                self.rate_limiter.record_deallocation(src_addr.ip());
+                debug!(
+                    "Reaped expired allocation {} for {} before re-Allocate",
+                    id, src_addr
+                );
+            }
+        } else if let Some((_, false, is_retransmission, lifetime)) = existing {
+            if is_retransmission {
+                debug!(
+                    "Allocate retransmission from {} - resending success",
+                    src_addr
+                );
+                let response = self.build_allocate_response(msg, src_addr, lifetime, key);
+                socket.send_to(&response, src_addr).await?;
             } else {
-                None
-            };
-            let response = self.build_allocate_response(msg, src_addr, lifetime, key.as_ref());
-            socket.send_to(&response, src_addr).await?;
+                warn!(
+                    "Allocate from {} with a new transaction id over an existing allocation - 437",
+                    src_addr
+                );
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::AllocationMismatch, key);
+                socket.send_to(&response, src_addr).await?;
+            }
             return Ok(());
         }
 
-        // 2. Validate REQUESTED-TRANSPORT (RFC 5766 requires UDP = 17)
-        // This is checked before auth/rate-limit as it's a protocol error
+        // 3. Validate REQUESTED-TRANSPORT (RFC 5766 requires UDP = 17)
         match msg.requested_transport {
             Some(17) => {
                 // UDP is supported
             }
             Some(other) => {
                 warn!("Unsupported transport protocol {} from {}", other, src_addr);
-                let response = self.build_error_response(msg, TurnErrorCode::UnsupportedTransport);
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::UnsupportedTransport, key);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
@@ -429,213 +544,59 @@ impl TurnHandler {
             }
         }
 
-        // 3. Authentication check BEFORE rate limiting
-        // Auth failures should return 401, not 508 (rate limit errors)
-        // Only valid auth attempts should count against rate limits
-        if !self.config.credentials.is_empty() {
-            // Check if MESSAGE-INTEGRITY is present
-            if msg.message_integrity.is_none() {
-                // First request without credentials - send 401 with REALM and NONCE
-                debug!("Allocate request missing MESSAGE-INTEGRITY, sending 401");
-                let response = self.build_unauthorized_response(msg);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-
-            // Validate credentials
-            let username = match &msg.username {
-                Some(u) => u,
-                None => {
-                    warn!("Allocate request has MESSAGE-INTEGRITY but no USERNAME");
-                    let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
+        // 4. Admission control. Runs after auth so that auth failures return 401,
+        //    not 508/486, and only valid attempts count against the limits.
+        if let Err(e) = self.rate_limiter.check_allocation_request(src_addr.ip()) {
+            warn!("Allocate request rejected for {}: {}", src_addr, e);
+            let error_code = match e {
+                RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
+                RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
             };
-
-            let password = match self.config.get_password(username) {
-                Some(p) => p,
-                None => {
-                    warn!("Unknown username in Allocate request: {}", username);
-                    let response = self.build_unauthorized_response(msg);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
-
-            // Validate nonce freshness
-            if let Some(ref nonce) = msg.nonce {
-                if !TurnAuth::validate_nonce(
-                    nonce,
-                    self.config.nonce_lifetime_secs,
-                    &self.config.nonce_secret,
-                ) {
-                    warn!("Stale nonce from {}", src_addr);
-                    // 438 Stale Nonce must include REALM and fresh NONCE per RFC 5389
-                    let response = self.build_stale_nonce_response(msg);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            } else {
-                warn!("Missing nonce from {}", src_addr);
-                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-
-            // Validate REALM - required for long-term credentials per RFC 5389
-            let client_realm = msg.realm.as_deref();
-            match client_realm {
-                Some(realm) if realm != self.config.realm => {
-                    warn!(
-                        "Realm mismatch from {}: client sent '{}', expected '{}'",
-                        src_addr, realm, self.config.realm
-                    );
-                    let response = self.build_unauthorized_response(msg);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-                None => {
-                    // REALM is required for long-term credentials per RFC 5389
-                    warn!(
-                        "Missing REALM attribute in Allocate request from {}",
-                        src_addr
-                    );
-                    let response = self.build_unauthorized_response(msg);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-                _ => {} // Realm matches
-            }
-
-            // Always use server's realm for key computation
-            let key = TurnAuth::compute_key(username, &self.config.realm, password);
-
-            if let (Some(integrity), Some(offset)) =
-                (&msg.message_integrity, msg.message_integrity_offset)
-            {
-                // Build message up to MESSAGE-INTEGRITY for validation
-                // Need to adjust the length in header to end at MESSAGE-INTEGRITY
-                let mut msg_for_hmac = msg.raw[..offset].to_vec();
-                // Adjust length: offset - 20 (header) + 24 (MESSAGE-INTEGRITY attr size)
-                let new_len = (offset - 20 + 24) as u16;
-                msg_for_hmac[2..4].copy_from_slice(&new_len.to_be_bytes());
-
-                if !TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, &key) {
-                    warn!("Invalid MESSAGE-INTEGRITY from {}", src_addr);
-                    let response = self.build_unauthorized_response(msg);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-
-                debug!("MESSAGE-INTEGRITY validated for user {}", username);
-            } else {
-                warn!("MESSAGE-INTEGRITY parsing error");
-                let response = self.build_error_response(msg, TurnErrorCode::BadRequest);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-
-            // 4. Authentication passed - NOW check rate limits
-            if let Err(e) = self.rate_limiter.check_allocation_request(src_addr.ip()) {
-                warn!("Allocate request rejected for {}: {}", src_addr, e);
-                let error_code = match e {
-                    RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
-                    RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
-                };
-                let response = self.build_error_response(msg, error_code);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-
-            // 5. Valid credentials and rate limit passed - create allocation atomically
-            let lifetime = 60;
-            let (alloc_id, created) =
-                self.allocations
-                    .create_or_get(src_addr, username.to_string(), lifetime);
-
-            if !created {
-                // Concurrent request won the race - treat as retransmission
-                // Cancel rate limiter reservation since we didn't create a new allocation
-                debug!(
-                    "Concurrent allocation created for {} - treating as retransmission",
-                    src_addr
-                );
-                self.rate_limiter.cancel_reservation(src_addr.ip());
-            } else {
-                info!(
-                    "Created allocation {} for {} (user: {})",
-                    alloc_id, src_addr, username
-                );
-            }
-
-            // Get actual lifetime from allocation (may be different if existing)
-            let actual_lifetime = self
-                .allocations
-                .get(alloc_id)
-                .map(|a| a.remaining_lifetime())
-                .unwrap_or(lifetime);
-
-            let response = self.build_allocate_response(msg, src_addr, actual_lifetime, Some(&key));
-            debug!(
-                "Sending Allocate response ({} bytes) to {}: {:02x?}",
-                response.len(),
-                src_addr,
-                &response[..std::cmp::min(response.len(), 64)]
-            );
+            let response = self.build_signed_error_response(msg, error_code, key);
             socket.send_to(&response, src_addr).await?;
-        } else {
-            // No authentication configured - anonymous access
-            // Check rate limits for anonymous requests
-            if let Err(e) = self.rate_limiter.check_allocation_request(src_addr.ip()) {
-                warn!("Allocate request rejected for {}: {}", src_addr, e);
-                let error_code = match e {
-                    RateLimitError::TooManyRequests => TurnErrorCode::InsufficientCapacity,
-                    RateLimitError::QuotaExceeded => TurnErrorCode::AllocationQuotaReached,
-                };
-                let response = self.build_error_response(msg, error_code);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-
-            let username = msg.username.as_deref().unwrap_or("anonymous");
-
-            // Create allocation atomically
-            let lifetime = 60;
-            let (alloc_id, created) =
-                self.allocations
-                    .create_or_get(src_addr, username.to_string(), lifetime);
-
-            if !created {
-                // Concurrent request won the race - treat as retransmission
-                debug!(
-                    "Concurrent allocation created for {} - treating as retransmission",
-                    src_addr
-                );
-                self.rate_limiter.cancel_reservation(src_addr.ip());
-            } else {
-                info!(
-                    "Created allocation {} for {} (user: {})",
-                    alloc_id, src_addr, username
-                );
-            }
-
-            // Get actual lifetime from allocation (may be different if existing)
-            let actual_lifetime = self
-                .allocations
-                .get(alloc_id)
-                .map(|a| a.remaining_lifetime())
-                .unwrap_or(lifetime);
-
-            let response = self.build_allocate_response(msg, src_addr, actual_lifetime, None);
-            debug!(
-                "Sending Allocate response ({} bytes) to {}: {:02x?}",
-                response.len(),
-                src_addr,
-                &response[..std::cmp::min(response.len(), 64)]
-            );
-            socket.send_to(&response, src_addr).await?;
+            return Ok(());
         }
+
+        // 5. Create the allocation atomically, remembering the transaction id so
+        //    retransmissions can be recognised in step 2.
+        let lifetime = 60;
+        let (alloc_id, created) = self.allocations.create_or_get(
+            src_addr,
+            username.clone(),
+            lifetime,
+            msg.transaction_id,
+        );
+
+        if !created {
+            // Concurrent request won the race - treat as retransmission and
+            // cancel our rate limiter reservation since nothing new was created.
+            debug!(
+                "Concurrent allocation created for {} - treating as retransmission",
+                src_addr
+            );
+            self.rate_limiter.cancel_reservation(src_addr.ip());
+        } else {
+            info!(
+                "Created allocation {} for {} (user: {})",
+                alloc_id, src_addr, username
+            );
+        }
+
+        // Get actual lifetime from allocation (may be different if existing)
+        let actual_lifetime = self
+            .allocations
+            .get(alloc_id)
+            .map(|a| a.remaining_lifetime())
+            .unwrap_or(lifetime);
+
+        let response = self.build_allocate_response(msg, src_addr, actual_lifetime, key);
+        debug!(
+            "Sending Allocate response ({} bytes) to {}: {:02x?}",
+            response.len(),
+            src_addr,
+            &response[..std::cmp::min(response.len(), 64)]
+        );
+        socket.send_to(&response, src_addr).await?;
 
         Ok(())
     }
@@ -649,23 +610,12 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("Refresh request from {}", src_addr);
 
-        // Snapshot id + username, then drop the guard so none of the awaits
-        // below run while an allocation lock is held.
-        let (alloc_id, username) = match self.allocations.get_by_client(src_addr) {
-            Some(a) => (a.id, a.username.clone()),
-            None => {
-                let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-        };
-
-        // Validate authentication (RFC 5766 Section 10.1)
-        let key = match self.validate_request_auth(msg, &username) {
-            AuthResult::Success(k) => Some(k),
-            AuthResult::NotRequired => None,
-            AuthResult::Failed(response) => {
-                warn!("Refresh auth failed from {}", src_addr);
+        // Authenticate, then resolve the allocation (RFC 5766 §10.1). No
+        // allocation guard is held across the awaits below.
+        let (alloc_id, key) = match self.authenticate_for_allocation(msg, src_addr) {
+            Ok(v) => v,
+            Err(response) => {
+                debug!("Refresh from {} rejected", src_addr);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
@@ -675,13 +625,22 @@ impl TurnHandler {
         let requested_lifetime = msg.lifetime.unwrap_or(60);
 
         if requested_lifetime == 0 {
-            // Client wants to delete the allocation
-            self.allocations.remove(alloc_id);
-            self.rate_limiter.record_deallocation(src_addr.ip());
-            info!(
-                "Deleted allocation {} for {} (lifetime=0)",
-                alloc_id, src_addr
-            );
+            // Client wants to delete the allocation. Only release the quota
+            // slot if *we* removed it: if cleanup reaped it concurrently, the
+            // cleanup task already released the slot and a second decrement
+            // would let this IP exceed its allocation quota.
+            if self.allocations.remove(alloc_id) {
+                self.rate_limiter.record_deallocation(src_addr.ip());
+                info!(
+                    "Deleted allocation {} for {} (lifetime=0)",
+                    alloc_id, src_addr
+                );
+            } else {
+                debug!(
+                    "Allocation {} for {} already removed before lifetime=0 refresh",
+                    alloc_id, src_addr
+                );
+            }
 
             let response = self.build_refresh_response(msg, 0, key.as_ref());
             socket.send_to(&response, src_addr).await?;
@@ -728,9 +687,21 @@ impl TurnHandler {
             return Ok(());
         }
 
-        // Reject forbidden peer IPs before doing anything else. RFC 5766 §9.2
-        // permits the server to reject any peer address it does not wish to
-        // relay to. Sending 403 covers loopback/multicast/etc.
+        // Authenticate, then resolve the allocation (RFC 5766 §10.1). No
+        // allocation guard is held across the awaits below.
+        let (alloc_id, key) = match self.authenticate_for_allocation(msg, src_addr) {
+            Ok(v) => v,
+            Err(response) => {
+                debug!("CreatePermission from {} rejected", src_addr);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
+        // Reject forbidden peer IPs. RFC 5766 §9.2 permits the server to reject
+        // any peer address it does not wish to relay to; 403 covers
+        // loopback/multicast/etc. Runs after authentication so the response can
+        // be signed - an unsigned 403 is discarded by an authenticated client.
         for peer_addr in &msg.xor_peer_addresses {
             if is_forbidden_peer_ip(peer_addr.ip()) {
                 warn!(
@@ -738,50 +709,16 @@ impl TurnHandler {
                     peer_addr.ip(),
                     src_addr
                 );
-                let response = self.build_error_response(msg, TurnErrorCode::Forbidden);
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::Forbidden, key.as_ref());
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
         }
 
-        let (alloc_id, key) = {
-            // Snapshot the username, then drop the guard so auth's await never
-            // runs while an allocation lock is held.
-            let username = match self.allocations.get_by_client(src_addr) {
-                Some(a) => a.username.clone(),
-                None => {
-                    let response =
-                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
-
-            // Validate authentication (RFC 5766 Section 10.1)
-            let key = match self.validate_request_auth(msg, &username) {
-                AuthResult::Success(k) => Some(k),
-                AuthResult::NotRequired => None,
-                AuthResult::Failed(response) => {
-                    warn!("CreatePermission auth failed from {}", src_addr);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
-
-            // Re-acquire briefly to update the activity timer and read the id.
-            match self.allocations.get_by_client(src_addr) {
-                Some(alloc) => {
-                    alloc.touch_received();
-                    (alloc.id, key)
-                }
-                None => {
-                    let response =
-                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            }
-        };
+        if let Some(alloc) = self.allocations.get(alloc_id) {
+            alloc.touch_received();
+        }
 
         // Atomically enforce the per-allocation permission cap and insert the
         // new peer IPs. Re-adds of existing permissions are always allowed
@@ -797,7 +734,11 @@ impl TurnHandler {
                 "CreatePermission cap exceeded for {} (alloc {}, max {})",
                 src_addr, alloc_id, self.config.max_permissions_per_alloc
             );
-            let response = self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
+            let response = self.build_signed_error_response(
+                msg,
+                TurnErrorCode::InsufficientCapacity,
+                key.as_ref(),
+            );
             socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
@@ -846,85 +787,143 @@ impl TurnHandler {
             }
         };
 
-        if is_forbidden_peer_ip(peer_addr.ip()) {
+        // Authenticate, then resolve the allocation (RFC 5766 §10.1). No
+        // allocation guard is held across the awaits below.
+        let (alloc_id, key) = match self.authenticate_for_allocation(msg, src_addr) {
+            Ok(v) => v,
+            Err(response) => {
+                debug!("ChannelBind from {} rejected", src_addr);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
+        // Runs after authentication so the 403 can be signed - an unsigned error
+        // response is discarded by an authenticated client (RFC 5389 §10.2.3).
+        if is_forbidden_peer_addr(&self.config, peer_addr) {
             warn!(
                 "ChannelBind with forbidden peer {} from {}",
-                peer_addr.ip(),
-                src_addr
+                peer_addr, src_addr
             );
-            let response = self.build_error_response(msg, TurnErrorCode::Forbidden);
+            let response =
+                self.build_signed_error_response(msg, TurnErrorCode::Forbidden, key.as_ref());
             socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
 
-        let (alloc_id, key) = {
-            // Snapshot the username, then drop the guard so auth's await never
-            // runs while an allocation lock is held.
-            let username = match self.allocations.get_by_client(src_addr) {
-                Some(a) => a.username.clone(),
-                None => {
-                    let response =
-                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
+        /// Outcome of the bind check, decided under one short-lived guard.
+        enum Bind {
+            /// Admissible. `needs_bind` is false for a refresh of the same pair.
+            Ok {
+                needs_bind: bool,
+            },
+            /// Channel bound to another peer, or peer bound to another channel.
+            Conflict,
+            CapExceeded(usize),
+            Gone,
+        }
 
-            // Validate authentication (RFC 5766 Section 10.1)
-            let key = match self.validate_request_auth(msg, &username) {
-                AuthResult::Success(k) => Some(k),
-                AuthResult::NotRequired => None,
-                AuthResult::Failed(response) => {
-                    warn!("ChannelBind auth failed from {}", src_addr);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
-
-            // Enforce the per-allocation channel cap and bind under a single
-            // short-lived guard with no await held. `Err(Some(n))` => cap exceeded
-            // (n = current channel count); `Err(None)` => allocation gone.
-            let bind_result = match self.allocations.get_by_client(src_addr) {
-                Some(alloc) => {
-                    // A rebind of an existing channel id or peer does not consume
-                    // a new slot.
-                    let is_rebind = alloc.peer_for_channel(channel).is_some()
-                        || alloc.channel_for_peer(peer_addr).is_some();
-                    if !is_rebind && alloc.channels_count() >= self.config.max_channels_per_alloc
-                    {
-                        Err(Some(alloc.channels_count()))
-                    } else {
-                        alloc.bind_channel(channel, peer_addr);
-                        alloc.touch_received();
-                        Ok(alloc.id)
+        // Decide the outcome before mutating anything. RFC 5766 §11.2 requires an
+        // error response to leave the allocation untouched; installing the implied
+        // permission up front let a client fill its permission table with IPs
+        // through ChannelBinds the server goes on to reject.
+        let outcome = match self.allocations.get(alloc_id) {
+            Some(alloc) => {
+                let bound_peer = alloc.peer_for_channel(channel);
+                let bound_channel = alloc.channel_for_peer(peer_addr);
+                match (bound_peer, bound_channel) {
+                    // RFC 5766 §11.2: a channel may not be rebound to a different
+                    // peer, nor a peer to a different channel, while bound.
+                    (Some(p), _) if p != peer_addr => Bind::Conflict,
+                    (_, Some(c)) if c != channel => Bind::Conflict,
+                    // Identical binding: refresh, consumes no new slot.
+                    (Some(_), Some(_)) => Bind::Ok { needs_bind: false },
+                    _ if alloc.channels_count() >= self.config.max_channels_per_alloc => {
+                        Bind::CapExceeded(alloc.channels_count())
                     }
+                    _ => Bind::Ok { needs_bind: true },
                 }
-                None => Err(None),
-            };
+            }
+            None => Bind::Gone,
+        };
 
-            match bind_result {
-                Ok(id) => (id, key),
-                Err(Some(count)) => {
-                    warn!(
-                        "ChannelBind cap exceeded for {}: {} >= {}",
-                        src_addr, count, self.config.max_channels_per_alloc
-                    );
-                    let response =
-                        self.build_error_response(msg, TurnErrorCode::InsufficientCapacity);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-                Err(None) => {
-                    let response =
-                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
+        let needs_bind = match outcome {
+            Bind::Ok { needs_bind } => needs_bind,
+            Bind::Conflict => {
+                warn!(
+                    "ChannelBind conflict from {}: channel 0x{:04x} / peer {} already bound elsewhere",
+                    src_addr, channel, peer_addr
+                );
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::BadRequest, key.as_ref());
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+            Bind::CapExceeded(count) => {
+                warn!(
+                    "ChannelBind cap exceeded for {}: {} >= {}",
+                    src_addr, count, self.config.max_channels_per_alloc
+                );
+                let response = self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::InsufficientCapacity,
+                    key.as_ref(),
+                );
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+            Bind::Gone => {
+                let response = self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::AllocationMismatch,
+                    key.as_ref(),
+                );
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
             }
         };
 
-        // Add permission through the table method to update index
-        self.allocations.add_permission(alloc_id, peer_addr.ip());
+        // ChannelBind also installs (or refreshes) a permission for the peer IP
+        // (RFC 5766 §11.2). Go through the capped path so ChannelBind cannot be
+        // used to bypass the per-allocation permission cap.
+        if !self.allocations.try_add_permissions_capped(
+            alloc_id,
+            &[peer_addr.ip()],
+            self.config.max_permissions_per_alloc,
+        ) {
+            let (code, what) = if self.allocations.get(alloc_id).is_none() {
+                (TurnErrorCode::AllocationMismatch, "allocation gone")
+            } else {
+                (
+                    TurnErrorCode::InsufficientCapacity,
+                    "permission cap exceeded",
+                )
+            };
+            warn!("ChannelBind from {} rejected: {}", src_addr, what);
+            let response = self.build_signed_error_response(msg, code, key.as_ref());
+            socket.send_to(&response, src_addr).await?;
+            return Ok(());
+        }
+
+        // Commit the binding. The permission is in place, so a client that gets
+        // a success response can use the channel immediately.
+        match self.allocations.get(alloc_id) {
+            Some(alloc) => {
+                if needs_bind {
+                    alloc.bind_channel(channel, peer_addr);
+                }
+                alloc.touch_received();
+            }
+            None => {
+                let response = self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::AllocationMismatch,
+                    key.as_ref(),
+                );
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        }
 
         info!(
             "ChannelBind: channel 0x{:04x} -> {} for {} (alloc {})",
@@ -964,21 +963,12 @@ impl TurnHandler {
             }
         };
 
-        // Reject forbidden peer targets (loopback, multicast, broadcast, etc.)
-        if is_forbidden_peer_ip(peer_addr.ip()) {
+        // Reject forbidden peer targets: loopback, multicast, broadcast, link-
+        // local, and our own external IP on a non-relay port. Same IP + relay
+        // port is the legitimate single-port internal-routing case handled below.
+        if is_forbidden_peer_addr(&self.config, peer_addr) {
             warn!(
                 "Send indication to forbidden peer {} from {}",
-                peer_addr.ip(),
-                src_addr
-            );
-            return Ok(());
-        }
-
-        // Drop sends to our own external IP on a non-relay port. Same IP + relay
-        // port is the legitimate single-port internal-routing case handled below.
-        if peer_addr.ip() == self.config.external_ip && peer_addr.port() != self.config.port {
-            warn!(
-                "Send indication to own external IP on non-relay port {} from {}",
                 peer_addr, src_addr
             );
             return Ok(());
@@ -1126,9 +1116,21 @@ impl TurnHandler {
                 }
             }
 
-            // Touch sender's allocation - they're actively sending data
+            // Touch sender's allocation - they're actively sending data. A
+            // successful internal route also feeds the orphan-sender timer, but a
+            // failed one deliberately does not: the payload here is usually an ICE
+            // connectivity check, sent before any peer exists, so arming the timer
+            // would have cleanup_orphaned_senders reap the allocation of whoever
+            // joins first (ringing, waiting room, slow signalling) 45s later,
+            // while it is actively sending and refreshing. The ChannelData and raw
+            // media paths do arm it on a failed relay, but STUN never reaches
+            // them - engine.rs routes ICE in its own branch and server.rs only
+            // sees RTP/RTCP/DTLS - so by then the client is past ICE.
             if let Some(a) = self.allocations.get_by_client(src_addr) {
                 a.touch_received();
+                if sent {
+                    a.touch_relay_success();
+                }
             }
             return Ok(());
         }
@@ -1155,14 +1157,46 @@ impl TurnHandler {
             return Ok(());
         }
 
-        // Relay data to peer
-        debug!(
-            "Relaying {} bytes from {} to peer {}",
-            data.len(),
-            src_addr,
-            peer_addr
-        );
-        socket.send_to(data, peer_addr).await?;
+        // Relay data to peer. If the peer is another TURN client of this server,
+        // a raw datagram would arrive on its TURN control socket from our relay
+        // address and be discarded by its TURN stack; wrap it in ChannelData or
+        // a Data Indication exactly as the ChannelData path in the relay engine
+        // does. Snapshot the target under a short guard, release, then send.
+        let target = self
+            .allocations
+            .get_by_client(peer_addr)
+            .map(|t| (t.id, t.channel_for_peer(src_addr)));
+        match target {
+            Some((target_id, reverse_channel)) => {
+                debug!(
+                    "Relaying {} bytes from {} to TURN client {} via {}",
+                    data.len(),
+                    src_addr,
+                    peer_addr,
+                    match reverse_channel {
+                        Some(c) => format!("reverse channel 0x{:04x}", c),
+                        None => "Data Indication".to_string(),
+                    }
+                );
+                let packet = match reverse_channel {
+                    Some(c) => self.build_channel_data(c, data),
+                    None => self.build_data_indication(src_addr, data),
+                };
+                socket.send_to(&packet, peer_addr).await?;
+                if let Some(t) = self.allocations.get(target_id) {
+                    t.touch();
+                }
+            }
+            None => {
+                debug!(
+                    "Relaying {} bytes from {} to peer {}",
+                    data.len(),
+                    src_addr,
+                    peer_addr
+                );
+                socket.send_to(data, peer_addr).await?;
+            }
+        }
 
         // Touch sender's allocation - they're actively sending data
         if let Some(a) = self.allocations.get_by_client(src_addr) {
@@ -1290,8 +1324,28 @@ impl TurnHandler {
         response
     }
 
-    /// Build an error response
+    /// Build an error response without MESSAGE-INTEGRITY.
+    ///
+    /// Only for errors raised before the credentials were verified, where no
+    /// key is available. Anything answered after authentication goes through
+    /// [`Self::build_signed_error_response`].
     fn build_error_response(&self, request: &StunInfo, error: TurnErrorCode) -> Vec<u8> {
+        self.build_signed_error_response(request, error, None)
+    }
+
+    /// Build an error response, signed when the request was authenticated.
+    ///
+    /// RFC 5389 Section 10.2.3: a client using long-term credentials discards an
+    /// error response that carries no MESSAGE-INTEGRITY, except for 400, 401 and
+    /// 438. An unsigned 437 or 508 is therefore invisible to the client - it keeps
+    /// retransmitting until its RTO schedule runs out (~39.5s) and then reports a
+    /// plain timeout instead of the error we sent.
+    fn build_signed_error_response(
+        &self,
+        request: &StunInfo,
+        error: TurnErrorCode,
+        key: Option<&[u8; 16]>,
+    ) -> Vec<u8> {
         let mut response = Vec::with_capacity(48);
 
         // Error response: set bits 4 and 8 of method
@@ -1320,8 +1374,14 @@ impl TurnHandler {
             response.push(0);
         }
 
-        let attr_len = (response.len() - 20) as u16;
-        response[2..4].copy_from_slice(&attr_len.to_be_bytes());
+        // MESSAGE-INTEGRITY (if authenticated)
+        if let Some(key) = key {
+            self.append_message_integrity(&mut response, key);
+        } else {
+            // Update length (no MESSAGE-INTEGRITY)
+            let attr_len = (response.len() - 20) as u16;
+            response[2..4].copy_from_slice(&attr_len.to_be_bytes());
+        }
 
         response
     }
@@ -1563,6 +1623,17 @@ impl TurnHandler {
         buf.extend_from_slice(&integrity);
     }
 
+    /// Build a TURN ChannelData message (RFC 5766 §11.4)
+    fn build_channel_data(&self, channel: u16, data: &[u8]) -> Vec<u8> {
+        let padding = (4 - ((4 + data.len()) % 4)) % 4;
+        let mut packet = Vec::with_capacity(4 + data.len() + padding);
+        packet.extend_from_slice(&channel.to_be_bytes());
+        packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        packet.extend_from_slice(data);
+        packet.resize(packet.len() + padding, 0);
+        packet
+    }
+
     /// Build a TURN Data Indication
     fn build_data_indication(&self, peer_addr: SocketAddr, data: &[u8]) -> Vec<u8> {
         let mut packet = Vec::with_capacity(48 + data.len());
@@ -1688,10 +1759,445 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_ipv4_mapped_ipv6_judged_by_ipv4_rules() {
+        assert!(is_forbidden_peer_ip(ip("::ffff:127.0.0.1")));
+        assert!(is_forbidden_peer_ip(ip("::ffff:169.254.169.254")));
+        assert!(is_forbidden_peer_ip(ip("::ffff:224.0.0.1")));
+        assert!(is_forbidden_peer_ip(ip("::ffff:0.0.0.0")));
+        // Mapped global unicast stays allowed.
+        assert!(!is_forbidden_peer_ip(ip("::ffff:203.0.113.5")));
+    }
+
+    #[test]
+    fn forbidden_ipv6_unicast_link_local() {
+        assert!(is_forbidden_peer_ip(ip("fe80::1")));
+        assert!(is_forbidden_peer_ip(ip("febf::1")));
+        // fec0::/10 (deprecated site-local) is not link-local.
+        assert!(!is_forbidden_peer_ip(ip("fec0::1")));
+    }
+
+    #[test]
+    fn forbidden_peer_addr_blocks_own_external_ip_on_other_ports() {
+        use super::is_forbidden_peer_addr;
+        use crate::config::Config;
+        let cfg = Config::new(ip("203.0.113.10")).with_port(3478);
+        let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        // Relay address itself is the legitimate single-port target.
+        assert!(!is_forbidden_peer_addr(&cfg, sa("203.0.113.10:3478")));
+        // Any other port on the relay host is refused.
+        assert!(is_forbidden_peer_addr(&cfg, sa("203.0.113.10:53")));
+        assert!(is_forbidden_peer_addr(&cfg, sa("203.0.113.10:3479")));
+        // IP-level rules still apply.
+        assert!(is_forbidden_peer_addr(&cfg, sa("127.0.0.1:3478")));
+        // Unrelated hosts are fine on any port.
+        assert!(!is_forbidden_peer_addr(&cfg, sa("203.0.113.11:53")));
+    }
+
+    #[test]
     fn allowed_global_unicast_not_forbidden() {
         assert!(!is_forbidden_peer_ip(ip("8.8.8.8")));
         assert!(!is_forbidden_peer_ip(ip("203.0.113.5"))); // TEST-NET-3
         assert!(!is_forbidden_peer_ip(ip("2001:db8::1")));
+    }
+
+    // ---- helpers for the handler-level tests below -------------------------
+
+    use super::{
+        AllocationTable, Config, RateLimiter, StunClass, StunInfo, StunMethod, TurnAuth,
+        TurnErrorCode, TurnHandler,
+    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    const RELAY_IP: &str = "203.0.113.10";
+    const RELAY_PORT: u16 = 3478;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Handler over an anonymous (no credentials) config, so the tests exercise
+    /// the request logic rather than the authentication path.
+    fn handler() -> (TurnHandler, Arc<AllocationTable>) {
+        let config = Arc::new(Config::new(ip(RELAY_IP)).with_port(RELAY_PORT));
+        let allocations = Arc::new(AllocationTable::new());
+        let rate_limiter = Arc::new(RateLimiter::new(120, 100));
+        (
+            TurnHandler::new(config, Arc::clone(&allocations), rate_limiter),
+            allocations,
+        )
+    }
+
+    /// Minimal parsed request. Attributes are set by the caller; only `raw`'s
+    /// message type and transaction id matter for building a response.
+    fn request(method: StunMethod, msg_type: u16) -> StunInfo {
+        let transaction_id = [7u8; 12];
+        let mut raw = Vec::with_capacity(20);
+        raw.extend_from_slice(&msg_type.to_be_bytes());
+        raw.extend_from_slice(&[0x00, 0x00]);
+        raw.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        raw.extend_from_slice(&transaction_id);
+        StunInfo {
+            class: StunClass::Request,
+            method,
+            transaction_id,
+            username: None,
+            xor_peer_addresses: Vec::new(),
+            channel_number: None,
+            lifetime: None,
+            data: None,
+            realm: None,
+            nonce: None,
+            message_integrity: None,
+            message_integrity_offset: None,
+            requested_transport: None,
+            raw,
+        }
+    }
+
+    // ---- error responses ----------------------------------------------------
+
+    #[test]
+    fn signed_error_response_carries_verifiable_message_integrity() {
+        // RFC 5389 §10.2.3: a client that authenticated discards an error
+        // response without MESSAGE-INTEGRITY (except 400/401/438), so a 437 has
+        // to be signed or the client just retransmits until it times out.
+        let (h, _) = handler();
+        let msg = request(StunMethod::Allocate, 0x0003);
+        let key = TurnAuth::compute_key("user", "uturn", "pass");
+
+        let resp =
+            h.build_signed_error_response(&msg, TurnErrorCode::AllocationMismatch, Some(&key));
+
+        // Header length covers everything after the 20-byte header.
+        let declared = u16::from_be_bytes([resp[2], resp[3]]) as usize;
+        assert_eq!(declared, resp.len() - 20);
+
+        // MESSAGE-INTEGRITY is the trailing 24-byte attribute (4 + 20).
+        let mi_start = resp.len() - 24;
+        assert_eq!(&resp[mi_start..mi_start + 2], &[0x00, 0x08]);
+        assert_eq!(&resp[mi_start + 2..mi_start + 4], &[0x00, 0x14]);
+        assert!(TurnAuth::verify_message_integrity(
+            &resp[..mi_start],
+            &resp[mi_start + 4..],
+            &key
+        ));
+
+        // ERROR-CODE still says 437.
+        assert_eq!(&resp[20..22], &[0x00, 0x09]);
+        assert_eq!(resp[24 + 2], 4);
+        assert_eq!(resp[24 + 3], 37);
+    }
+
+    #[test]
+    fn unsigned_error_response_has_no_message_integrity() {
+        let (h, _) = handler();
+        let msg = request(StunMethod::Allocate, 0x0003);
+        let resp = h.build_error_response(&msg, TurnErrorCode::AllocationMismatch);
+        let declared = u16::from_be_bytes([resp[2], resp[3]]) as usize;
+        assert_eq!(declared, resp.len() - 20);
+
+        // Same message, 24 bytes shorter than the signed one, and its trailing
+        // attribute is the ERROR-CODE rather than a MESSAGE-INTEGRITY.
+        let key = TurnAuth::compute_key("user", "uturn", "pass");
+        let signed =
+            h.build_signed_error_response(&msg, TurnErrorCode::AllocationMismatch, Some(&key));
+        assert_eq!(signed.len(), resp.len() + 24);
+        assert_eq!(&resp[20..22], &[0x00, 0x09]);
+        let attr_len = u16::from_be_bytes([resp[22], resp[23]]) as usize;
+        assert_eq!(resp.len(), 20 + 4 + attr_len.div_ceil(4) * 4);
+    }
+
+    // ---- ChannelBind --------------------------------------------------------
+
+    #[tokio::test]
+    async fn channel_bind_conflict_installs_no_permission() {
+        // RFC 5766 §11.2: an error response must leave the allocation unchanged.
+        // The permission implied by ChannelBind used to be installed before the
+        // binding was validated, so a client could fill its permission table
+        // with IPs through requests the server went on to reject with 400.
+        let (h, table) = handler();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = sa("127.0.0.1:40001");
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peer_a = sa("203.0.113.20:5000");
+        let peer_b = sa("203.0.113.21:5000");
+
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![peer_a];
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer_a));
+        assert_eq!(alloc.permissions_count(), 1);
+        drop(alloc);
+
+        // Same channel, different peer -> 400, and no trace of peer_b.
+        bind.xor_peer_addresses = vec![peer_b];
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer_a));
+        assert_eq!(alloc.channel_for_peer(peer_b), None);
+        assert!(!alloc.is_permitted(peer_b.ip()));
+        assert_eq!(alloc.permissions_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_bind_refresh_of_same_pair_is_idempotent() {
+        let (h, table) = handler();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = sa("127.0.0.1:40002");
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peer = sa("203.0.113.20:5000");
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![peer];
+
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+        assert_eq!(alloc.permissions_count(), 1);
+    }
+
+    // ---- authenticated requests --------------------------------------------
+
+    const USER: &str = "user";
+    const PASS: &str = "pass";
+
+    /// Handler with one static credential configured, plus the key that user
+    /// signs with. Responses to its requests must carry MESSAGE-INTEGRITY.
+    fn auth_handler() -> (TurnHandler, Arc<AllocationTable>, Arc<Config>, [u8; 16]) {
+        let config = Arc::new(
+            Config::new(ip(RELAY_IP))
+                .with_port(RELAY_PORT)
+                .with_credential(USER, PASS),
+        );
+        let allocations = Arc::new(AllocationTable::new());
+        let rate_limiter = Arc::new(RateLimiter::new(120, 100));
+        let key = TurnAuth::compute_key(USER, &config.realm, PASS);
+        (
+            TurnHandler::new(Arc::clone(&config), Arc::clone(&allocations), rate_limiter),
+            allocations,
+            config,
+            key,
+        )
+    }
+
+    /// Add the credential attributes and a MESSAGE-INTEGRITY over `raw`, the way
+    /// a client would. `raw` holds only the header, which is all the server
+    /// hashes here; the parsed attributes are set as fields.
+    fn sign(mut msg: StunInfo, config: &Config, key: &[u8; 16]) -> StunInfo {
+        msg.username = Some(USER.to_string());
+        msg.realm = Some(config.realm.clone());
+        msg.nonce = Some(TurnAuth::generate_nonce(&config.nonce_secret));
+
+        let offset = msg.raw.len();
+        let hashed_len = (offset - 20 + 24) as u16;
+        msg.raw[2..4].copy_from_slice(&hashed_len.to_be_bytes());
+        let mi = TurnAuth::compute_message_integrity(&msg.raw, key);
+        msg.raw.extend_from_slice(&[0x00, 0x08, 0x00, 0x14]);
+        msg.raw.extend_from_slice(&mi);
+        msg.message_integrity = Some(mi.to_vec());
+        msg.message_integrity_offset = Some(offset);
+        msg
+    }
+
+    /// Bind a socket for the server and one standing in for the client, and
+    /// return the client's address so responses can be read back.
+    async fn socket_pair() -> (tokio::net::UdpSocket, tokio::net::UdpSocket, SocketAddr) {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        (server, client, client_addr)
+    }
+
+    /// Read one response, asserting it arrives.
+    async fn recv(client: &tokio::net::UdpSocket) -> Vec<u8> {
+        let mut buf = vec![0u8; 1500];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("no response sent")
+        .unwrap()
+        .0;
+        buf.truncate(n);
+        buf
+    }
+
+    fn error_code(resp: &[u8]) -> (u8, u8) {
+        assert_eq!(
+            &resp[20..22],
+            &[0x00, 0x09],
+            "first attribute is ERROR-CODE"
+        );
+        (resp[26], resp[27])
+    }
+
+    fn assert_signed_with(resp: &[u8], key: &[u8; 16]) {
+        let mi_start = resp.len() - 24;
+        assert_eq!(
+            &resp[mi_start..mi_start + 4],
+            &[0x00, 0x08, 0x00, 0x14],
+            "response ends in a MESSAGE-INTEGRITY attribute"
+        );
+        assert!(
+            TurnAuth::verify_message_integrity(&resp[..mi_start], &resp[mi_start + 4..], key),
+            "MESSAGE-INTEGRITY verifies"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_without_allocation_returns_signed_437() {
+        // Allocations live at most 60s, so a client that loses one Refresh gets
+        // this 437 on its next one. Unsigned, an authenticated client discards
+        // it (RFC 5389 §10.2.3) and retransmits for ~39.5s instead of
+        // reallocating - which is why authentication runs before the lookup.
+        let (h, _table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+
+        let msg = sign(request(StunMethod::Refresh, 0x0004), &config, &key);
+        h.handle_refresh(&msg, client_addr, &server).await.unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(&resp[0..2], &[0x01, 0x14], "Refresh error response");
+        assert_eq!(error_code(&resp), (4, 37));
+        assert_signed_with(&resp, &key);
+    }
+
+    #[tokio::test]
+    async fn channel_bind_forbidden_peer_returns_signed_403() {
+        let (h, table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create(client_addr, USER.to_string(), 600);
+
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![sa("127.0.0.1:1234")];
+        let bind = sign(bind, &config, &key);
+        h.handle_channel_bind(&bind, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 3));
+        assert_signed_with(&resp, &key);
+    }
+
+    #[tokio::test]
+    async fn create_permission_forbidden_peer_returns_signed_403() {
+        let (h, table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create(client_addr, USER.to_string(), 600);
+
+        let mut perm = request(StunMethod::CreatePermission, 0x0008);
+        perm.xor_peer_addresses = vec![sa("169.254.169.254:80")];
+        let perm = sign(perm, &config, &key);
+        h.handle_create_permission(&perm, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 3));
+        assert_signed_with(&resp, &key);
+    }
+
+    #[tokio::test]
+    async fn request_for_another_users_allocation_is_rejected() {
+        // RFC 5766 §10.1: post-Allocate requests carry the same credentials as
+        // the Allocate did. Moving auth ahead of the lookup must not lose that.
+        let (h, table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create(client_addr, "someone-else".to_string(), 600);
+
+        let msg = sign(request(StunMethod::Refresh, 0x0004), &config, &key);
+        h.handle_refresh(&msg, client_addr, &server).await.unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 1), "401 Unauthorized");
+    }
+
+    // ---- Allocate over a lapsed allocation ----------------------------------
+
+    #[tokio::test]
+    async fn allocate_over_expired_allocation_starts_fresh() {
+        // cleanup_expired runs every 2s, so a client that lets its allocation
+        // lapse and reconnects usually finds the dead entry still in the table.
+        // 437 there would lock it out of the port until the reaper catches up.
+        let (h, table) = handler();
+        let (server, client, client_addr) = socket_pair().await;
+
+        // The coarse clock only moves when the server ticks it, so drive it by
+        // hand: allocate with a zero lifetime, then step past the expiry.
+        crate::coarse_time::init();
+        let dead = table.create(client_addr, "u".to_string(), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        crate::coarse_time::update_coarse_time();
+        assert!(table.get(dead).unwrap().is_expired());
+
+        let mut alloc = request(StunMethod::Allocate, 0x0003);
+        alloc.requested_transport = Some(17);
+        h.handle_allocate(&alloc, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(&resp[0..2], &[0x01, 0x03], "Allocate success response");
+        assert!(table.get(dead).is_none(), "the lapsed allocation is gone");
+        let fresh = table.get_by_client(client_addr).expect("a new allocation");
+        assert!(!fresh.is_expired());
+    }
+
+    #[tokio::test]
+    async fn allocate_with_new_transaction_id_over_live_allocation_is_437() {
+        let (h, table) = handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create_or_get(client_addr, "u".to_string(), 600, [1u8; 12]);
+
+        let mut alloc = request(StunMethod::Allocate, 0x0003);
+        alloc.requested_transport = Some(17);
+        h.handle_allocate(&alloc, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 37));
+    }
+
+    // ---- Send indication ----------------------------------------------------
+
+    #[tokio::test]
+    async fn send_indication_without_target_does_not_arm_orphan_timer() {
+        // Internal routing runs during ICE, before a peer exists. Arming the
+        // orphan-sender timer here would have cleanup_orphaned_senders reap the
+        // allocation of whoever joins the call first, 45s later, while it is
+        // still actively sending and refreshing.
+        let (h, table) = handler();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = sa("127.0.0.1:40003");
+        let id = table.create(client, "u".to_string(), 600);
+        table.add_permission(id, ip(RELAY_IP));
+
+        let mut send = request(StunMethod::Send, 0x0006);
+        send.class = StunClass::Indication;
+        send.xor_peer_addresses = vec![sa(&format!("{}:{}", RELAY_IP, RELAY_PORT))];
+        // Not a STUN message, so the ICE-ufrag routing branch is skipped and the
+        // broadcast fallback finds no unpaired target but the sender itself.
+        send.data = Some(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        h.handle_send(&send, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        // A zero timeout would report any armed timer as orphaned.
+        assert!(!alloc.is_orphaned_sender(0));
     }
 
     #[test]

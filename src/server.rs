@@ -13,7 +13,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::coarse_time;
 use crate::config::Config;
 use crate::demux::{Demuxer, PacketType};
-use crate::lookup::{AllocationTable, RateLimiter};
+use crate::lookup::{AllocationId, AllocationTable, RateLimiter};
 use crate::relay::RelayEngine;
 use crate::turn::TurnHandler;
 
@@ -23,8 +23,14 @@ const CLEANUP_INTERVAL_SECS: u64 = 2;
 /// Inactivity timeout - remove allocation if no traffic FROM client for this long
 const INACTIVITY_TIMEOUT_SECS: u64 = 45;
 
-/// Receive buffer size - MTU is typically 1500, but allow for jumbo frames
-const RECV_BUFFER_SIZE: usize = 2048;
+/// Receive buffer size.
+///
+/// Sized for the largest possible UDP payload (65 507 bytes over IPv4). A
+/// datagram larger than the buffer is silently truncated by recv_from, which
+/// would corrupt a relayed payload or make a STUN message unparseable without
+/// any error. Allocated once for the lifetime of the receive loop, so the
+/// generous size costs nothing per packet.
+const RECV_BUFFER_SIZE: usize = 65_535;
 
 /// uTURN server
 pub struct Server {
@@ -281,80 +287,94 @@ impl Server {
     async fn relay_client_data(&self, data: &[u8], src_addr: SocketAddr) -> Result<()> {
         let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
 
-        // Get sender's allocation and verify they have permission for relay IP
-        let sender_alloc = match self.allocations.get_by_client(src_addr) {
-            Some(alloc) => alloc,
-            None => {
-                trace!("relay_client_data from unknown client: {}", src_addr);
-                return Ok(());
-            }
-        };
-
-        // Check that SENDER has permission for the relay IP (RFC 5766 requirement)
-        if !sender_alloc.is_permitted(self.config.external_ip) {
-            trace!(
-                "Client {} tried to relay data without permission for relay IP",
-                src_addr
-            );
-            return Ok(());
-        }
+        // Snapshot the sender's id, relay-IP permission and ICE ufrags, then
+        // release the guard: everything below awaits socket sends, and an
+        // allocation guard must never be held across I/O (cleanup takes shard
+        // write locks and would stall or deadlock behind a parked guard).
+        let (sender_id, sender_local, sender_remote) =
+            match self.allocations.get_by_client(src_addr) {
+                Some(alloc) => {
+                    // Check that SENDER has permission for the relay IP (RFC 5766 requirement)
+                    if !alloc.is_permitted(self.config.external_ip) {
+                        trace!(
+                            "Client {} tried to relay data without permission for relay IP",
+                            src_addr
+                        );
+                        return Ok(());
+                    }
+                    (
+                        alloc.id,
+                        alloc.get_ice_ufrag(),
+                        alloc.get_ice_remote_ufrag(),
+                    )
+                }
+                None => {
+                    trace!("relay_client_data from unknown client: {}", src_addr);
+                    return Ok(());
+                }
+            };
 
         // Try ufrag-based routing first to avoid bandwidth multiplication
-        let sender_local = sender_alloc.get_ice_ufrag();
-        let sender_remote = sender_alloc.get_ice_remote_ufrag();
-
         let peers = match (&sender_local, &sender_remote) {
             (Some(local), Some(remote)) => self.allocations.find_ice_peers(local, remote),
             _ => Vec::new(),
         };
 
-        if !peers.is_empty() {
-            // Route to specific ICE peer only
-            let indication = self.build_data_indication(relay_addr, data);
-            let mut relayed = false;
-
-            for &peer_id in &peers {
-                if let Some(target_alloc) = self.allocations.get(peer_id) {
-                    if target_alloc.client_addr == src_addr {
-                        continue;
-                    }
-                    if !target_alloc.is_permitted(self.config.external_ip) {
-                        continue;
-                    }
-
-                    debug!(
-                        "Relaying {} bytes from client {} to ICE peer {} (via relay {})",
-                        data.len(),
-                        src_addr,
-                        target_alloc.client_addr,
-                        relay_addr
-                    );
-
-                    self.socket
-                        .send_to(&indication, target_alloc.client_addr)
-                        .await?;
-                    target_alloc.touch();
-                    relayed = true;
-                }
-            }
-
-            if relayed {
-                sender_alloc.touch_relay_success();
-            } else {
-                sender_alloc.touch_relay_attempt();
-            }
-        } else {
-            // No ICE pairing yet - drop RTP (no broadcast fallback)
+        if peers.is_empty() {
+            // No ICE pairing yet - drop (no broadcast fallback)
             trace!(
-                "RTP from {} dropped: no ICE ufrag match (local={:?}, remote={:?})",
+                "Data from {} dropped: no ICE ufrag match (local={:?}, remote={:?})",
                 src_addr,
                 sender_local,
                 sender_remote,
             );
-            sender_alloc.touch_relay_attempt();
+            self.touch_relay(sender_id, false);
+            return Ok(());
         }
 
+        // Snapshot the ICE peers' client addresses, then send to the snapshot.
+        let targets: Vec<(AllocationId, SocketAddr)> = peers
+            .iter()
+            .filter_map(|&peer_id| {
+                let target = self.allocations.get(peer_id)?;
+                if target.client_addr == src_addr || !target.is_permitted(self.config.external_ip) {
+                    None
+                } else {
+                    Some((peer_id, target.client_addr))
+                }
+            })
+            .collect();
+
+        let indication = self.build_data_indication(relay_addr, data);
+        let mut relayed = false;
+        for (peer_id, target_addr) in targets {
+            debug!(
+                "Relaying {} bytes from client {} to ICE peer {} (via relay {})",
+                data.len(),
+                src_addr,
+                target_addr,
+                relay_addr
+            );
+            self.socket.send_to(&indication, target_addr).await?;
+            if let Some(target) = self.allocations.get(peer_id) {
+                target.touch();
+            }
+            relayed = true;
+        }
+
+        self.touch_relay(sender_id, relayed);
         Ok(())
+    }
+
+    /// Re-acquire briefly to record the outcome of a relay attempt.
+    fn touch_relay(&self, id: AllocationId, relayed: bool) {
+        if let Some(a) = self.allocations.get(id) {
+            if relayed {
+                a.touch_relay_success();
+            } else {
+                a.touch_relay_attempt();
+            }
+        }
     }
 
     /// Build a TURN Data Indication message
