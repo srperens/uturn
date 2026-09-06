@@ -9,7 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
 use crate::demux::{StunClass, StunInfo, StunMethod};
-use crate::lookup::{AllocationTable, RateLimitError, RateLimiter};
+use crate::lookup::{AllocationId, AllocationTable, RateLimitError, RateLimiter};
 
 use super::auth::TurnAuth;
 use super::message::TurnErrorCode;
@@ -19,16 +19,6 @@ pub struct TurnHandler {
     config: Arc<Config>,
     allocations: Arc<AllocationTable>,
     rate_limiter: Arc<RateLimiter>,
-}
-
-/// Result of authentication validation
-enum AuthResult {
-    /// Authentication successful, here's the key for response
-    Success([u8; 16]),
-    /// No authentication required (anonymous mode)
-    NotRequired,
-    /// Authentication failed, send this error response
-    Failed(Vec<u8>),
 }
 
 /// Peer addresses we refuse to relay to, regardless of permission.
@@ -177,27 +167,59 @@ impl TurnHandler {
         Ok((username.clone(), key))
     }
 
-    /// Validate authentication for requests on an existing allocation
-    /// (Refresh, CreatePermission, ChannelBind).
+    /// Authenticate a request that operates on an existing allocation
+    /// (Refresh, CreatePermission, ChannelBind) and resolve that allocation.
     ///
-    /// Per RFC 5766 Section 10.1: All requests after the initial Allocate must be
-    /// authenticated using the same credentials as the Allocate request.
-    fn validate_request_auth(&self, msg: &StunInfo, expected_username: &str) -> AuthResult {
-        // If no credentials configured, authentication is not required
-        if self.config.credentials.is_empty() {
-            return AuthResult::NotRequired;
-        }
+    /// RFC 5766 §10.1: every request after the initial Allocate carries the same
+    /// credentials as the Allocate did, so the username must match the one on
+    /// the allocation.
+    ///
+    /// Authentication deliberately runs *before* the allocation lookup. The
+    /// lookup's own failure is a 437, and RFC 5389 §10.2.3 has an authenticated
+    /// client discard an error response that carries no MESSAGE-INTEGRITY - so a
+    /// 437 built without a key is invisible: the client retransmits through its
+    /// whole RTO schedule (~39.5s) and reports a timeout instead of reallocating.
+    /// Allocations here live at most 60s, so a client that loses one Refresh hits
+    /// this on its next one.
+    ///
+    /// Returns the allocation id and the key every response on this request must
+    /// be signed with (`None` in anonymous mode), or the error response to send.
+    fn authenticate_for_allocation(
+        &self,
+        msg: &StunInfo,
+        src_addr: SocketAddr,
+    ) -> Result<(AllocationId, Option<[u8; 16]>), Vec<u8>> {
+        let auth = if self.config.credentials.is_empty() {
+            None
+        } else {
+            Some(self.verify_long_term_credentials(msg)?)
+        };
+        let key = auth.as_ref().map(|(_, k)| *k);
 
-        match self.verify_long_term_credentials(msg) {
-            Err(response) => AuthResult::Failed(response),
-            Ok((username, _)) if username != expected_username => {
-                warn!(
-                    "Username mismatch: expected '{}', got '{}'",
-                    expected_username, username
-                );
-                AuthResult::Failed(self.build_unauthorized_response(msg))
+        // Snapshot id + username, then drop the guard: the caller awaits a send
+        // on every path out of here and must not hold an allocation guard.
+        let found = self
+            .allocations
+            .get_by_client(src_addr)
+            .map(|a| (a.id, a.username.clone()));
+
+        match (found, &auth) {
+            (None, _) => {
+                debug!("Request from {} has no allocation - 437", src_addr);
+                Err(self.build_signed_error_response(
+                    msg,
+                    TurnErrorCode::AllocationMismatch,
+                    key.as_ref(),
+                ))
             }
-            Ok((_, key)) => AuthResult::Success(key),
+            (Some((_, allocated_to)), Some((username, _))) if allocated_to != *username => {
+                warn!(
+                    "Username mismatch: allocation for {} belongs to '{}', request says '{}'",
+                    src_addr, allocated_to, username
+                );
+                Err(self.build_unauthorized_response(msg))
+            }
+            (Some((id, _)), _) => Ok((id, key)),
         }
     }
 
@@ -455,14 +477,35 @@ impl TurnHandler {
             None => msg.username.as_deref().unwrap_or("anonymous").to_string(),
         };
 
-        // 2. Existing allocation on this 5-tuple. A retransmission carries the
-        //    same transaction id and gets the success response again; a *new*
+        // 2. Existing *live* allocation on this 5-tuple. A retransmission carries
+        //    the same transaction id and gets the success response again; a *new*
         //    Allocate over a live allocation is a 437 Allocation Mismatch.
-        if let Some(alloc) = self.allocations.get_by_client(src_addr) {
-            let is_retransmission = alloc.allocate_txn_id == msg.transaction_id;
-            let lifetime = alloc.remaining_lifetime();
-            drop(alloc);
+        //
+        //    An allocation whose lifetime has run out but which cleanup_expired
+        //    (2s interval) has not reaped yet is not live.
+        let existing = self.allocations.get_by_client(src_addr).map(|a| {
+            (
+                a.id,
+                a.is_expired(),
+                a.allocate_txn_id == msg.transaction_id,
+                a.remaining_lifetime(),
+            )
+        });
 
+        // Reap a lapsed allocation rather than answer it: 437 would leave a
+        // client that lets its allocation expire and reconnects unable to
+        // allocate until the reaper catches up, and the success-with-lifetime-0
+        // it used to get is just as dead. Releasing the quota slot here mirrors
+        // what cleanup_expired would have done.
+        if let Some((id, true, _, _)) = existing {
+            if self.allocations.remove(id) {
+                self.rate_limiter.record_deallocation(src_addr.ip());
+                debug!(
+                    "Reaped expired allocation {} for {} before re-Allocate",
+                    id, src_addr
+                );
+            }
+        } else if let Some((_, false, is_retransmission, lifetime)) = existing {
             if is_retransmission {
                 debug!(
                     "Allocate retransmission from {} - resending success",
@@ -567,23 +610,12 @@ impl TurnHandler {
     ) -> Result<()> {
         debug!("Refresh request from {}", src_addr);
 
-        // Snapshot id + username, then drop the guard so none of the awaits
-        // below run while an allocation lock is held.
-        let (alloc_id, username) = match self.allocations.get_by_client(src_addr) {
-            Some(a) => (a.id, a.username.clone()),
-            None => {
-                let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-        };
-
-        // Validate authentication (RFC 5766 Section 10.1)
-        let key = match self.validate_request_auth(msg, &username) {
-            AuthResult::Success(k) => Some(k),
-            AuthResult::NotRequired => None,
-            AuthResult::Failed(response) => {
-                warn!("Refresh auth failed from {}", src_addr);
+        // Authenticate, then resolve the allocation (RFC 5766 §10.1). No
+        // allocation guard is held across the awaits below.
+        let (alloc_id, key) = match self.authenticate_for_allocation(msg, src_addr) {
+            Ok(v) => v,
+            Err(response) => {
+                debug!("Refresh from {} rejected", src_addr);
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
@@ -655,9 +687,21 @@ impl TurnHandler {
             return Ok(());
         }
 
-        // Reject forbidden peer IPs before doing anything else. RFC 5766 §9.2
-        // permits the server to reject any peer address it does not wish to
-        // relay to. Sending 403 covers loopback/multicast/etc.
+        // Authenticate, then resolve the allocation (RFC 5766 §10.1). No
+        // allocation guard is held across the awaits below.
+        let (alloc_id, key) = match self.authenticate_for_allocation(msg, src_addr) {
+            Ok(v) => v,
+            Err(response) => {
+                debug!("CreatePermission from {} rejected", src_addr);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
+        // Reject forbidden peer IPs. RFC 5766 §9.2 permits the server to reject
+        // any peer address it does not wish to relay to; 403 covers
+        // loopback/multicast/etc. Runs after authentication so the response can
+        // be signed - an unsigned 403 is discarded by an authenticated client.
         for peer_addr in &msg.xor_peer_addresses {
             if is_forbidden_peer_ip(peer_addr.ip()) {
                 warn!(
@@ -665,53 +709,16 @@ impl TurnHandler {
                     peer_addr.ip(),
                     src_addr
                 );
-                let response = self.build_error_response(msg, TurnErrorCode::Forbidden);
+                let response =
+                    self.build_signed_error_response(msg, TurnErrorCode::Forbidden, key.as_ref());
                 socket.send_to(&response, src_addr).await?;
                 return Ok(());
             }
         }
 
-        let (alloc_id, key) = {
-            // Snapshot the username, then drop the guard so auth's await never
-            // runs while an allocation lock is held.
-            let username = match self.allocations.get_by_client(src_addr) {
-                Some(a) => a.username.clone(),
-                None => {
-                    let response =
-                        self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
-
-            // Validate authentication (RFC 5766 Section 10.1)
-            let key = match self.validate_request_auth(msg, &username) {
-                AuthResult::Success(k) => Some(k),
-                AuthResult::NotRequired => None,
-                AuthResult::Failed(response) => {
-                    warn!("CreatePermission auth failed from {}", src_addr);
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            };
-
-            // Re-acquire briefly to update the activity timer and read the id.
-            match self.allocations.get_by_client(src_addr) {
-                Some(alloc) => {
-                    alloc.touch_received();
-                    (alloc.id, key)
-                }
-                None => {
-                    let response = self.build_signed_error_response(
-                        msg,
-                        TurnErrorCode::AllocationMismatch,
-                        key.as_ref(),
-                    );
-                    socket.send_to(&response, src_addr).await?;
-                    return Ok(());
-                }
-            }
-        };
+        if let Some(alloc) = self.allocations.get(alloc_id) {
+            alloc.touch_received();
+        }
 
         // Atomically enforce the per-allocation permission cap and insert the
         // new peer IPs. Re-adds of existing permissions are always allowed
@@ -780,37 +787,29 @@ impl TurnHandler {
             }
         };
 
+        // Authenticate, then resolve the allocation (RFC 5766 §10.1). No
+        // allocation guard is held across the awaits below.
+        let (alloc_id, key) = match self.authenticate_for_allocation(msg, src_addr) {
+            Ok(v) => v,
+            Err(response) => {
+                debug!("ChannelBind from {} rejected", src_addr);
+                socket.send_to(&response, src_addr).await?;
+                return Ok(());
+            }
+        };
+
+        // Runs after authentication so the 403 can be signed - an unsigned error
+        // response is discarded by an authenticated client (RFC 5389 §10.2.3).
         if is_forbidden_peer_addr(&self.config, peer_addr) {
             warn!(
                 "ChannelBind with forbidden peer {} from {}",
                 peer_addr, src_addr
             );
-            let response = self.build_error_response(msg, TurnErrorCode::Forbidden);
+            let response =
+                self.build_signed_error_response(msg, TurnErrorCode::Forbidden, key.as_ref());
             socket.send_to(&response, src_addr).await?;
             return Ok(());
         }
-
-        // Snapshot id + username, then drop the guard so auth's await never
-        // runs while an allocation lock is held.
-        let (alloc_id, username) = match self.allocations.get_by_client(src_addr) {
-            Some(a) => (a.id, a.username.clone()),
-            None => {
-                let response = self.build_error_response(msg, TurnErrorCode::AllocationMismatch);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-        };
-
-        // Validate authentication (RFC 5766 Section 10.1)
-        let key = match self.validate_request_auth(msg, &username) {
-            AuthResult::Success(k) => Some(k),
-            AuthResult::NotRequired => None,
-            AuthResult::Failed(response) => {
-                warn!("ChannelBind auth failed from {}", src_addr);
-                socket.send_to(&response, src_addr).await?;
-                return Ok(());
-            }
-        };
 
         /// Outcome of the bind check, decided under one short-lived guard.
         enum Bind {
@@ -1119,12 +1118,14 @@ impl TurnHandler {
 
             // Touch sender's allocation - they're actively sending data. A
             // successful internal route also feeds the orphan-sender timer, but a
-            // failed one deliberately does not: this path runs during ICE, before
-            // a peer exists, so arming the timer here would have
-            // cleanup_orphaned_senders reap the allocation of whoever joins first
-            // (ringing, waiting room, slow signalling) 45s later, while it is
-            // actively sending and refreshing. The ChannelData and raw media paths
-            // only run once media flows, so they can arm it on a failed attempt.
+            // failed one deliberately does not: the payload here is usually an ICE
+            // connectivity check, sent before any peer exists, so arming the timer
+            // would have cleanup_orphaned_senders reap the allocation of whoever
+            // joins first (ringing, waiting room, slow signalling) 45s later,
+            // while it is actively sending and refreshing. The ChannelData and raw
+            // media paths do arm it on a failed relay, but STUN never reaches
+            // them - engine.rs routes ICE in its own branch and server.rs only
+            // sees RTP/RTCP/DTLS - so by then the client is past ICE.
             if let Some(a) = self.allocations.get_by_client(src_addr) {
                 a.touch_received();
                 if sent {
@@ -1963,6 +1964,212 @@ mod tests {
         assert_eq!(alloc.peer_for_channel(0x4000), Some(peer));
         assert_eq!(alloc.channels_count(), 1);
         assert_eq!(alloc.permissions_count(), 1);
+    }
+
+    // ---- authenticated requests --------------------------------------------
+
+    const USER: &str = "user";
+    const PASS: &str = "pass";
+
+    /// Handler with one static credential configured, plus the key that user
+    /// signs with. Responses to its requests must carry MESSAGE-INTEGRITY.
+    fn auth_handler() -> (TurnHandler, Arc<AllocationTable>, Arc<Config>, [u8; 16]) {
+        let config = Arc::new(
+            Config::new(ip(RELAY_IP))
+                .with_port(RELAY_PORT)
+                .with_credential(USER, PASS),
+        );
+        let allocations = Arc::new(AllocationTable::new());
+        let rate_limiter = Arc::new(RateLimiter::new(120, 100));
+        let key = TurnAuth::compute_key(USER, &config.realm, PASS);
+        (
+            TurnHandler::new(Arc::clone(&config), Arc::clone(&allocations), rate_limiter),
+            allocations,
+            config,
+            key,
+        )
+    }
+
+    /// Add the credential attributes and a MESSAGE-INTEGRITY over `raw`, the way
+    /// a client would. `raw` holds only the header, which is all the server
+    /// hashes here; the parsed attributes are set as fields.
+    fn sign(mut msg: StunInfo, config: &Config, key: &[u8; 16]) -> StunInfo {
+        msg.username = Some(USER.to_string());
+        msg.realm = Some(config.realm.clone());
+        msg.nonce = Some(TurnAuth::generate_nonce(&config.nonce_secret));
+
+        let offset = msg.raw.len();
+        let hashed_len = (offset - 20 + 24) as u16;
+        msg.raw[2..4].copy_from_slice(&hashed_len.to_be_bytes());
+        let mi = TurnAuth::compute_message_integrity(&msg.raw, key);
+        msg.raw.extend_from_slice(&[0x00, 0x08, 0x00, 0x14]);
+        msg.raw.extend_from_slice(&mi);
+        msg.message_integrity = Some(mi.to_vec());
+        msg.message_integrity_offset = Some(offset);
+        msg
+    }
+
+    /// Bind a socket for the server and one standing in for the client, and
+    /// return the client's address so responses can be read back.
+    async fn socket_pair() -> (tokio::net::UdpSocket, tokio::net::UdpSocket, SocketAddr) {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        (server, client, client_addr)
+    }
+
+    /// Read one response, asserting it arrives.
+    async fn recv(client: &tokio::net::UdpSocket) -> Vec<u8> {
+        let mut buf = vec![0u8; 1500];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("no response sent")
+        .unwrap()
+        .0;
+        buf.truncate(n);
+        buf
+    }
+
+    fn error_code(resp: &[u8]) -> (u8, u8) {
+        assert_eq!(
+            &resp[20..22],
+            &[0x00, 0x09],
+            "first attribute is ERROR-CODE"
+        );
+        (resp[26], resp[27])
+    }
+
+    fn assert_signed_with(resp: &[u8], key: &[u8; 16]) {
+        let mi_start = resp.len() - 24;
+        assert_eq!(
+            &resp[mi_start..mi_start + 4],
+            &[0x00, 0x08, 0x00, 0x14],
+            "response ends in a MESSAGE-INTEGRITY attribute"
+        );
+        assert!(
+            TurnAuth::verify_message_integrity(&resp[..mi_start], &resp[mi_start + 4..], key),
+            "MESSAGE-INTEGRITY verifies"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_without_allocation_returns_signed_437() {
+        // Allocations live at most 60s, so a client that loses one Refresh gets
+        // this 437 on its next one. Unsigned, an authenticated client discards
+        // it (RFC 5389 §10.2.3) and retransmits for ~39.5s instead of
+        // reallocating - which is why authentication runs before the lookup.
+        let (h, _table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+
+        let msg = sign(request(StunMethod::Refresh, 0x0004), &config, &key);
+        h.handle_refresh(&msg, client_addr, &server).await.unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(&resp[0..2], &[0x01, 0x14], "Refresh error response");
+        assert_eq!(error_code(&resp), (4, 37));
+        assert_signed_with(&resp, &key);
+    }
+
+    #[tokio::test]
+    async fn channel_bind_forbidden_peer_returns_signed_403() {
+        let (h, table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create(client_addr, USER.to_string(), 600);
+
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![sa("127.0.0.1:1234")];
+        let bind = sign(bind, &config, &key);
+        h.handle_channel_bind(&bind, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 3));
+        assert_signed_with(&resp, &key);
+    }
+
+    #[tokio::test]
+    async fn create_permission_forbidden_peer_returns_signed_403() {
+        let (h, table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create(client_addr, USER.to_string(), 600);
+
+        let mut perm = request(StunMethod::CreatePermission, 0x0008);
+        perm.xor_peer_addresses = vec![sa("169.254.169.254:80")];
+        let perm = sign(perm, &config, &key);
+        h.handle_create_permission(&perm, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 3));
+        assert_signed_with(&resp, &key);
+    }
+
+    #[tokio::test]
+    async fn request_for_another_users_allocation_is_rejected() {
+        // RFC 5766 §10.1: post-Allocate requests carry the same credentials as
+        // the Allocate did. Moving auth ahead of the lookup must not lose that.
+        let (h, table, config, key) = auth_handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create(client_addr, "someone-else".to_string(), 600);
+
+        let msg = sign(request(StunMethod::Refresh, 0x0004), &config, &key);
+        h.handle_refresh(&msg, client_addr, &server).await.unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 1), "401 Unauthorized");
+    }
+
+    // ---- Allocate over a lapsed allocation ----------------------------------
+
+    #[tokio::test]
+    async fn allocate_over_expired_allocation_starts_fresh() {
+        // cleanup_expired runs every 2s, so a client that lets its allocation
+        // lapse and reconnects usually finds the dead entry still in the table.
+        // 437 there would lock it out of the port until the reaper catches up.
+        let (h, table) = handler();
+        let (server, client, client_addr) = socket_pair().await;
+
+        // The coarse clock only moves when the server ticks it, so drive it by
+        // hand: allocate with a zero lifetime, then step past the expiry.
+        crate::coarse_time::init();
+        let dead = table.create(client_addr, "u".to_string(), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        crate::coarse_time::update_coarse_time();
+        assert!(table.get(dead).unwrap().is_expired());
+
+        let mut alloc = request(StunMethod::Allocate, 0x0003);
+        alloc.requested_transport = Some(17);
+        h.handle_allocate(&alloc, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(&resp[0..2], &[0x01, 0x03], "Allocate success response");
+        assert!(table.get(dead).is_none(), "the lapsed allocation is gone");
+        let fresh = table.get_by_client(client_addr).expect("a new allocation");
+        assert!(!fresh.is_expired());
+    }
+
+    #[tokio::test]
+    async fn allocate_with_new_transaction_id_over_live_allocation_is_437() {
+        let (h, table) = handler();
+        let (server, client, client_addr) = socket_pair().await;
+        table.create_or_get(client_addr, "u".to_string(), 600, [1u8; 12]);
+
+        let mut alloc = request(StunMethod::Allocate, 0x0003);
+        alloc.requested_transport = Some(17);
+        h.handle_allocate(&alloc, client_addr, &server)
+            .await
+            .unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(error_code(&resp), (4, 37));
     }
 
     // ---- Send indication ----------------------------------------------------
