@@ -15,6 +15,10 @@ use parking_lot::RwLock;
 
 use crate::coarse_time::{coarse_now_ms, is_expired_secs};
 
+/// Lifetime of a channel binding (RFC 5766 §11): 10 minutes, refreshed by a
+/// ChannelBind for the same channel/peer pair.
+pub const CHANNEL_LIFETIME_MS: u64 = 600_000;
+
 /// Unique allocation identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AllocationId(u64);
@@ -49,10 +53,12 @@ pub struct Allocation {
     /// Permitted peer IP addresses
     pub permissions: RwLock<HashSet<IpAddr>>,
 
-    /// Channel bindings: channel_id -> peer_addr
-    pub channels: DashMap<u16, SocketAddr>,
+    /// Channel bindings: channel_id -> binding (peer address + expiry)
+    pub channels: DashMap<u16, ChannelBinding>,
 
-    /// Reverse channel lookup: peer_addr -> channel_id
+    /// Reverse channel lookup: peer_addr -> channel_id. Liveness is decided by
+    /// the forward entry in `channels`; this map may briefly hold a lapsed
+    /// channel number until `cleanup_expired_channels` reaps it.
     pub channels_reverse: DashMap<SocketAddr, u16>,
 
     /// Known peer addresses (learned from traffic)
@@ -96,6 +102,31 @@ pub struct Allocation {
 
     /// Remote ICE ufrag this allocation communicates with (from STUN USERNAME)
     pub ice_remote_ufrag: RwLock<Option<String>>,
+}
+
+/// A channel binding: the bound peer plus the deadline at which it lapses.
+///
+/// RFC 5766 §11 gives channel bindings a 10-minute lifetime, refreshed by a
+/// ChannelBind for the same pair. Without expiry the §11.2 conflict rules
+/// ("channel not bound to a different peer, peer not bound to a different
+/// channel") would hold for the whole life of the allocation, and a client
+/// that legitimately rebinds a peer to a new channel number - libwebrtc does
+/// exactly this when a `TurnEntry` is torn down and recreated for the same
+/// address after an ICE restart, having advanced its channel counter - would
+/// get a permanent 400 for the rest of the call.
+#[derive(Debug)]
+pub struct ChannelBinding {
+    /// Peer this channel is bound to.
+    pub peer_addr: SocketAddr,
+    /// Coarse-clock deadline; the binding is lapsed once `now >= expires_ms`.
+    pub expires_ms: AtomicU64,
+}
+
+impl ChannelBinding {
+    #[inline]
+    fn is_live(&self, now_ms: u64) -> bool {
+        now_ms < self.expires_ms.load(Ordering::Relaxed)
+    }
 }
 
 /// Information about a known peer
@@ -203,20 +234,40 @@ impl Allocation {
         self.permissions.read().len()
     }
 
-    /// Bind a channel to a peer address.
+    /// Bind a channel to a peer address, or refresh an existing binding.
     ///
     /// Keeps `channels` and `channels_reverse` consistent: if the channel was
     /// previously bound to another peer, or the peer to another channel, the
     /// stale entries are removed. Otherwise traffic from the old peer would
     /// still be framed with a channel number the client now associates with
-    /// the new peer. (The handler rejects such conflicting binds with 400 per
-    /// RFC 5766 §11.2; this is defense-in-depth.)
+    /// the new peer. (The handler rejects conflicting binds with 400 per RFC
+    /// 5766 §11.2 while the old binding is live; this also covers the rebind
+    /// that becomes legal once it has lapsed.)
     pub fn bind_channel(&self, channel: u16, peer_addr: SocketAddr) {
-        if let Some(old_peer) = self.channels.insert(channel, peer_addr) {
-            if old_peer != peer_addr {
-                self.channels_reverse.remove(&old_peer);
+        let expires_ms = coarse_now_ms() + CHANNEL_LIFETIME_MS;
+
+        match self.channels.entry(channel) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                let old_peer = e.get().peer_addr;
+                if old_peer == peer_addr {
+                    // Refresh in place.
+                    e.get().expires_ms.store(expires_ms, Ordering::Relaxed);
+                } else {
+                    e.replace_entry(ChannelBinding {
+                        peer_addr,
+                        expires_ms: AtomicU64::new(expires_ms),
+                    });
+                    self.channels_reverse.remove(&old_peer);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(ChannelBinding {
+                    peer_addr,
+                    expires_ms: AtomicU64::new(expires_ms),
+                });
             }
         }
+
         if let Some(old_channel) = self.channels_reverse.insert(peer_addr, channel) {
             if old_channel != channel {
                 self.channels.remove(&old_channel);
@@ -224,22 +275,59 @@ impl Allocation {
         }
     }
 
-    /// Number of channels currently bound.
+    /// Number of channels currently bound and not yet lapsed.
     #[inline]
     pub fn channels_count(&self) -> usize {
-        self.channels.len()
+        let now_ms = coarse_now_ms();
+        self.channels
+            .iter()
+            .filter(|e| e.value().is_live(now_ms))
+            .count()
     }
 
-    /// Get channel for a peer address
+    /// Get the live channel bound to a peer address.
+    ///
+    /// The forward entry is authoritative: `channels_reverse` can outlive it
+    /// between cleanup passes.
     #[inline]
     pub fn channel_for_peer(&self, peer_addr: SocketAddr) -> Option<u16> {
-        self.channels_reverse.get(&peer_addr).map(|r| *r)
+        let channel = *self.channels_reverse.get(&peer_addr)?;
+        let binding = self.channels.get(&channel)?;
+        if binding.peer_addr == peer_addr && binding.is_live(coarse_now_ms()) {
+            Some(channel)
+        } else {
+            None
+        }
     }
 
-    /// Get peer address for a channel
+    /// Get the peer address bound to a channel, if the binding is still live.
     #[inline]
     pub fn peer_for_channel(&self, channel: u16) -> Option<SocketAddr> {
-        self.channels.get(&channel).map(|r| *r)
+        let binding = self.channels.get(&channel)?;
+        if binding.is_live(coarse_now_ms()) {
+            Some(binding.peer_addr)
+        } else {
+            None
+        }
+    }
+
+    /// Drop channel bindings whose 10-minute lifetime has elapsed, freeing the
+    /// channel number and the peer for a fresh bind.
+    pub fn cleanup_expired_channels(&self) {
+        let now_ms = coarse_now_ms();
+        let mut lapsed: Vec<(u16, SocketAddr)> = Vec::new();
+        for entry in self.channels.iter() {
+            if !entry.value().is_live(now_ms) {
+                lapsed.push((*entry.key(), entry.value().peer_addr));
+            }
+        }
+        for (channel, peer_addr) in lapsed {
+            self.channels.remove(&channel);
+            // Only clear the reverse entry if it still points at this channel;
+            // a concurrent rebind may already have claimed the peer.
+            self.channels_reverse
+                .remove_if(&peer_addr, |_, &ch| ch == channel);
+        }
     }
 
     /// Update last activity time (lock-free, uses coarse timestamp)
@@ -762,6 +850,17 @@ impl AllocationTable {
         }
     }
 
+    /// Drop lapsed channel bindings across every allocation (RFC 5766 §11).
+    ///
+    /// Touches only each allocation's own channel maps, never a secondary
+    /// index, so it does not participate in the `allocations`-before-index
+    /// lock order documented above.
+    pub fn cleanup_channel_bindings(&self) {
+        for entry in self.allocations.iter() {
+            entry.value().cleanup_expired_channels();
+        }
+    }
+
     /// Remove expired allocations (atomic per-entry removal)
     /// Returns the list of client IPs whose allocations were removed
     pub fn cleanup_expired(&self) -> Vec<IpAddr> {
@@ -916,6 +1015,125 @@ fn generate_ufrag() -> String {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    // ---- channel binding lifetime (RFC 5766 §11) ----------------------------
+
+    /// Force a binding past its deadline without waiting out the real lifetime.
+    fn lapse(alloc: &Allocation, channel: u16) {
+        alloc
+            .channels
+            .get(&channel)
+            .expect("channel bound")
+            .expires_ms
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn lapsed_channel_binding_frees_the_peer_for_a_new_channel() {
+        // RFC 5766 §11.2 forbids rebinding a peer to a different channel only
+        // while the binding is live; §11 caps that at 10 minutes. libwebrtc
+        // rebinds the same peer to a higher channel number after a TurnEntry is
+        // destroyed and recreated (ICE restart), so a conflict that never
+        // lapsed would 400 for the rest of the allocation.
+        let alloc = Allocation::new(
+            "198.51.100.5:50000".parse().unwrap(),
+            "u".to_string(),
+            600,
+            [0u8; 12],
+        );
+        let peer: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+
+        alloc.bind_channel(0x4000, peer);
+        assert_eq!(alloc.channel_for_peer(peer), Some(0x4000));
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+
+        lapse(&alloc, 0x4000);
+
+        // The lapsed binding is invisible, so the handler sees no conflict.
+        assert_eq!(alloc.channel_for_peer(peer), None);
+        assert_eq!(alloc.peer_for_channel(0x4000), None);
+        assert_eq!(alloc.channels_count(), 0);
+
+        // ... and the peer may be bound to a fresh channel number.
+        alloc.bind_channel(0x4001, peer);
+        assert_eq!(alloc.channel_for_peer(peer), Some(0x4001));
+        assert_eq!(alloc.peer_for_channel(0x4001), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+    }
+
+    #[test]
+    fn rebinding_same_pair_refreshes_the_lifetime() {
+        let alloc = Allocation::new(
+            "198.51.100.5:50000".parse().unwrap(),
+            "u".to_string(),
+            600,
+            [0u8; 12],
+        );
+        let peer: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+
+        alloc.bind_channel(0x4000, peer);
+        lapse(&alloc, 0x4000);
+        assert_eq!(alloc.peer_for_channel(0x4000), None);
+
+        // A ChannelBind for the same pair revives it rather than allocating a
+        // second slot.
+        alloc.bind_channel(0x4000, peer);
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+    }
+
+    #[test]
+    fn cleanup_expired_channels_reaps_both_maps() {
+        let table = AllocationTable::new();
+        let client: SocketAddr = "198.51.100.5:50000".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+        let peer: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+        let live_peer: SocketAddr = "203.0.113.21:5000".parse().unwrap();
+
+        {
+            let alloc = table.get(id).unwrap();
+            alloc.bind_channel(0x4000, peer);
+            alloc.bind_channel(0x4001, live_peer);
+            lapse(&alloc, 0x4000);
+        }
+
+        table.cleanup_channel_bindings();
+
+        let alloc = table.get(id).unwrap();
+        assert!(alloc.channels.get(&0x4000).is_none());
+        assert!(
+            alloc.channels_reverse.get(&peer).is_none(),
+            "reverse entry must not outlive the binding"
+        );
+        // The still-live binding is untouched.
+        assert_eq!(alloc.peer_for_channel(0x4001), Some(live_peer));
+        assert_eq!(alloc.channel_for_peer(live_peer), Some(0x4001));
+    }
+
+    #[test]
+    fn rebinding_a_channel_to_a_new_peer_clears_the_old_reverse_entry() {
+        let alloc = Allocation::new(
+            "198.51.100.5:50000".parse().unwrap(),
+            "u".to_string(),
+            600,
+            [0u8; 12],
+        );
+        let old: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+        let new: SocketAddr = "203.0.113.21:5000".parse().unwrap();
+
+        alloc.bind_channel(0x4000, old);
+        alloc.bind_channel(0x4000, new);
+
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(new));
+        assert_eq!(alloc.channel_for_peer(new), Some(0x4000));
+        assert_eq!(
+            alloc.channel_for_peer(old),
+            None,
+            "old peer must not keep a channel the client reassigned"
+        );
+        assert_eq!(alloc.channels_count(), 1);
+    }
 
     #[test]
     fn test_create_allocation() {

@@ -419,15 +419,45 @@ impl RelayEngine {
                 }
             }
         } else {
-            // Is the peer another TURN client on this server? Snapshot its id
-            // and reverse channel, release the guard, then send.
-            let target = self.allocations.get_by_client(peer_addr).map(|t| Delivery {
-                id: t.id,
-                client_addr: t.client_addr,
-                channel: t.channel_for_peer(src_addr),
+            // A client must not be able to bounce its own ChannelData back to
+            // its own transport address.
+            if peer_addr == src_addr {
+                trace!("ChannelData from {} targeting itself dropped", src_addr);
+                return Ok(());
+            }
+
+            // Is the peer another TURN client on this server? Snapshot its id,
+            // relay-IP permission and reverse channel, release the guard, then
+            // send.
+            //
+            // Delivering into another client's allocation means that
+            // allocation's permissions apply as well (RFC 5766 §10.3) - the
+            // sender's channel bind only authorises the sender's half. Same
+            // relay-IP convention as every other client-to-client path.
+            let target = self.allocations.get_by_client(peer_addr).map(|t| {
+                (
+                    t.is_permitted(self.config.external_ip),
+                    Delivery {
+                        id: t.id,
+                        client_addr: t.client_addr,
+                        channel: t.channel_for_peer(src_addr),
+                    },
+                )
             });
 
-            if let Some(d) = target {
+            if let Some((permitted, d)) = target {
+                // A client of ours with no permission for the relay IP: drop
+                // rather than falling through to the raw send, which would put
+                // the same bytes on the same socket unwrapped.
+                if !permitted {
+                    trace!(
+                        "ChannelData from {} to TURN client {} dropped: target has no \
+                         permission for the relay IP",
+                        src_addr,
+                        peer_addr
+                    );
+                    return Ok(());
+                }
                 debug!(
                     "ChannelData relay: {} -> {} via channel {} ({})",
                     src_addr,

@@ -140,6 +140,10 @@ impl Server {
                     }
                 }
 
+                // Reap channel bindings past their 10-minute lifetime, so the
+                // channel number and the peer are free to be bound again.
+                cleanup_allocations.cleanup_channel_bindings();
+
                 // Cleanup stale rate limiter entries
                 cleanup_rate_limiter.cleanup();
             }

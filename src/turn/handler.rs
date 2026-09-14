@@ -64,6 +64,24 @@ pub(crate) fn is_forbidden_peer_addr(config: &Config, addr: SocketAddr) -> bool 
         || (addr.ip() == config.external_ip && addr.port() != config.port)
 }
 
+/// Where a Send indication's payload should go once the sender's own
+/// permission has been verified.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SendTarget {
+    /// Another TURN client of this server, plus the channel it has bound back
+    /// to the sender (if any). The payload is wrapped rather than forwarded
+    /// raw: a raw datagram from our relay address would be discarded by the
+    /// target's TURN stack.
+    Local {
+        id: AllocationId,
+        reverse_channel: Option<u16>,
+    },
+    /// Not one of our clients - forward the raw payload.
+    External,
+    /// Drop the payload.
+    Drop,
+}
+
 impl TurnHandler {
     /// Create a new handler
     pub fn new(
@@ -75,6 +93,43 @@ impl TurnHandler {
             config,
             allocations,
             rate_limiter,
+        }
+    }
+
+    /// Decide where a Send indication's payload should go.
+    ///
+    /// The caller has already checked that the *sender* holds a permission for
+    /// `peer_addr`. That only authorises the sender's half: when the peer turns
+    /// out to be another client of this server, the payload is delivered into
+    /// that client's allocation as a Data Indication / ChannelData, so its
+    /// permissions apply as well (RFC 5766 §10.3). Without that second check
+    /// any client could hand any other client arbitrary application data - and
+    /// keep its allocation alive indefinitely with the accompanying touch - by
+    /// creating a permission for the victim's IP, which nothing restricts.
+    ///
+    /// The relay-IP convention matches every other client-to-client path here:
+    /// a WebRTC client permits the relay address, which is where peer traffic
+    /// appears to come from on this single-port server.
+    fn classify_send_target(&self, src_addr: SocketAddr, peer_addr: SocketAddr) -> SendTarget {
+        // Never bounce a well-formed indication back at the sender.
+        if peer_addr == src_addr {
+            return SendTarget::Drop;
+        }
+        match self.allocations.get_by_client(peer_addr) {
+            Some(target) => {
+                if target.is_permitted(self.config.external_ip) {
+                    SendTarget::Local {
+                        id: target.id,
+                        reverse_channel: target.channel_for_peer(src_addr),
+                    }
+                } else {
+                    // A client of ours with no permission for the relay IP.
+                    // Drop rather than falling back to the raw send, which
+                    // would put the same bytes on the same socket unwrapped.
+                    SendTarget::Drop
+                }
+            }
+            None => SendTarget::External,
         }
     }
 
@@ -833,7 +888,10 @@ impl TurnHandler {
                 let bound_channel = alloc.channel_for_peer(peer_addr);
                 match (bound_peer, bound_channel) {
                     // RFC 5766 §11.2: a channel may not be rebound to a different
-                    // peer, nor a peer to a different channel, while bound.
+                    // peer, nor a peer to a different channel, while bound. Both
+                    // accessors report only *live* bindings, so a pair whose
+                    // 10-minute lifetime (§11) has lapsed is free to be rebound
+                    // rather than conflicting for the life of the allocation.
                     (Some(p), _) if p != peer_addr => Bind::Conflict,
                     (_, Some(c)) if c != channel => Bind::Conflict,
                     // Identical binding: refresh, consumes no new slot.
@@ -1157,17 +1215,18 @@ impl TurnHandler {
             return Ok(());
         }
 
-        // Relay data to peer. If the peer is another TURN client of this server,
-        // a raw datagram would arrive on its TURN control socket from our relay
-        // address and be discarded by its TURN stack; wrap it in ChannelData or
-        // a Data Indication exactly as the ChannelData path in the relay engine
-        // does. Snapshot the target under a short guard, release, then send.
-        let target = self
-            .allocations
-            .get_by_client(peer_addr)
-            .map(|t| (t.id, t.channel_for_peer(src_addr)));
-        match target {
-            Some((target_id, reverse_channel)) => {
+        // Decide where the payload goes under a short guard, release it, then
+        // send: the arms below await, and an allocation guard must never be
+        // held across I/O.
+        match self.classify_send_target(src_addr, peer_addr) {
+            SendTarget::Drop => {
+                trace!("Send indication from {} to {} dropped", src_addr, peer_addr);
+                return Ok(());
+            }
+            SendTarget::Local {
+                id: target_id,
+                reverse_channel,
+            } => {
                 debug!(
                     "Relaying {} bytes from {} to TURN client {} via {}",
                     data.len(),
@@ -1187,7 +1246,7 @@ impl TurnHandler {
                     t.touch();
                 }
             }
-            None => {
+            SendTarget::External => {
                 debug!(
                     "Relaying {} bytes from {} to peer {}",
                     data.len(),
@@ -1803,8 +1862,8 @@ mod tests {
     // ---- helpers for the handler-level tests below -------------------------
 
     use super::{
-        AllocationTable, Config, RateLimiter, StunClass, StunInfo, StunMethod, TurnAuth,
-        TurnErrorCode, TurnHandler,
+        AllocationTable, Config, RateLimiter, SendTarget, StunClass, StunInfo, StunMethod,
+        TurnAuth, TurnErrorCode, TurnHandler,
     };
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -2173,6 +2232,87 @@ mod tests {
     }
 
     // ---- Send indication ----------------------------------------------------
+
+    #[test]
+    fn send_to_turn_client_without_relay_permission_is_dropped() {
+        // RFC 5766 §10.3: peer data must not be relayed to a client that has no
+        // matching permission. A Send indication aimed at another client of this
+        // server is delivered *into* that client's allocation as a Data
+        // Indication, so the target's permissions apply too - the sender's
+        // permission for the target's IP (which nothing restricts a client from
+        // creating) only covers the sender's half. Without this, any client
+        // could inject application data into any other client's allocation and
+        // keep it alive indefinitely with the accompanying touch.
+        let (h, table) = handler();
+        let attacker = sa("198.51.100.5:50000");
+        let victim = sa("198.51.100.9:50001");
+        table.create(attacker, "attacker".to_string(), 600);
+        let victim_id = table.create(victim, "victim".to_string(), 600);
+
+        // The victim never permitted the relay IP.
+        assert_eq!(
+            h.classify_send_target(attacker, victim),
+            SendTarget::Drop,
+            "unpermitted TURN client must not be handed peer data"
+        );
+
+        // Once it does, the normal client-to-client path is available again.
+        table.get(victim_id).unwrap().add_permission(ip(RELAY_IP));
+        assert_eq!(
+            h.classify_send_target(attacker, victim),
+            SendTarget::Local {
+                id: victim_id,
+                reverse_channel: None,
+            }
+        );
+    }
+
+    #[test]
+    fn send_to_self_is_dropped() {
+        let (h, table) = handler();
+        let client = sa("198.51.100.5:50000");
+        let id = table.create(client, "u".to_string(), 600);
+        table.get(id).unwrap().add_permission(ip(RELAY_IP));
+
+        // Even a fully permitted client must not get its own payload bounced
+        // back to it as a well-formed Data Indication.
+        assert_eq!(h.classify_send_target(client, client), SendTarget::Drop);
+    }
+
+    #[test]
+    fn send_to_non_client_peer_is_forwarded_raw() {
+        // The external-peer path is unaffected by the permission gate above.
+        let (h, table) = handler();
+        let client = sa("198.51.100.5:50000");
+        table.create(client, "u".to_string(), 600);
+
+        assert_eq!(
+            h.classify_send_target(client, sa("203.0.113.77:9000")),
+            SendTarget::External
+        );
+    }
+
+    #[test]
+    fn send_to_turn_client_uses_its_reverse_channel() {
+        let (h, table) = handler();
+        let a = sa("198.51.100.5:50000");
+        let b = sa("198.51.100.9:50001");
+        table.create(a, "a".to_string(), 600);
+        let b_id = table.create(b, "b".to_string(), 600);
+        {
+            let b_alloc = table.get(b_id).unwrap();
+            b_alloc.add_permission(ip(RELAY_IP));
+            b_alloc.bind_channel(0x4004, a);
+        }
+
+        assert_eq!(
+            h.classify_send_target(a, b),
+            SendTarget::Local {
+                id: b_id,
+                reverse_channel: Some(0x4004),
+            }
+        );
+    }
 
     #[tokio::test]
     async fn send_indication_without_target_does_not_arm_orphan_timer() {
