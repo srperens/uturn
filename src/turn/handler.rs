@@ -1079,9 +1079,10 @@ impl TurnHandler {
                 None => return Ok(()),
             };
 
-            // Try targeted routing via ICE ufrags to avoid cross-talk between
-            // unrelated calls. Only fall back to broadcast for the very first
-            // STUN packet before any ufrag is registered.
+            // Route via ICE ufrags to avoid cross-talk between unrelated calls.
+            // If no ufrag matches (the target has not registered yet), the
+            // payload is dropped, not broadcast: STUN retransmits the check and
+            // a later copy routes once the peer is up.
             let mut sent = false;
 
             // For STUN Binding Requests: register sender ufrags and route by target ufrag

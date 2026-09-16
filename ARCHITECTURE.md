@@ -118,7 +118,7 @@ fn find_ice_peers(sender_local: &str, sender_remote: &str) -> Vec<AllocationId> 
 }
 ```
 
-The ICE ufrag pairing is learned atomically on the first STUN Binding Request using DashMap's entry API, preventing duplicate registrations when the same STUN message is broadcast to multiple allocations.
+The ICE ufrag pairing is learned atomically on the first STUN Binding Request using DashMap's entry API. The claim is first-come-first-served: the first allocation to register a given ICE ufrag owns it, and a later registration of the same ufrag is refused. This makes the pairing stable, but it is **not** bound to the authenticated TURN username — see the Security Considerations section for what that means for trust.
 
 ### 3. Allocation Manager
 
@@ -185,8 +185,17 @@ impl TurnHandler {
 ### 5. Relay Engine
 
 Forwards media between peers and clients using targeted ICE ufrag-based routing.
-No broadcast is used — all packets are routed to the specific matched peer, or dropped
-if no match exists. This prevents cross-talk between unrelated calls.
+Media, DTLS and ICE connectivity checks are routed to the specific ufrag-matched
+peer, or dropped if no match exists — no broadcast — which prevents cross-talk
+between unrelated calls.
+
+(One path is not yet ufrag-targeted: a relayed STUN *response* from a client
+[`handle_client_response`] is fanned out to every allocation that permits the
+responder's source IP. A response carries no USERNAME, so it does not disclose a
+ufrag pair, and in the normal single-port model — where clients permit the relay
+IP rather than each other — this matches nothing; it only fans out when clients
+share a public IP. Tightening it to ufrag-targeted delivery is tracked as
+follow-up work.)
 
 **ChannelData routing (STUN)** — 3-tier targeted routing:
 
@@ -217,12 +226,13 @@ if !peers.is_empty() {
 }
 ```
 
-**Send Indication routing** — targeted with first-packet broadcast fallback:
+**Send Indication routing** — targeted, or drop:
 
 ```rust
 // ICE checks arrive here before channel binding. Register ufrags and
-// route to target by ufrag lookup. Only the very first STUN packet
-// (before peer has registered) falls back to broadcast.
+// route to the one target named by the check's USERNAME. If that target
+// has not registered yet, drop: STUN retransmits the check (RFC 5389
+// §7.2.1) and a later copy routes once the peer is up. No broadcast.
 if is_stun_binding_request(data) {
     register_ice_ufrags(alloc.id, local_ufrag, remote_ufrag);
     if let Some(target) = lookup_by_ice_ufrag(&remote_ufrag) {
@@ -230,8 +240,16 @@ if is_stun_binding_request(data) {
     }
 }
 if !sent { find_ice_peers() → send_to(peers); }
-if !sent { broadcast();  /* first-packet only */ }
+if !sent { drop; }
 ```
+
+The same holds for the ICE check that arrives as a direct STUN Binding
+Request (`handle_binding_request`): it is delivered only to the allocation
+whose ICE ufrag the USERNAME names, or dropped. A check's USERNAME carries
+both ufrags of the call, so delivering it to any other client would disclose
+that pair — and because ufrag registration is first-come-first-served, a
+disclosed pair is enough to hijack the call's routing. See the Security
+Considerations section.
 
 **Peer → Client relay:**
 
@@ -379,10 +397,16 @@ match self.by_ice_ufrag.entry(local_ufrag) {
 
 ### No Broadcast Routing
 
-After ICE ufrag registration, all packet types (STUN, DTLS, RTP) are routed exclusively
-to the matched peer. Unmatched RTP and DTLS are dropped, not broadcast. The only remaining
-broadcast path is for the very first STUN packet in a new call, before the peer has registered
-its ufrag. This eliminates cross-talk between concurrent unrelated calls.
+All client-to-client packet types (STUN connectivity checks, DTLS, RTP) are routed
+exclusively to the ufrag-matched peer. When no peer matches — including the very
+first check of a call, before the addressed peer has registered its ufrag — the
+packet is dropped, not broadcast; STUN retransmission (RFC 5389 §7.2.1) recovers
+the setup case. This eliminates cross-talk between concurrent unrelated calls and,
+because a check's USERNAME carries the call's ufrag pair, avoids disclosing it to
+unrelated clients.
+
+(The one exception is the relayed STUN *response* path noted under the Relay
+Engine, which still fans out by source-IP permission and carries no ufrag pair.)
 
 ## State Machine
 
@@ -500,10 +524,49 @@ struct AllocationManager {
 
 ## Security Considerations
 
-1. **Authentication**: Long-term credentials (HMAC-SHA1)
-2. **Permissions**: Only relay to explicitly permitted peers
-3. **Rate limiting**: Per-client allocation limits
-4. **Amplification**: Validate source before relaying
+1. **Authentication**: Long-term credentials (RFC 5389), verified by
+   MESSAGE-INTEGRITY on every request. Static credentials are shared across
+   clients unless the deployment issues per-user or ephemeral ones.
+2. **Permissions**: Peer permissions are enforced (RFC 5766 §9), but note they
+   provide **little isolation between calls in single-port mode**: every client
+   shares one relay address and auto-grants a permission for it, so all clients
+   permit the same target. Separation between concurrent calls rests on ICE
+   ufrag routing, not on permissions.
+3. **Rate limiting**: Per-IP allocation quota and request rate. There is no
+   global allocation cap, and quotas key on the full IP, so an actor with an
+   IPv6 prefix has many independent quotas.
+4. **Amplification / SSRF**: Loopback, multicast, broadcast, link-local (incl.
+   cloud metadata) and the relay host's other ports are refused as peers.
+   Private ranges (RFC 1918, ULA, CGNAT) are **allowed by default** — intended
+   for on-prem/lab use, but it means a client can reach private networks the
+   relay host can see.
+
+### Trust model and known limitation
+
+The single-port design routes client-to-client traffic by **ICE ufrag**, a
+label the client asserts in the STUN USERNAME. That claim is **not
+authenticated**: `register_ice_ufrags` is first-come-first-served and is not
+bound to the authenticated TURN username. The MESSAGE-INTEGRITY on the inner ICE
+check is keyed with the ICE password, which this server does not hold, so it
+cannot verify the claim.
+
+Consequence: a party that knows a call's ufrag — a leaked/observed SDP, an
+on-path observer, or the call's own counterparty — can claim it before the real
+peer and take over that call's routing (the real peer's own registration then
+loses the race and its media is dropped). Media stays confidential regardless,
+because DTLS-SRTP is end-to-end and its certificate is pinned by the SDP
+fingerprint; the exposure is hijack, denial of service, and metadata, not
+plaintext. ICE ufrags are regenerated per call, so a stolen ufrag is a
+single-call, single-use capability, not a durable key.
+
+Not fixed by ufrag routing alone. Closing it requires verifying the claim —
+e.g. call-scoped ephemeral credentials carrying a call id, giving the server the
+ICE password, or handing each allocation its own relay address (removing the
+need to infer pairing at all). Until then, deployments should treat ufrag
+secrecy as best-effort and rely on DTLS-SRTP for confidentiality.
+
+Not yet implemented: TURNS (TLS/DTLS), so on-path observers can read STUN
+USERNAMEs and see who talks to whom.
 
 ## Future Extensions
 
