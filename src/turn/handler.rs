@@ -377,7 +377,10 @@ impl TurnHandler {
 
         // Register ICE ufrags from USERNAME attribute (format: "remoteUfrag:localUfrag").
         // This is critical for single-port TURN to route DTLS/media correctly.
-        if let Some((remote_ufrag, local_ufrag)) = msg.parse_ice_username() {
+        // The parsed pair is kept: `remote_ufrag` also names the one allocation
+        // this check is addressed to, which is what the relay below routes on.
+        let ice_ufrags = msg.parse_ice_username();
+        if let Some((remote_ufrag, local_ufrag)) = &ice_ufrags {
             let registered = self.allocations.register_ice_ufrags(
                 alloc_id,
                 local_ufrag.clone(),
@@ -418,39 +421,54 @@ impl TurnHandler {
             }
         };
 
-        // Relay to other allocations that share the relay-IP permission.
+        // Relay the check to the one allocation it is addressed to.
+        //
+        // An ICE connectivity check names its destination: USERNAME carries
+        // "remoteUfrag:localUfrag", so `remote_ufrag` identifies the peer this
+        // packet is for. Delivering it anywhere else is not just wasted fan-out,
+        // it is a disclosure - the USERNAME would hand every other client on this
+        // server the ufrag pair of a call it has nothing to do with. That pair is
+        // all an attacker needs, because `AllocationTable::register_ice_ufrags` is
+        // first-come-first-served: claim the peer's ufrag before it does and the
+        // reverse-pair lookup in `find_ice_peers` routes that call's media to the
+        // claimant while the real peer, whose own registration now loses the race,
+        // goes dark.
+        //
+        // If the addressed peer has not allocated yet there is nothing to deliver
+        // to. Dropping is correct and free: STUN retransmits the check over its
+        // RTO schedule (RFC 5389 section 7.2.1, ~39.5s), by which time the peer has
+        // registered. No buffering, and no fan-out for an attacker to farm.
         if sender_permitted {
             let relay_addr = SocketAddr::new(self.config.external_ip, self.config.port);
 
-            // Snapshot the relay targets' client addresses without holding any
-            // allocation guard across the awaits below.
-            let targets: Vec<SocketAddr> = self
-                .allocations
-                .lookup_by_peer_ip(self.config.external_ip)
-                .into_iter()
-                .filter_map(|alloc_id| {
-                    let target = self.allocations.get(alloc_id)?;
-                    // Skip the sender's own allocation and targets without
-                    // permission for the relay IP.
-                    if target.client_addr == src_addr
-                        || !target.is_permitted(self.config.external_ip)
-                    {
-                        None
-                    } else {
-                        Some(target.client_addr)
-                    }
-                })
-                .collect();
+            // Snapshot the target's client address without holding an allocation
+            // guard across the await below.
+            let target_addr = ice_ufrags.as_ref().and_then(|(remote_ufrag, _)| {
+                let target_id = self.allocations.lookup_by_ice_ufrag(remote_ufrag)?;
+                let target = self.allocations.get(target_id)?;
+                if target.client_addr == src_addr || !target.is_permitted(self.config.external_ip) {
+                    return None;
+                }
+                Some(target.client_addr)
+            });
 
-            // Relay the Binding Request via Data Indication.
-            // XOR-PEER-ADDRESS = relay address (from receiver's perspective).
-            let indication = self.build_data_indication(relay_addr, &msg.raw);
-            for target_addr in targets {
-                debug!(
-                    "Relaying Binding Request from {} to {} via Data Indication",
-                    src_addr, target_addr
-                );
-                socket.send_to(&indication, target_addr).await?;
+            match target_addr {
+                Some(target_addr) => {
+                    debug!(
+                        "Relaying Binding Request from {} to {} via Data Indication",
+                        src_addr, target_addr
+                    );
+                    // XOR-PEER-ADDRESS = relay address (from receiver's perspective).
+                    let indication = self.build_data_indication(relay_addr, &msg.raw);
+                    socket.send_to(&indication, target_addr).await?;
+                }
+                None => {
+                    trace!(
+                        "Binding Request from {} dropped: no allocation holds target ufrag {:?}",
+                        src_addr,
+                        ice_ufrags.as_ref().map(|(remote, _)| remote),
+                    );
+                }
             }
         }
 
@@ -1141,37 +1159,32 @@ impl TurnHandler {
                 }
             }
 
-            // Last resort: send only to unpaired allocations (no ice_ufrag set yet).
-            // This limits the broadcast to allocations that haven't completed ICE,
-            // preventing leakage to already-established calls.
+            // Nothing matched, so there is nobody to deliver to: drop.
+            //
+            // This used to fall back to a broadcast, restricted to allocations
+            // that had not registered an ICE ufrag yet, on the theory that those
+            // are calls still setting up rather than established ones. That
+            // restriction does not hold. "Unpaired" is not a transient startup
+            // state a client passes through - it is a state a client can simply
+            // choose and stay in, for free and indefinitely: allocate, permit the
+            // relay IP, never send a check carrying a USERNAME, and Refresh every
+            // 30s. `is_inactive` is fed by Refresh (`Allocation::touch_received`)
+            // so the allocation never ages out, and `is_orphaned_sender` returns
+            // false while `has_relay_attempt` is unset, so a purely passive
+            // allocation is never reaped either. Anyone parked like that received
+            // the first connectivity check of every new call on this server -
+            // which is exactly the packet whose USERNAME carries both ufrags of
+            // that call, and that pair is enough to hijack it (see the routing
+            // comment in `handle_binding_request`).
+            //
+            // Dropping costs nothing: STUN retransmits the check over its RTO
+            // schedule (RFC 5389 section 7.2.1), so once the real peer registers, a
+            // retransmit routes to it by ufrag on one of the paths above.
             if !sent {
-                // Snapshot unpaired target addresses before awaiting.
-                let targets: Vec<SocketAddr> = self
-                    .allocations
-                    .lookup_by_peer_ip(self.config.external_ip)
-                    .into_iter()
-                    .filter_map(|alloc_id| {
-                        let target = self.allocations.get(alloc_id)?;
-                        // Skip the sender and allocations that already have ICE
-                        // ufrags (established calls).
-                        if target.client_addr == src_addr || target.get_ice_ufrag().is_some() {
-                            None
-                        } else {
-                            Some(target.client_addr)
-                        }
-                    })
-                    .collect();
-                let indication = self.build_data_indication(our_addr, data);
-                for target_addr in targets {
-                    socket.send_to(&indication, target_addr).await?;
-                    sent = true;
-                }
-                if !sent {
-                    trace!(
-                        "No unpaired target found for internal routing from {}",
-                        src_addr
-                    );
-                }
+                trace!(
+                    "Internal routing from {} dropped: no ufrag match for target",
+                    src_addr
+                );
             }
 
             // Touch sender's allocation - they're actively sending data. A
@@ -2314,6 +2327,109 @@ mod tests {
         );
     }
 
+    /// Assert nothing is delivered to `sock` within a short window.
+    async fn assert_silent(sock: &tokio::net::UdpSocket, who: &str) {
+        let mut buf = vec![0u8; 1500];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sock.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            got.is_err(),
+            "{} received {} bytes it was not addressed in",
+            who,
+            got.map(|r| r.unwrap().0).unwrap_or(0)
+        );
+    }
+
+    /// An allocation permitted for the relay IP that never registers an ICE
+    /// ufrag. Nothing ages it out (Refresh feeds `is_inactive`, and
+    /// `is_orphaned_sender` stays false while it sends nothing), so this is a
+    /// posture an attacker can hold indefinitely. It must never be delivered
+    /// traffic addressed to somebody else.
+    async fn bystander(table: &AllocationTable) -> tokio::net::UdpSocket {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let id = table.create(sock.local_addr().unwrap(), "u".to_string(), 600);
+        table.add_permission(id, ip(RELAY_IP));
+        sock
+    }
+
+    #[tokio::test]
+    async fn binding_request_reaches_only_the_addressed_peer() {
+        let (h, table) = handler();
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let onlooker = bystander(&table).await;
+
+        let sender = sa("127.0.0.1:40010");
+        let sender_id = table.create(sender, "u".to_string(), 600);
+        table.add_permission(sender_id, ip(RELAY_IP));
+        table.register_ice_ufrags(sender_id, "AAAA".to_string(), "BBBB".to_string());
+
+        let peer_id = table.create(peer_sock.local_addr().unwrap(), "u".to_string(), 600);
+        table.add_permission(peer_id, ip(RELAY_IP));
+        table.register_ice_ufrags(peer_id, "BBBB".to_string(), "AAAA".to_string());
+
+        // USERNAME is "remoteUfrag:localUfrag" - addressed to BBBB.
+        let mut req = request(StunMethod::Binding, 0x0001);
+        req.username = Some("BBBB:AAAA".to_string());
+
+        h.handle_binding_request(&req, sender, &server)
+            .await
+            .unwrap();
+
+        // The addressed peer gets it...
+        let delivered = recv(&peer_sock).await;
+        assert!(!delivered.is_empty());
+        // ...and nobody else does. A leaked USERNAME hands over both ufrags of
+        // this call, which is enough to claim BBBB and hijack the routing.
+        assert_silent(&onlooker, "unpaired onlooker").await;
+    }
+
+    #[tokio::test]
+    async fn binding_request_for_an_unregistered_ufrag_is_dropped() {
+        let (h, table) = handler();
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let onlooker = bystander(&table).await;
+
+        let sender = sa("127.0.0.1:40011");
+        let sender_id = table.create(sender, "u".to_string(), 600);
+        table.add_permission(sender_id, ip(RELAY_IP));
+
+        // The peer has not allocated yet - the common case for the first check
+        // of a call. STUN retransmits, so dropping loses nothing.
+        let mut req = request(StunMethod::Binding, 0x0001);
+        req.username = Some("NOTHERE:AAAA".to_string());
+
+        h.handle_binding_request(&req, sender, &server)
+            .await
+            .unwrap();
+
+        assert_silent(&onlooker, "unpaired onlooker").await;
+    }
+
+    #[tokio::test]
+    async fn send_indication_without_a_ufrag_match_is_dropped_not_broadcast() {
+        let (h, table) = handler();
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let onlooker = bystander(&table).await;
+
+        let sender = sa("127.0.0.1:40012");
+        let sender_id = table.create(sender, "u".to_string(), 600);
+        table.add_permission(sender_id, ip(RELAY_IP));
+
+        let mut send = request(StunMethod::Send, 0x0006);
+        send.class = StunClass::Indication;
+        send.xor_peer_addresses = vec![sa(&format!("{}:{}", RELAY_IP, RELAY_PORT))];
+        // Not STUN, and the sender has no ufrags registered: nothing matches.
+        send.data = Some(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        h.handle_send(&send, sender, &server).await.unwrap();
+
+        assert_silent(&onlooker, "unpaired onlooker").await;
+    }
+
     #[tokio::test]
     async fn send_indication_without_target_does_not_arm_orphan_timer() {
         // Internal routing runs during ICE, before a peer exists. Arming the
@@ -2329,8 +2445,8 @@ mod tests {
         let mut send = request(StunMethod::Send, 0x0006);
         send.class = StunClass::Indication;
         send.xor_peer_addresses = vec![sa(&format!("{}:{}", RELAY_IP, RELAY_PORT))];
-        // Not a STUN message, so the ICE-ufrag routing branch is skipped and the
-        // broadcast fallback finds no unpaired target but the sender itself.
+        // Not a STUN message, so the ICE-ufrag routing branch is skipped and
+        // nothing matches: the payload is dropped.
         send.data = Some(vec![0xde, 0xad, 0xbe, 0xef]);
 
         h.handle_send(&send, client, &socket).await.unwrap();
