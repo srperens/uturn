@@ -1,4 +1,7 @@
-//! uTURN - Single-port TURN relay server
+//! uTURN - Single-port TURN relay for WebRTC
+//!
+//! Client-to-client traffic through the shared relay address is routed by ICE
+//! ufrag, so both sides must be ICE agents. See ARCHITECTURE.md for scope.
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -10,7 +13,17 @@ use uturn::{Config, Server};
 
 #[derive(Parser, Debug)]
 #[command(name = "uturn")]
-#[command(about = "A single-port TURN relay server for WebRTC")]
+#[command(about = "Single-port TURN relay for WebRTC")]
+#[command(
+    long_about = "Single-port TURN relay for WebRTC. Internal (client-to-client) \
+and external (client-to-peer) traffic are routed over this one UDP port, so \
+there is a single port to expose rather than a relay port range.\n\n\
+Client-to-client relaying through the shared single-port relay address is \
+routed by ICE ufrag, so both sides must be ICE agents. Plain client-to-\
+external-peer relaying follows RFC 5766 and works with any TURN client. \
+This is not a drop-in general-purpose TURN server: no TCP, no TURNS, and \
+all clients share one relay address."
+)]
 #[command(version)]
 struct Args {
     /// UDP port to listen on
