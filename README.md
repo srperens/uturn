@@ -2,6 +2,18 @@
 
 A single-port TURN relay server for WebRTC.
 
+> **Scope: this is a WebRTC-focused relay, not a general-purpose TURN server.**
+>
+> Every client shares one relay address, so client-to-client traffic cannot be
+> resolved from the destination address alone. uTURN routes it by the **ICE
+> ufrag** carried in the STUN USERNAME, which means both sides must be ICE
+> agents — in practice, WebRTC endpoints. Plain client-to-external-peer
+> relaying follows RFC 5766 and works with any TURN client.
+>
+> It is not a drop-in replacement for coturn: no TCP transport, no TURNS
+> (TLS/DTLS), and no per-allocation relay address. If you need a
+> standards-complete TURN deployment, use coturn.
+
 ## Why?
 
 Standard TURN servers require a **port range** (typically 49152-65535) for relay traffic. This is problematic for:
@@ -67,7 +79,7 @@ docker run -p 3478:3478/udp \
 
 ## Testing
 
-Test with `turnutils_uclient` and `turnutils_peer` from [coturn](https://github.com/coturn/coturn):
+Test with `turnutils_uclient` and `turnutils_peer` from [coturn](https://github.com/coturn/coturn). This exercises the client-to-external-peer path (RFC 5766), not the ufrag-routed client-to-client path — that one needs real ICE agents:
 
 ```bash
 # Start a peer server on the TURN server (or any reachable host)
@@ -94,7 +106,7 @@ Note: The `-y` self-test flag doesn't work with single-port TURN since client an
 - [x] ChannelBind
 - [x] Send/Data Indications
 - [x] Long-term credentials (RFC 5389)
-- [x] Client-to-client relay (single-port mode)
+- [x] Client-to-client relay (single-port mode, ICE ufrag routed)
 - [ ] TCP TURN
 - [ ] TURNS (TLS/DTLS)
 - [ ] REST API for ephemeral credentials
