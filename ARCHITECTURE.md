@@ -10,7 +10,23 @@ uTURN carries both internal (client-to-client) and external (client-to-peer) tra
 
 That single shared relay address is what makes the design WebRTC-specific. With one address for every client, a client-to-client packet's destination says nothing about which peer it is for, so the pairing has to be inferred from the payload: uTURN routes by the **ICE ufrag** in the STUN USERNAME (see [Relay Engine](#5-relay-engine)). Both sides must therefore be ICE agents. Client-to-external-peer relaying takes the ordinary RFC 5766 path and is not ufrag-dependent, so a generic TURN client works there.
 
-Deliberately out of scope: TCP transport, TURNS (TLS/DTLS), and per-allocation relay addresses. uTURN is not a drop-in replacement for a standards-complete TURN server.
+### Deviation from the TURN spec
+
+The shared relay address is not an unimplemented feature, it is a deliberate deviation. RFC 5766 Section 5 requires:
+
+> Both the relayed transport address and the 5-tuple MUST be unique across all allocations, so either one can be used to uniquely identify the allocation.
+
+RFC 8656 Section 6 carries the same requirement forward for the relayed transport address. uTURN honours the 5-tuple half — a client is still identified by its source address — and gives up the other half. Everything else in this document follows from that: with one relayed transport address shared by every allocation, a packet arriving for that address cannot be attributed to an allocation by its destination, so the pairing has to come from the payload, which is what the ICE ufrag provides and why both parties must be ICE agents.
+
+This is the objection raised against single-port TURN in [pion/turn#284](https://github.com/pion/turn/issues/284), where the same thread also sketches the way out that uTURN takes: track the ICE connectivity checks and derive the pairing from them.
+
+### Scaling
+
+All allocation state lives in this process (`AllocationTable`'s `DashMap`s; there is no shared store), and client-to-client relaying resolves both parties inside one instance. So an instance is the unit of consistency: every participant of a call must reach the same one.
+
+This rules out putting several replicas behind one load-balanced address. Kubernetes Services in particular pick "a backend Pod at random" by default; `sessionAffinity: ClientIP` pins each client to a pod, but two clients have two source IPs and may still be pinned to different pods, and neither would see the other's ufrag registration. Scale out by adding instances with their own addresses and directing a whole call to one of them.
+
+Deliberately out of scope: TCP transport, TURNS (TLS/DTLS), per-allocation relay addresses, and any form of clustering.
 
 ## System Architecture
 
