@@ -6,6 +6,8 @@ uTURN is a WebRTC-focused TURN server that operates on a single UDP port. Unlike
 
 ### Scope
 
+uTURN carries both internal (client-to-client) and external (client-to-peer) traffic over the one UDP port it listens on, so there is a single port to expose rather than a relay port range. That matters anywhere a port range is awkward — Kubernetes Services, restrictive firewalls, a single NAT port forward. (For the Kubernetes case specifically, see the STUNner comparison in the README: STUNner terminates TURN at the cluster edge and relies on pod networking for the media path, where uTURN keeps that path on its single port.)
+
 That single shared relay address is what makes the design WebRTC-specific. With one address for every client, a client-to-client packet's destination says nothing about which peer it is for, so the pairing has to be inferred from the payload: uTURN routes by the **ICE ufrag** in the STUN USERNAME (see [Relay Engine](#5-relay-engine)). Both sides must therefore be ICE agents. Client-to-external-peer relaying takes the ordinary RFC 5766 path and is not ufrag-dependent, so a generic TURN client works there.
 
 Deliberately out of scope: TCP transport, TURNS (TLS/DTLS), and per-allocation relay addresses. uTURN is not a drop-in replacement for a standards-complete TURN server.
