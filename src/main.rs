@@ -1,16 +1,29 @@
-//! uTURN - Single-port TURN relay server
+//! uTURN - Single-port TURN relay for WebRTC
+//!
+//! Client-to-client traffic through the shared relay address is routed by ICE
+//! ufrag, so both sides must be ICE agents. See ARCHITECTURE.md for scope.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use tokio::signal;
-use tracing::{info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use uturn::{Config, Server};
 
 #[derive(Parser, Debug)]
 #[command(name = "uturn")]
-#[command(about = "A single-port TURN relay server for WebRTC")]
+#[command(about = "Single-port TURN relay for WebRTC")]
+#[command(
+    long_about = "Single-port TURN relay for WebRTC. Internal (client-to-client) \
+and external (client-to-peer) traffic are routed over this one UDP port, so \
+there is a single port to expose rather than a relay port range.\n\n\
+Client-to-client relaying through the shared single-port relay address is \
+routed by ICE ufrag, so both sides must be ICE agents. Plain client-to-\
+external-peer relaying follows RFC 5766 and works with any TURN client. \
+This is not a drop-in general-purpose TURN server: no TCP, no TURNS, and \
+all clients share one relay address."
+)]
 #[command(version)]
 struct Args {
     /// UDP port to listen on
@@ -44,6 +57,20 @@ struct Args {
     /// Nonce validity period in seconds
     #[arg(long, env = "UTURN_NONCE_LIFETIME", default_value = "3600")]
     nonce_lifetime_secs: u64,
+
+    /// Run as an open relay with no authentication. Without this flag the
+    /// server refuses to start when no `--user` is configured. Exposing an
+    /// anonymous relay on the public internet will be abused.
+    #[arg(long, env = "UTURN_ALLOW_ANONYMOUS", default_value = "false")]
+    allow_anonymous: bool,
+
+    /// Maximum number of peer IP permissions per allocation
+    #[arg(long, env = "UTURN_MAX_PERMISSIONS", default_value = "64")]
+    max_permissions_per_alloc: usize,
+
+    /// Maximum number of bound channels per allocation
+    #[arg(long, env = "UTURN_MAX_CHANNELS", default_value = "128")]
+    max_channels_per_alloc: usize,
 }
 
 #[tokio::main]
@@ -71,6 +98,15 @@ async fn main() -> Result<()> {
         })
         .collect();
 
+    if credentials.is_empty() && !args.allow_anonymous {
+        error!("No credentials configured. Refusing to start an unauthenticated TURN relay.");
+        error!(
+            "Pass --user USER:PASS (or UTURN_USERS=...) to configure auth, \
+             or --allow-anonymous to intentionally run as an open relay."
+        );
+        bail!("missing credentials");
+    }
+
     // Generate random nonce secret at startup
     use rand::Rng;
     let nonce_secret: [u8; 16] = rand::thread_rng().gen();
@@ -84,6 +120,9 @@ async fn main() -> Result<()> {
         rate_limit_per_minute: args.rate_limit_per_minute,
         nonce_lifetime_secs: args.nonce_lifetime_secs,
         nonce_secret,
+        allow_anonymous: args.allow_anonymous,
+        max_permissions_per_alloc: args.max_permissions_per_alloc,
+        max_channels_per_alloc: args.max_channels_per_alloc,
     };
 
     info!(
@@ -92,6 +131,14 @@ async fn main() -> Result<()> {
         config.port,
         config.external_ip
     );
+
+    if config.credentials.is_empty() {
+        warn!(
+            "ANONYMOUS MODE: server is running as an open relay with no authentication. \
+             This will be abused on the public internet (amplification, free transit, \
+             SSRF pivots). Use only on trusted networks."
+        );
+    }
 
     let server = Server::new(config).await?;
 

@@ -12,14 +12,18 @@ RUN cargo build --release
 # Runtime stage
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S uturn \
+    && adduser -S -G uturn -H -s /sbin/nologin uturn
 
 COPY --from=builder /build/target/release/uturn /usr/local/bin/uturn
 
-# Default port
+# Default port (>1024 so unprivileged user can bind). If a port <1024 is
+# needed, grant CAP_NET_BIND_SERVICE at runtime or override USER.
 EXPOSE 3478/udp
 
 # Required: UTURN_EXTERNAL_IP must be set
 # Optional: UTURN_PORT, UTURN_REALM, UTURN_USERS, UTURN_LOG_LEVEL
 
+USER uturn
 ENTRYPOINT ["/usr/local/bin/uturn"]

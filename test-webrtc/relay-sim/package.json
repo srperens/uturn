@@ -1,0 +1,13 @@
+{
+  "name": "uturn-relay-sim",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Interop test harness for uTURN single-port relaying",
+  "scripts": {
+    "interop": "node relaytest.js",
+    "interop:restart": "ICE_RESTART=1 node relaytest.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.56.0"
+  }
+}

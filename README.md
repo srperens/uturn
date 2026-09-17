@@ -1,6 +1,25 @@
 # uTURN
 
-A single-port TURN relay server for WebRTC.
+A single-port TURN relay for WebRTC. Both internal (client-to-client) and
+external (client-to-peer) traffic is routed over one UDP port — so there is a
+single port to expose, not a relay port range.
+
+> **Scope: this is a WebRTC relay, not a general-purpose TURN server.**
+>
+> Because every client shares one relay address, client-to-client traffic
+> cannot be resolved from the destination address alone. uTURN routes it by the
+> **ICE ufrag** carried in the STUN USERNAME, which means both sides must be ICE
+> agents — in practice, WebRTC endpoints. Plain client-to-external-peer
+> relaying follows RFC 5766 and works with any TURN client.
+>
+> The shared relay address is a deliberate deviation from the spec, not a
+> missing feature: RFC 5766 Section 5 requires that "[b]oth the relayed
+> transport address and the 5-tuple MUST be unique across all allocations"
+> (RFC 8656 Section 6 keeps the requirement). uTURN keeps the 5-tuple unique
+> and gives up the other half, which is exactly why client-to-client pairing
+> has to be inferred from ICE ufrags. There is also no TCP transport and no
+> TURNS (TLS/DTLS). If you need a standards-complete TURN deployment, use
+> coturn.
 
 ## Why?
 
@@ -11,6 +30,14 @@ Standard TURN servers require a **port range** (typically 49152-65535) for relay
 - Simple NAT configurations
 
 uTURN multiplexes all traffic through a **single UDP port**. All clients share the same relay address (e.g., `server:3478`), and the server routes packets internally based on allocation lookups.
+
+### Compared to STUNner
+
+[STUNner](https://github.com/l7mp/stunner) solves the same Kubernetes problem from the other end: it terminates TURN at the cluster edge and hands media to workloads over pod networking, so the media path depends on the cluster's networking rather than on one port.
+
+uTURN keeps everything on the one UDP port it listens on. Client-to-client traffic is relayed inside the server and never leaves that port, and external peers are reached from it too, so there is one port to expose per instance. The trade-off is scope: uTURN is a relay for WebRTC media, not a Kubernetes gateway — there is no CRD, no control plane and no cluster integration.
+
+**One instance per relay address.** All allocation state is in-process, so every participant of a call must reach the *same* uTURN process. A Service with several replicas does not work: kube-proxy ["select[s] a backend Pod at random"](https://kubernetes.io/docs/reference/networking/virtual-ips/) by default, so a client's packets can land on a pod that has no allocation for it. `sessionAffinity: ClientIP` — which is what STUNner sets on the Services exposing its Gateways — fixes that much, but not client-to-client: two clients have two source IPs and can still be pinned to two different pods, and neither can then see the other's ufrag. Run one replica per Service and scale out by adding instances, steering all participants of a call to the same one. STUNner does not have this constraint, because its dataplane pods relay to a backend that any of them can reach over pod networking.
 
 ## How Single-Port TURN Works
 
@@ -67,7 +94,7 @@ docker run -p 3478:3478/udp \
 
 ## Testing
 
-Test with `turnutils_uclient` and `turnutils_peer` from [coturn](https://github.com/coturn/coturn):
+Test with `turnutils_uclient` and `turnutils_peer` from [coturn](https://github.com/coturn/coturn). This exercises the client-to-external-peer path (RFC 5766), not the ufrag-routed client-to-client path — that one needs real ICE agents:
 
 ```bash
 # Start a peer server on the TURN server (or any reachable host)
@@ -94,7 +121,7 @@ Note: The `-y` self-test flag doesn't work with single-port TURN since client an
 - [x] ChannelBind
 - [x] Send/Data Indications
 - [x] Long-term credentials (RFC 5389)
-- [x] Client-to-client relay (single-port mode)
+- [x] Client-to-client relay (single-port mode, ICE ufrag routed)
 - [ ] TCP TURN
 - [ ] TURNS (TLS/DTLS)
 - [ ] REST API for ephemeral credentials
