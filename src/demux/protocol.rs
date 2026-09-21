@@ -2,6 +2,8 @@
 //!
 //! Multiplexing scheme for STUN, DTLS, RTP, RTCP, and TURN ChannelData.
 
+use bytes::Bytes;
+
 use super::rtp::RtpHeader;
 use super::stun::StunInfo;
 
@@ -12,16 +14,16 @@ pub enum PacketType {
     Stun(StunInfo),
 
     /// DTLS record
-    Dtls(Vec<u8>),
+    Dtls(Bytes),
 
     /// TURN ChannelData
-    TurnChannelData { channel: u16, data: Vec<u8> },
+    TurnChannelData { channel: u16, data: Bytes },
 
     /// RTP packet
-    Rtp { ssrc: u32, data: Vec<u8> },
+    Rtp { ssrc: u32, data: Bytes },
 
     /// RTCP packet
-    Rtcp(Vec<u8>),
+    Rtcp(Bytes),
 
     /// Unknown packet type
     Unknown,
@@ -52,7 +54,7 @@ impl Demuxer {
             0..=3 => Self::parse_stun(data),
 
             // DTLS: first byte 20-63 (content types)
-            20..=63 => PacketType::Dtls(data.to_vec()),
+            20..=63 => PacketType::Dtls(Bytes::copy_from_slice(data)),
 
             // TURN ChannelData: first byte 64-127 (channel numbers 0x4000-0x7FFF)
             64..=127 => Self::parse_channel_data(data),
@@ -91,7 +93,7 @@ impl Demuxer {
 
         PacketType::TurnChannelData {
             channel,
-            data: data[4..4 + length].to_vec(),
+            data: Bytes::copy_from_slice(&data[4..4 + length]),
         }
     }
 
@@ -117,7 +119,7 @@ impl Demuxer {
         if (200..=204).contains(&raw_pt) {
             // Validate RTCP packet structure to avoid false positives
             if Self::is_valid_rtcp(data) {
-                return PacketType::Rtcp(data.to_vec());
+                return PacketType::Rtcp(Bytes::copy_from_slice(data));
             }
             // Not valid RTCP, fall through to RTP parsing
         }
@@ -131,7 +133,7 @@ impl Demuxer {
         match RtpHeader::parse(data) {
             Some(header) => PacketType::Rtp {
                 ssrc: header.ssrc,
-                data: data.to_vec(),
+                data: Bytes::copy_from_slice(data),
             },
             None => PacketType::Unknown,
         }

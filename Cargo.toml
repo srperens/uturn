@@ -13,10 +13,6 @@ categories = ["network-programming", "multimedia"]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# STUN/TURN protocol
-stun_codec = "0.3"
-bytecodec = "0.4"
-
 # Networking
 bytes = "1"
 socket2 = "0.5"
@@ -34,8 +30,6 @@ rand = "0.8"
 
 # Config & CLI
 clap = { version = "4", features = ["derive", "env"] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
 
 # Logging
 tracing = "0.1"

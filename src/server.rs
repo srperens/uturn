@@ -53,7 +53,21 @@ impl Server {
             std::net::IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], config.port)),
             std::net::IpAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.port)),
         };
-        let socket = UdpSocket::bind(bind_addr).await?;
+        // Raise kernel socket buffers before converting to tokio::UdpSocket.
+        // Best-effort: failure to set is non-fatal (some environments cap SO_*).
+        let socket = {
+            let domain = match config.external_ip {
+                std::net::IpAddr::V4(_) => socket2::Domain::IPV4,
+                std::net::IpAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            sock.set_reuse_address(true)?;
+            let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+            let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+            sock.set_nonblocking(true)?;
+            sock.bind(&bind_addr.into())?;
+            UdpSocket::from_std(sock.into())?
+        };
 
         info!("Bound to {}", bind_addr);
 
@@ -143,6 +157,9 @@ impl Server {
                 // Reap channel bindings past their 10-minute lifetime, so the
                 // channel number and the peer are free to be bound again.
                 cleanup_allocations.cleanup_channel_bindings();
+
+                // Reap permissions past their 5-minute lifetime (RFC 5766 §9).
+                cleanup_allocations.cleanup_permissions();
 
                 // Cleanup stale rate limiter entries
                 cleanup_rate_limiter.cleanup();

@@ -3,6 +3,7 @@
 //! Extracts ICE username fragment (ufrag) for session identification.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use bytes::Bytes;
 
 /// STUN magic cookie
 pub const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
@@ -88,8 +89,8 @@ pub struct StunInfo {
     /// REQUESTED-TRANSPORT attribute (protocol number, e.g., 17 for UDP)
     pub requested_transport: Option<u8>,
 
-    /// Raw message bytes
-    pub raw: Vec<u8>,
+    /// Raw message bytes (shared; cheap to clone)
+    pub raw: Bytes,
 }
 
 /// Intermediate structure for parsed attributes
@@ -173,7 +174,7 @@ impl StunInfo {
             message_integrity: attrs.message_integrity,
             message_integrity_offset: attrs.message_integrity_offset,
             requested_transport: attrs.requested_transport,
-            raw: data.to_vec(),
+            raw: Bytes::copy_from_slice(data),
         })
     }
 

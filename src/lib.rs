@@ -24,7 +24,6 @@ pub mod demux;
 pub mod lookup;
 pub mod relay;
 pub mod server;
-pub mod transport;
 pub mod turn;
 
 pub use config::Config;
