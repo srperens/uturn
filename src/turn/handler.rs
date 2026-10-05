@@ -2087,7 +2087,8 @@ mod tests {
 
         h.handle_channel_bind(&bind, client, &socket).await.unwrap();
 
-        // Force the binding past its deadline without waiting 10 minutes.
+        // Near the end of its lifetime, as when a client refreshes it, without
+        // waiting 10 minutes. Still live.
         {
             let alloc = table.get(id).unwrap();
             alloc
@@ -2095,11 +2096,11 @@ mod tests {
                 .get(&0x4000)
                 .expect("channel bound")
                 .expires_ms
-                .store(0, Ordering::Relaxed);
+                .store(coarse_now_ms() + 1_000, Ordering::Relaxed);
             assert_eq!(
                 alloc.peer_for_channel(0x4000),
-                None,
-                "lapsed binding must be invisible"
+                Some(peer),
+                "binding must still be live before the refresh"
             );
         }
 
@@ -2110,12 +2111,12 @@ mod tests {
         assert_eq!(
             alloc.peer_for_channel(0x4000),
             Some(peer),
-            "handler refresh must revive the lapsed binding"
+            "binding must stay bound after the refresh"
         );
         let expires = alloc
             .channels
             .get(&0x4000)
-            .expect("channel revived")
+            .expect("channel still bound")
             .expires_ms
             .load(Ordering::Relaxed);
         let now = coarse_now_ms();

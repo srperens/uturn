@@ -2,8 +2,8 @@
 //!
 //! Extracts ICE username fragment (ufrag) for session identification.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use bytes::Bytes;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// STUN magic cookie
 pub const STUN_MAGIC_COOKIE: u32 = 0x2112A442;

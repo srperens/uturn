@@ -60,7 +60,8 @@ impl Server {
                 std::net::IpAddr::V4(_) => socket2::Domain::IPV4,
                 std::net::IpAddr::V6(_) => socket2::Domain::IPV6,
             };
-            let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            let sock =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
             sock.set_reuse_address(true)?;
             let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
             let _ = sock.set_send_buffer_size(4 * 1024 * 1024);

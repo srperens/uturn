@@ -1398,7 +1398,10 @@ mod tests {
 
         assert!(table.register_ice_ufrags(id, "LOC".into(), "REM1".into()));
         assert!(table.register_ice_ufrags(id, "LOC".into(), "REM2".into()));
-        assert_eq!(table.get(id).unwrap().get_ice_remote_ufrag().as_deref(), Some("REM2"));
+        assert_eq!(
+            table.get(id).unwrap().get_ice_remote_ufrag().as_deref(),
+            Some("REM2")
+        );
         assert_eq!(table.lookup_by_ice_ufrag("LOC"), Some(id));
     }
 
@@ -1414,7 +1417,10 @@ mod tests {
             "second allocation must not steal the ufrag"
         );
         assert_eq!(table.lookup_by_ice_ufrag("SHARED"), Some(a));
-        assert_eq!(table.get(a).unwrap().get_ice_remote_ufrag().as_deref(), Some("PEER"));
+        assert_eq!(
+            table.get(a).unwrap().get_ice_remote_ufrag().as_deref(),
+            Some("PEER")
+        );
         assert!(table.get(b).unwrap().get_ice_ufrag().is_none());
     }
 
@@ -1467,5 +1473,4 @@ mod tests {
         assert!(!table.get(id).unwrap().is_permitted(peer));
         assert!(!table.by_permission.contains_key(&peer));
     }
-
 }

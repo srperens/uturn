@@ -244,7 +244,10 @@ impl RelayEngine {
     }
 
     /// Snapshot the sender's (local, remote) ICE ufrags.
-    fn sender_ufrags(&self, id: AllocationId) -> (Option<std::sync::Arc<str>>, Option<std::sync::Arc<str>>) {
+    fn sender_ufrags(
+        &self,
+        id: AllocationId,
+    ) -> (Option<std::sync::Arc<str>>, Option<std::sync::Arc<str>>) {
         match self.allocations.get(id) {
             Some(a) => (a.get_ice_ufrag(), a.get_ice_remote_ufrag()),
             None => (None, None),
@@ -555,8 +558,7 @@ impl RelayEngine {
             // no candidate has seen this peer yet — we still fan out then.
             let narrowed = self.narrow_peer_candidates(&candidates, peer_addr);
             if narrowed.len() == 1 {
-                self.allocations
-                    .register_peer_tuple(narrowed[0], peer_addr);
+                self.allocations.register_peer_tuple(narrowed[0], peer_addr);
                 self.snapshot_peer_deliveries(&narrowed, peer_addr, true, true)
             } else {
                 trace!(
@@ -596,8 +598,7 @@ impl RelayEngine {
         } else {
             let narrowed = self.narrow_peer_candidates(&candidates, peer_addr);
             if narrowed.len() == 1 {
-                self.allocations
-                    .register_peer_tuple(narrowed[0], peer_addr);
+                self.allocations.register_peer_tuple(narrowed[0], peer_addr);
             }
             narrowed
         };
@@ -629,8 +630,7 @@ impl RelayEngine {
         } else {
             let narrowed = self.narrow_peer_candidates(&candidates, peer_addr);
             if narrowed.len() == 1 {
-                self.allocations
-                    .register_peer_tuple(narrowed[0], peer_addr);
+                self.allocations.register_peer_tuple(narrowed[0], peer_addr);
             }
             narrowed
         };
