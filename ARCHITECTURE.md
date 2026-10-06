@@ -74,15 +74,9 @@ Deliberately out of scope: TCP transport, TURNS (TLS/DTLS), per-allocation relay
 
 Single socket bound to the configured port (default 3478).
 
-```rust
-pub struct UdpTransport {
-    socket: UdpSocket,
-    external_ip: IpAddr,
-    port: u16,
-}
-```
-
-All packets (STUN, TURN, RTP, DTLS) arrive here and are dispatched to the demultiplexer.
+The server binds a single `tokio::net::UdpSocket` (via `socket2` so receive/send
+buffers can be raised). All packets (STUN, TURN, RTP, DTLS) arrive here and are
+dispatched to the demultiplexer.
 
 ### 2. Demultiplexer
 
@@ -103,7 +97,7 @@ impl Demuxer {
         match data.first() {
             Some(0..=3) => Self::parse_stun(data),
             Some(20..=63) => PacketType::Dtls(data.to_vec()),
-            Some(64..=79) => Self::parse_channel_data(data),
+            Some(64..=127) => Self::parse_channel_data(data),
             Some(128..=191) => Self::parse_rtp_rtcp(data),
             _ => PacketType::Unknown,
         }
@@ -117,7 +111,7 @@ impl Demuxer {
 |------------|----------|
 | 0-3 | STUN |
 | 20-63 | DTLS |
-| 64-79 | TURN ChannelData |
+| 64-127 | TURN ChannelData (TURN channel numbers 0x4000-0x7FFF) |
 | 128-191 | RTP or RTCP |
 
 #### STUN Session Identification (ICE Ufrag Pairing)
@@ -142,7 +136,7 @@ fn find_ice_peers(sender_local: &str, sender_remote: &str) -> Vec<AllocationId> 
 }
 ```
 
-The ICE ufrag pairing is learned atomically on the first STUN Binding Request using DashMap's entry API. The claim is first-come-first-served: the first allocation to register a given ICE ufrag owns it, and a later registration of the same ufrag is refused. This makes the pairing stable, but it is **not** bound to the authenticated TURN username — see the Security Considerations section for what that means for trust.
+The ICE ufrag pairing is learned atomically on the first STUN Binding Request using DashMap's entry API. The claim is first-come-first-served across *different* allocations: the first allocation to register a given ICE ufrag owns it, and a later registration of the same ufrag by another allocation is refused. The *same* allocation may update its ufrags (ICE restart). This makes the pairing stable, but it is **not** bound to the authenticated TURN username — see the Security Considerations section for what that means for trust.
 
 ### 3. Allocation Manager
 
@@ -154,9 +148,8 @@ pub struct AllocationTable {
     by_client: DashMap<SocketAddr, AllocationId>,
 
     // Reverse lookups for demuxing
-    by_ufrag: DashMap<String, AllocationId>,         // TURN ufrag
     by_ice_ufrag: DashMap<String, AllocationId>,     // ICE local ufrag
-    by_peer_ip: DashMap<IpAddr, Vec<AllocationId>>,  // Permission-based
+    by_permission: DashMap<IpAddr, Vec<AllocationId>>,  // Permission-based
     by_peer_tuple: DashMap<SocketAddr, AllocationId>, // Direct peer lookup
 
     allocations: DashMap<AllocationId, Allocation>,
@@ -175,8 +168,8 @@ pub struct Allocation {
     ice_remote_ufrag: RwLock<Option<String>>,  // Remote peer's ICE ufrag
 
     // TURN state
-    permissions: RwLock<HashSet<IpAddr>>,
-    channels: DashMap<u16, SocketAddr>,  // channel_id → peer_addr
+    permissions: RwLock<HashMap<IpAddr, u64>>,  // peer IP → expires_ms (RFC 5766 §9, 5 min)
+    channels: DashMap<u16, ChannelBinding>,     // channel_id → peer + expires_ms (§11, 10 min)
 
     // Lifetime management
     expires_at: RwLock<Instant>,
@@ -213,13 +206,11 @@ Media, DTLS and ICE connectivity checks are routed to the specific ufrag-matched
 peer, or dropped if no match exists — no broadcast — which prevents cross-talk
 between unrelated calls.
 
-(One path is not yet ufrag-targeted: a relayed STUN *response* from a client
-[`handle_client_response`] is fanned out to every allocation that permits the
-responder's source IP. A response carries no USERNAME, so it does not disclose a
-ufrag pair, and in the normal single-port model — where clients permit the relay
-IP rather than each other — this matches nothing; it only fans out when clients
-share a public IP. Tightening it to ufrag-targeted delivery is tracked as
-follow-up work.)
+STUN *responses* from a client (`handle_client_response`) carry no USERNAME, so
+routing uses the sender's already-registered ICE ufrag pair (`find_ice_peers`).
+If the sender has not registered ICE credentials yet, the response is dropped
+rather than permission-IP fanout (which would cross-talk between calls that share
+peer IPs in single-port mode).
 
 **ChannelData routing (STUN)** — 3-tier targeted routing:
 
@@ -519,19 +510,6 @@ let packet_type = Demuxer::classify(data);
 // ...
 ```
 
-### Memory Layout
-
-Keep hot data together for cache efficiency:
-
-```rust
-#[repr(C)]
-struct AllocationHot {
-    client_addr: SocketAddr,    // 28 bytes
-    expires_at: Instant,        // 16 bytes
-    permissions_bitmap: u128,   // Fast permission check for common case
-}
-```
-
 ### Lock-Free Where Possible
 
 Use concurrent data structures for lookup tables:
@@ -551,7 +529,8 @@ struct AllocationManager {
 1. **Authentication**: Long-term credentials (RFC 5389), verified by
    MESSAGE-INTEGRITY on every request. Static credentials are shared across
    clients unless the deployment issues per-user or ephemeral ones.
-2. **Permissions**: Peer permissions are enforced (RFC 5766 §9), but note they
+2. **Permissions**: Peer permissions are enforced with a 5-minute lifetime
+   refreshed by CreatePermission/ChannelBind (RFC 5766 §9), but note they
    provide **little isolation between calls in single-port mode**: every client
    shares one relay address and auto-grants a permission for it, so all clients
    permit the same target. Separation between concurrent calls rests on ICE

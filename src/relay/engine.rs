@@ -180,6 +180,37 @@ impl RelayEngine {
             .collect()
     }
 
+    /// When multiple allocations permit the same peer IP, prefer those that
+    /// already have a channel binding or known_peers entry for this exact
+    /// address. Falls back to the full candidate set when none have affinity
+    /// (first packet from a brand-new peer) — residual cross-talk risk remains
+    /// in that case until a tuple is registered.
+    fn narrow_peer_candidates(
+        &self,
+        candidates: &[AllocationId],
+        peer_addr: SocketAddr,
+    ) -> Vec<AllocationId> {
+        let mut with_channel = Vec::new();
+        let mut with_known = Vec::new();
+        for &id in candidates {
+            let Some(alloc) = self.allocations.get(id) else {
+                continue;
+            };
+            if alloc.channel_for_peer(peer_addr).is_some() {
+                with_channel.push(id);
+            } else if alloc.known_peers.contains_key(&peer_addr) {
+                with_known.push(id);
+            }
+        }
+        if !with_channel.is_empty() {
+            with_channel
+        } else if !with_known.is_empty() {
+            with_known
+        } else {
+            candidates.to_vec()
+        }
+    }
+
     /// Send `data` to one snapshotted receiver, using ChannelData if a channel
     /// is bound, otherwise a Data Indication with `peer_addr` as the source.
     async fn deliver(&self, d: &Delivery, peer_addr: SocketAddr, data: &[u8]) -> Result<()> {
@@ -213,7 +244,10 @@ impl RelayEngine {
     }
 
     /// Snapshot the sender's (local, remote) ICE ufrags.
-    fn sender_ufrags(&self, id: AllocationId) -> (Option<String>, Option<String>) {
+    fn sender_ufrags(
+        &self,
+        id: AllocationId,
+    ) -> (Option<std::sync::Arc<str>>, Option<std::sync::Arc<str>>) {
         match self.allocations.get(id) {
             Some(a) => (a.get_ice_ufrag(), a.get_ice_remote_ufrag()),
             None => (None, None),
@@ -519,15 +553,23 @@ impl RelayEngine {
                 .register_peer_tuple(candidates[0], peer_addr);
             self.snapshot_peer_deliveries(&candidates, peer_addr, false, true)
         } else {
-            // Multiple IP candidates and no tuple registered yet:
-            // send to all on first packet, but don't register anything.
-            trace!(
-                "RTP from {} (SSRC {:08x}) - {} candidates, sending to all (first packet)",
-                peer_addr,
-                ssrc,
-                candidates.len()
-            );
-            self.snapshot_peer_deliveries(&candidates, peer_addr, true, true)
+            // Multiple IP candidates: narrow by prior affinity (channel binding
+            // or known_peers) to reduce cross-talk. Residual risk remains when
+            // no candidate has seen this peer yet — we still fan out then.
+            let narrowed = self.narrow_peer_candidates(&candidates, peer_addr);
+            if narrowed.len() == 1 {
+                self.allocations.register_peer_tuple(narrowed[0], peer_addr);
+                self.snapshot_peer_deliveries(&narrowed, peer_addr, true, true)
+            } else {
+                trace!(
+                    "RTP from {} (SSRC {:08x}) - {} candidates ({} affinity), first-packet fanout",
+                    peer_addr,
+                    ssrc,
+                    candidates.len(),
+                    narrowed.len()
+                );
+                self.snapshot_peer_deliveries(&narrowed, peer_addr, true, true)
+            }
         };
 
         for d in deliveries {
@@ -549,13 +591,19 @@ impl RelayEngine {
             return Ok(());
         }
 
-        // If unique match, register tuple for fast path
-        if is_unique {
+        let chosen = if is_unique {
             self.allocations
                 .register_peer_tuple(candidates[0], peer_addr);
-        }
+            candidates
+        } else {
+            let narrowed = self.narrow_peer_candidates(&candidates, peer_addr);
+            if narrowed.len() == 1 {
+                self.allocations.register_peer_tuple(narrowed[0], peer_addr);
+            }
+            narrowed
+        };
 
-        let deliveries = self.snapshot_peer_deliveries(&candidates, peer_addr, true, true);
+        let deliveries = self.snapshot_peer_deliveries(&chosen, peer_addr, true, true);
         for d in deliveries {
             self.deliver(&d, peer_addr, data).await?;
             self.touch(d.id);
@@ -575,14 +623,20 @@ impl RelayEngine {
             return Ok(());
         }
 
-        // If unique match, register tuple for fast path
-        if is_unique {
+        let chosen = if is_unique {
             self.allocations
                 .register_peer_tuple(candidates[0], peer_addr);
-        }
+            candidates
+        } else {
+            let narrowed = self.narrow_peer_candidates(&candidates, peer_addr);
+            if narrowed.len() == 1 {
+                self.allocations.register_peer_tuple(narrowed[0], peer_addr);
+            }
+            narrowed
+        };
 
         // DTLS goes via Data Indication (not ChannelData): use_channels = false.
-        let deliveries = self.snapshot_peer_deliveries(&candidates, peer_addr, true, false);
+        let deliveries = self.snapshot_peer_deliveries(&chosen, peer_addr, true, false);
         for d in deliveries {
             self.deliver(&d, peer_addr, data).await?;
             self.touch(d.id);

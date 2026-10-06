@@ -477,24 +477,45 @@ impl TurnHandler {
         Ok(())
     }
 
-    /// Handle STUN response from a client - relay to peers
+    /// Handle STUN response from a client - relay to ICE-paired peers.
+    ///
+    /// STUN responses carry no USERNAME, so they cannot disclose a ufrag pair.
+    /// We therefore route using the *sender's* already-registered ICE pair
+    /// (`find_ice_peers`). Permission-IP fanout is intentionally not used: in
+    /// single-port mode many allocations share permissions for the same IPs,
+    /// and fanout would cross-talk between unrelated calls. If the sender has
+    /// not yet registered ICE credentials, the response is dropped.
     async fn handle_client_response(
         &self,
         msg: &StunInfo,
         src_addr: SocketAddr,
         socket: &UdpSocket,
     ) -> Result<()> {
-        debug!("Client response from {} - relaying to peers", src_addr);
+        debug!("Client response from {} - relaying to ICE peers", src_addr);
 
-        // Snapshot the target client addresses, then release all allocation
-        // guards before awaiting the sends (never hold a guard across I/O).
-        let targets: Vec<SocketAddr> = self
-            .allocations
-            .lookup_by_peer_ip(src_addr.ip())
+        let (local, remote) = match self.allocations.get_by_client(src_addr) {
+            Some(alloc) => (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag()),
+            None => {
+                trace!("Client response from unknown client {}", src_addr);
+                return Ok(());
+            }
+        };
+
+        let peers = match (local.as_deref(), remote.as_deref()) {
+            (Some(l), Some(r)) => self.allocations.find_ice_peers(l, r),
+            _ => {
+                trace!(
+                    "Client response from {} dropped: no ICE ufrag pair registered yet",
+                    src_addr
+                );
+                return Ok(());
+            }
+        };
+
+        let targets: Vec<SocketAddr> = peers
             .into_iter()
             .filter_map(|alloc_id| {
                 let target = self.allocations.get(alloc_id)?;
-                // Skip if target is same as source
                 if target.client_addr == src_addr {
                     None
                 } else {
@@ -503,7 +524,10 @@ impl TurnHandler {
             })
             .collect();
 
-        // Build and send Data Indication with the raw STUN response
+        if targets.is_empty() {
+            return Ok(());
+        }
+
         let indication = self.build_data_indication(src_addr, &msg.raw);
         for target_addr in targets {
             debug!(
@@ -912,8 +936,9 @@ impl TurnHandler {
                     // rather than conflicting for the life of the allocation.
                     (Some(p), _) if p != peer_addr => Bind::Conflict,
                     (_, Some(c)) if c != channel => Bind::Conflict,
-                    // Identical binding: refresh, consumes no new slot.
-                    (Some(_), Some(_)) => Bind::Ok { needs_bind: false },
+                    // Identical binding: still needs bind_channel() so the
+                    // 10-minute lifetime is refreshed (RFC 5766 §11).
+                    (Some(_), Some(_)) => Bind::Ok { needs_bind: true },
                     _ if alloc.channels_count() >= self.config.max_channels_per_alloc => {
                         Bind::CapExceeded(alloc.channels_count())
                     }
@@ -1924,7 +1949,7 @@ mod tests {
             message_integrity: None,
             message_integrity_offset: None,
             requested_transport: None,
-            raw,
+            raw: raw.into(),
         }
     }
 
@@ -2039,6 +2064,74 @@ mod tests {
         assert_eq!(alloc.permissions_count(), 1);
     }
 
+    #[tokio::test]
+    async fn channel_bind_refresh_extends_lifetime() {
+        // RFC 5766 §11: a ChannelBind for an existing same channel/peer pair
+        // must refresh the ~10 min lifetime. Regression: the handler used to
+        // set needs_bind=false and skip bind_channel(), so expires_ms never
+        // moved and a lapsed-then-refreshed binding stayed dead.
+        use crate::coarse_time::coarse_now_ms;
+        use std::sync::atomic::Ordering;
+
+        crate::coarse_time::init();
+
+        let (h, table) = handler();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = sa("127.0.0.1:40003");
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peer = sa("203.0.113.21:5000");
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![peer];
+
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        // Near the end of its lifetime, as when a client refreshes it, without
+        // waiting 10 minutes. Still live.
+        {
+            let alloc = table.get(id).unwrap();
+            alloc
+                .channels
+                .get(&0x4000)
+                .expect("channel bound")
+                .expires_ms
+                .store(coarse_now_ms() + 1_000, Ordering::Relaxed);
+            assert_eq!(
+                alloc.peer_for_channel(0x4000),
+                Some(peer),
+                "binding must still be live before the refresh"
+            );
+        }
+
+        // Refresh via the handler path (same pair).
+        h.handle_channel_bind(&bind, client, &socket).await.unwrap();
+
+        let alloc = table.get(id).unwrap();
+        assert_eq!(
+            alloc.peer_for_channel(0x4000),
+            Some(peer),
+            "binding must stay bound after the refresh"
+        );
+        let expires = alloc
+            .channels
+            .get(&0x4000)
+            .expect("channel still bound")
+            .expires_ms
+            .load(Ordering::Relaxed);
+        let now = coarse_now_ms();
+        assert!(
+            expires > now,
+            "refreshed binding must be in the future (expires={expires}, now={now})"
+        );
+        // Full 10-minute grant, allow a few seconds of skew for the coarse clock.
+        assert!(
+            expires >= now + 600_000 - 5_000,
+            "lifetime not extended toward 10 min: expires={expires}, now={now}"
+        );
+        assert_eq!(alloc.channels_count(), 1);
+    }
+
     // ---- authenticated requests --------------------------------------------
 
     const USER: &str = "user";
@@ -2073,10 +2166,12 @@ mod tests {
 
         let offset = msg.raw.len();
         let hashed_len = (offset - 20 + 24) as u16;
-        msg.raw[2..4].copy_from_slice(&hashed_len.to_be_bytes());
-        let mi = TurnAuth::compute_message_integrity(&msg.raw, key);
-        msg.raw.extend_from_slice(&[0x00, 0x08, 0x00, 0x14]);
-        msg.raw.extend_from_slice(&mi);
+        let mut raw = msg.raw.to_vec();
+        raw[2..4].copy_from_slice(&hashed_len.to_be_bytes());
+        let mi = TurnAuth::compute_message_integrity(&raw, key);
+        raw.extend_from_slice(&[0x00, 0x08, 0x00, 0x14]);
+        raw.extend_from_slice(&mi);
+        msg.raw = raw.into();
         msg.message_integrity = Some(mi.to_vec());
         msg.message_integrity_offset = Some(offset);
         msg
