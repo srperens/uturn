@@ -126,8 +126,7 @@ async fn main() -> Result<()> {
     }
 
     // Generate random nonce secret at startup
-    use rand::Rng;
-    let nonce_secret: [u8; 16] = rand::thread_rng().gen();
+    let nonce_secret: [u8; 16] = rand::random();
 
     let config = Config {
         port: args.port,

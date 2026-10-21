@@ -1,7 +1,7 @@
 //! TURN authentication (long-term credentials)
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
@@ -146,8 +146,10 @@ mod tests {
     fn test_compute_key() {
         // Test vector from RFC 5389
         let key = TurnAuth::compute_key("user", "realm", "pass");
-        // Key is MD5("user:realm:pass")
-        assert_eq!(key.len(), 16);
+        // Key is MD5("user:realm:pass"). Independent reference:
+        // printf 'user:realm:pass' | openssl dgst -md5
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "8493fbc53ba582fb4c044c456bdc40eb");
     }
 
     #[test]

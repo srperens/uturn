@@ -82,8 +82,7 @@ impl std::fmt::Debug for Config {
 impl Config {
     /// Create a new config with minimal settings
     pub fn new(external_ip: IpAddr) -> Self {
-        use rand::Rng;
-        let nonce_secret: [u8; 16] = rand::thread_rng().gen();
+        let nonce_secret: [u8; 16] = rand::random();
 
         Self {
             port: 3478,
