@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use crate::turn::TurnAuth;
 
 /// Server configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// UDP port to listen on
     pub port: u16,
@@ -53,6 +53,30 @@ pub struct Config {
     /// Maximum number of bound channels per allocation.
     /// Exceeding this returns 508 Insufficient Capacity. (RFC 5766 §11.2)
     pub max_channels_per_alloc: usize,
+}
+
+/// Redacts passwords and secrets, so logging a `Config` cannot leak them.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let users: Vec<&str> = self.credentials.iter().map(|(u, _)| u.as_str()).collect();
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .field("external_ip", &self.external_ip)
+            .field("realm", &self.realm)
+            .field("credentials", &users)
+            .field(
+                "auth_secrets",
+                &format_args!("[{} redacted]", self.auth_secrets.len()),
+            )
+            .field("max_allocations_per_ip", &self.max_allocations_per_ip)
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("nonce_lifetime_secs", &self.nonce_lifetime_secs)
+            .field("nonce_secret", &"[redacted]")
+            .field("allow_anonymous", &self.allow_anonymous)
+            .field("max_permissions_per_alloc", &self.max_permissions_per_alloc)
+            .field("max_channels_per_alloc", &self.max_channels_per_alloc)
+            .finish()
+    }
 }
 
 impl Config {
@@ -179,6 +203,19 @@ mod tests {
                 TurnAuth::ephemeral_password("new", &user),
             ]
         );
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let out = format!(
+            "{:?}",
+            config()
+                .with_credential("alice", "hunter2-static")
+                .with_auth_secret("example-secret-value")
+        );
+        assert!(out.contains("alice"));
+        assert!(!out.contains("hunter2-static"));
+        assert!(!out.contains("example-secret-value"));
     }
 
     #[test]

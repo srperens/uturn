@@ -39,19 +39,21 @@ struct Args {
     realm: String,
 
     /// Static credentials in format user:password (can be repeated)
-    #[arg(short, long, env = "UTURN_USERS", value_delimiter = ',')]
+    #[arg(
+        short,
+        long,
+        env = "UTURN_USERS",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
     user: Vec<String>,
 
     /// Shared secret for time-limited TURN REST API credentials (coturn's
     /// `static-auth-secret`). Username `<expiry-unix-secs>:<id>`, password
-    /// base64(HMAC-SHA1(secret, username)). Repeat to accept several secrets
-    /// while rotating.
-    #[arg(
-        long,
-        env = "UTURN_AUTH_SECRET",
-        value_delimiter = ',',
-        hide_env_values = true
-    )]
+    /// base64(HMAC-SHA1(secret, username)). Repeat the flag, or separate with
+    /// whitespace in the env var, to accept several secrets while rotating.
+    /// Each secret must be at least 16 bytes.
+    #[arg(long, env = "UTURN_AUTH_SECRET", hide_env_values = true)]
     static_auth_secret: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
@@ -111,11 +113,7 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    let auth_secrets: Vec<String> = args
-        .static_auth_secret
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
+    let auth_secrets = parse_auth_secrets(&args.static_auth_secret)?;
 
     if credentials.is_empty() && auth_secrets.is_empty() && !args.allow_anonymous {
         error!("No credentials configured. Refusing to start an unauthenticated TURN relay.");
@@ -182,6 +180,33 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Minimum length of a TURN REST API shared secret, in bytes.
+const MIN_AUTH_SECRET_LEN: usize = 16;
+
+/// Split `--static-auth-secret` values into secrets.
+///
+/// Whitespace separates secrets (so one env var can carry several during
+/// rotation, and a trailing newline from a mounted secret file is dropped).
+/// Commas are deliberately *not* separators: a generated secret may contain
+/// one, and splitting it would silently turn it into weaker keys. A short
+/// secret is refused for the same reason - it is brute-forceable offline from
+/// a single observed credential.
+fn parse_auth_secrets(values: &[String]) -> Result<Vec<String>> {
+    let secrets: Vec<String> = values
+        .iter()
+        .flat_map(|v| v.split_whitespace())
+        .map(str::to_string)
+        .collect();
+    if let Some(short) = secrets.iter().find(|s| s.len() < MIN_AUTH_SECRET_LEN) {
+        bail!(
+            "--static-auth-secret: a {}-byte secret is too short (minimum {} bytes)",
+            short.len(),
+            MIN_AUTH_SECRET_LEN
+        );
+    }
+    Ok(secrets)
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -203,5 +228,69 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    const A: &str = "aaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn auth_secrets_split_on_whitespace_only() {
+        assert_eq!(parse_auth_secrets(&strings(&[A])).unwrap(), strings(&[A]));
+        assert_eq!(
+            parse_auth_secrets(&strings(&[&format!("{A} {B}\n")])).unwrap(),
+            strings(&[A, B])
+        );
+        assert_eq!(
+            parse_auth_secrets(&strings(&[A, B])).unwrap(),
+            strings(&[A, B])
+        );
+        // A comma is part of the secret, not a separator.
+        let with_comma = format!("{A},{B}");
+        assert_eq!(
+            parse_auth_secrets(&strings(&[&with_comma])).unwrap(),
+            strings(&[&with_comma])
+        );
+    }
+
+    #[test]
+    fn auth_secrets_empty_values_yield_none() {
+        assert!(parse_auth_secrets(&strings(&[])).unwrap().is_empty());
+        assert!(parse_auth_secrets(&strings(&["", " \n"]))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn short_auth_secret_is_refused() {
+        assert!(parse_auth_secrets(&strings(&["short"])).is_err());
+        // "new, old"-style input must fail loudly, not run with fragments.
+        assert!(parse_auth_secrets(&strings(&[&format!("{A}, x")])).is_err());
+    }
+
+    #[test]
+    fn secret_alone_satisfies_startup_gate() {
+        let args = Args::try_parse_from([
+            "uturn",
+            "--external-ip",
+            "203.0.113.10",
+            "--static-auth-secret",
+            A,
+        ])
+        .unwrap();
+        assert!(args.user.is_empty());
+        assert!(!args.allow_anonymous);
+        assert_eq!(
+            parse_auth_secrets(&args.static_auth_secret).unwrap(),
+            strings(&[A])
+        );
     }
 }

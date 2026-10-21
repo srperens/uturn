@@ -532,7 +532,7 @@ struct AllocationManager {
    issues per-user ones, or are derived from a shared secret for time-limited
    TURN REST API usernames (`<expiry>:<id>`, see README). An expired REST
    username is rejected on every request, Refresh included, so an allocation
-   cannot outlive its credentials.
+   outlives its credentials by at most one allocation lifetime (60s).
 2. **Permissions**: Peer permissions are enforced with a 5-minute lifetime
    refreshed by CreatePermission/ChannelBind (RFC 5766 §9), but note they
    provide **little isolation between calls in single-port mode**: every client

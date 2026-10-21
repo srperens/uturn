@@ -87,7 +87,7 @@ docker run -p 3478:3478/udp \
 | `--external-ip` | `UTURN_EXTERNAL_IP` | (required) | Public IP for relay addresses |
 | `--realm` | `UTURN_REALM` | uturn | TURN realm for authentication |
 | `--user` | `UTURN_USERS` | - | Credentials in `user:pass` format (repeatable) |
-| `--static-auth-secret` | `UTURN_AUTH_SECRET` | - | Shared secret for time-limited credentials (repeatable, see below) |
+| `--static-auth-secret` | `UTURN_AUTH_SECRET` | - | Shared secret for time-limited credentials, min 16 bytes (see below) |
 | `--log-level` | `UTURN_LOG_LEVEL` | info | Log level: trace, debug, info, warn, error |
 | `--max-allocations-per-ip` | `UTURN_MAX_ALLOC_PER_IP` | 200 | Max concurrent allocations per IP (0 = unlimited) |
 | `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 30 | Max allocation requests per IP per minute (0 = unlimited) |
@@ -98,11 +98,16 @@ docker run -p 3478:3478/udp \
 With `--static-auth-secret`, uTURN accepts short-lived credentials minted by
 your application backend from a shared secret. This is the scheme from
 [draft-uberti-behave-turn-rest](https://datatracker.ietf.org/doc/html/draft-uberti-behave-turn-rest-00),
-compatible with coturn's `use-auth-secret` / `static-auth-secret`, so a backend
-that already issues coturn credentials works unchanged.
+compatible with coturn's `use-auth-secret` / `static-auth-secret`.
 
-- **username** = `<expiry-unix-seconds>:<id>` (the `:<id>` part is optional)
+- **username** = `<expiry-unix-seconds>:<id>` (the `:<id>` part is optional;
+  `<id>:<expiry-unix-seconds>` is accepted too, as in coturn)
 - **password** = `base64(HMAC-SHA1(secret, username))`
+
+Differences from coturn: the separator is always `:` (no
+`rest-api-separator`), and static `--user` credentials stay valid alongside
+the secret (coturn's `use-auth-secret` disables them); a static username that
+looks like `<expiry>:<id>` wins.
 
 The backend shares only the secret with uTURN; the two never talk to each
 other. The "REST API" is an endpoint in your own backend that hands these to
@@ -118,14 +123,22 @@ const credential = crypto.createHmac('sha1', process.env.TURN_SECRET)
 // -> RTCPeerConnection({ iceServers: [{ urls: 'turn:turn.example.com:3478', username, credential }] })
 ```
 
-Credentials are checked on every request, including Refresh, so an allocation
-cannot outlive its credentials: media stops within a minute of expiry. Pick a
-TTL longer than your longest call, and keep backend and relay clocks in sync.
+Credentials are checked on every request, including Refresh, so once they
+expire the allocation is no longer refreshed and runs out on its own (at most
+60 seconds): media stops within a minute of expiry. Pick a TTL longer than your
+longest call, and keep backend and relay clocks in sync.
 
-To rotate, pass both secrets (`UTURN_AUTH_SECRET=new,old`), switch the backend
-to the new one, then drop the old one once its credentials have expired.
-Static `--user` credentials keep working alongside, and win if a static
-username happens to look like `<expiry>:<id>`.
+Pass the secret through `UTURN_AUTH_SECRET` (or a mounted secret) rather than
+`--static-auth-secret` on the command line, where it shows up in `ps`. Use a
+random secret of at least 16 bytes, e.g. `openssl rand -hex 32`; shorter ones
+are refused.
+
+To rotate, give both secrets whitespace-separated
+(`UTURN_AUTH_SECRET="<new> <old>"`, or repeat the flag), switch the backend to
+the new one, then drop the old one once its credentials have expired. Commas
+are not separators, since a secret may contain one. Every configured secret is
+tried on a failed request, so keep the list short and retire old secrets
+promptly.
 
 ## Testing
 

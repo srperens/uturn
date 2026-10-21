@@ -21,16 +21,22 @@ impl TurnAuth {
 
     /// Expiry (unix seconds) carried by a TURN REST API username.
     ///
-    /// The format is `<expiry>:<id>`, or a bare `<expiry>`
-    /// (draft-uberti-behave-turn-rest, as implemented by coturn's
-    /// `use-auth-secret`). Returns `None` when the username does not start
-    /// with a timestamp.
+    /// The format is `<expiry>:<id>` or a bare `<expiry>`
+    /// (draft-uberti-behave-turn-rest). Like coturn's `use-auth-secret`, the
+    /// reversed `<id>:<expiry>` is accepted too: when the part before the
+    /// first `:` is not a timestamp, the rest of the username must be.
+    /// Returns `None` when no timestamp is found.
     pub fn ephemeral_expiry(username: &str) -> Option<u64> {
-        let ts = username.split(':').next()?;
-        if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
+        fn timestamp(s: &str) -> Option<u64> {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse().ok()
         }
-        ts.parse().ok()
+        match username.split_once(':') {
+            Some((head, tail)) => timestamp(head).or_else(|| timestamp(tail)),
+            None => timestamp(username),
+        }
     }
 
     /// Password for a TURN REST API username: base64(HMAC-SHA1(secret, username))
@@ -165,8 +171,15 @@ mod tests {
             TurnAuth::ephemeral_expiry("1761100000:a:b"),
             Some(1761100000)
         );
+        // coturn also accepts the reversed order and a leading separator.
+        assert_eq!(
+            TurnAuth::ephemeral_expiry("alice:1761100000"),
+            Some(1761100000)
+        );
+        assert_eq!(TurnAuth::ephemeral_expiry(":1761100000"), Some(1761100000));
         assert_eq!(TurnAuth::ephemeral_expiry("alice"), None);
-        assert_eq!(TurnAuth::ephemeral_expiry("alice:1761100000"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("alice:bob"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("alice:1761100000:x"), None);
         assert_eq!(TurnAuth::ephemeral_expiry(":alice"), None);
         assert_eq!(TurnAuth::ephemeral_expiry(""), None);
         assert_eq!(TurnAuth::ephemeral_expiry("+12:alice"), None);

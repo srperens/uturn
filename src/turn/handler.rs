@@ -153,19 +153,6 @@ impl TurnHandler {
             }
         };
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let passwords = self.config.candidate_passwords(username, now);
-        if passwords.is_empty() {
-            warn!(
-                "Unknown or expired username in authenticated request: {}",
-                username
-            );
-            return Err(self.build_unauthorized_response(msg));
-        }
-
         // Validate nonce freshness
         match &msg.nonce {
             Some(nonce) => {
@@ -188,7 +175,7 @@ impl TurnHandler {
         match msg.realm.as_deref() {
             Some(realm) if realm != self.config.realm => {
                 warn!(
-                    "Realm mismatch: client sent '{}', expected '{}'",
+                    "Realm mismatch: client sent {:?}, expected {:?}",
                     realm, self.config.realm
                 );
                 return Err(self.build_unauthorized_response(msg));
@@ -198,6 +185,24 @@ impl TurnHandler {
                 return Err(self.build_unauthorized_response(msg));
             }
             _ => {} // Realm matches
+        }
+
+        // Derive candidate passwords only now: with REST API secrets this costs
+        // one HMAC per secret, which a request with a stale nonce or wrong
+        // realm must not be able to force.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let passwords = self.config.candidate_passwords(username, now);
+        if passwords.is_empty() {
+            // debug, not warn: any unauthenticated sender reaches this, so a
+            // warn would let it flood the log.
+            debug!(
+                "Unknown or expired username in authenticated request: {:?}",
+                username
+            );
+            return Err(self.build_unauthorized_response(msg));
         }
 
         let (integrity, offset) = match (&msg.message_integrity, msg.message_integrity_offset) {
@@ -222,11 +227,11 @@ impl TurnHandler {
             .map(|password| TurnAuth::compute_key(username, &self.config.realm, password))
             .find(|key| TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, key));
         let Some(key) = key else {
-            warn!("Invalid MESSAGE-INTEGRITY for user {}", username);
+            warn!("Invalid MESSAGE-INTEGRITY for user {:?}", username);
             return Err(self.build_unauthorized_response(msg));
         };
 
-        debug!("MESSAGE-INTEGRITY validated for user {}", username);
+        debug!("MESSAGE-INTEGRITY validated for user {:?}", username);
         Ok((username.clone(), key))
     }
 
@@ -277,7 +282,7 @@ impl TurnHandler {
             }
             (Some((_, allocated_to)), Some((username, _))) if allocated_to != *username => {
                 warn!(
-                    "Username mismatch: allocation for {} belongs to '{}', request says '{}'",
+                    "Username mismatch: allocation for {} belongs to {:?}, request says {:?}",
                     src_addr, allocated_to, username
                 );
                 Err(self.build_unauthorized_response(msg))
@@ -2429,6 +2434,80 @@ mod tests {
         h.handle_refresh(&msg, client_addr, &server).await.unwrap();
 
         assert_eq!(error_code(&recv(&client).await), (4, 1));
+        assert!(
+            table.get_by_client(client_addr).is_some(),
+            "the allocation runs to its own lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_and_channel_bind_with_valid_ephemeral_credentials() {
+        let (h, table, config) = secret_handler(&[SECRET]);
+        let (server, client, client_addr) = socket_pair().await;
+        let (user, key) = ephemeral(&config, SECRET, 3600);
+        table.create(client_addr, user.clone(), 600);
+
+        let msg = sign_as(request(StunMethod::Refresh, 0x0004), &user, &config, &key);
+        h.handle_refresh(&msg, client_addr, &server).await.unwrap();
+        let resp = recv(&client).await;
+        assert_eq!(&resp[0..2], &[0x01, 0x04], "Refresh success response");
+        assert_signed_with(&resp, &key);
+
+        let mut bind = request(StunMethod::ChannelBind, 0x0009);
+        bind.channel_number = Some(0x4000);
+        bind.xor_peer_addresses = vec![sa("198.51.100.7:5000")];
+        let bind = sign_as(bind, &user, &config, &key);
+        h.handle_channel_bind(&bind, client_addr, &server)
+            .await
+            .unwrap();
+        let resp = recv(&client).await;
+        assert_eq!(&resp[0..2], &[0x01, 0x09], "ChannelBind success response");
+        assert_signed_with(&resp, &key);
+    }
+
+    #[tokio::test]
+    async fn static_and_ephemeral_users_both_allocate() {
+        let config = Arc::new(
+            Config::new(ip(RELAY_IP))
+                .with_port(RELAY_PORT)
+                .with_credential(USER, PASS)
+                .with_auth_secret(SECRET),
+        );
+        let table = Arc::new(AllocationTable::new());
+        let h = TurnHandler::new(
+            Arc::clone(&config),
+            Arc::clone(&table),
+            Arc::new(RateLimiter::new(120, 100)),
+        );
+        let static_key = TurnAuth::compute_key(USER, &config.realm, PASS);
+        let (user, ephemeral_key) = ephemeral(&config, SECRET, 3600);
+
+        for (user, key) in [(USER, static_key), (user.as_str(), ephemeral_key)] {
+            let (server, client, client_addr) = socket_pair().await;
+            let msg = sign_as(allocate_request(), user, &config, &key);
+            h.handle_allocate(&msg, client_addr, &server).await.unwrap();
+
+            let resp = recv(&client).await;
+            assert_eq!(&resp[0..2], &[0x01, 0x03], "{user} allocates");
+            assert_signed_with(&resp, &key);
+            assert_eq!(table.get_by_client(client_addr).unwrap().username, user);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_nonce_is_438_before_any_password_derivation() {
+        // Ordering guard: an expired REST username yields no candidate
+        // passwords, so if derivation ran before the nonce check this would be
+        // a 401. 438 shows the bogus nonce is rejected first, without any HMAC.
+        let (h, _table, config) = secret_handler(&[SECRET]);
+        let (server, client, client_addr) = socket_pair().await;
+        let (user, key) = ephemeral(&config, SECRET, -1);
+
+        let mut msg = sign_as(allocate_request(), &user, &config, &key);
+        msg.nonce = Some("0000000000000001:0000000000000000".to_string());
+        h.handle_allocate(&msg, client_addr, &server).await.unwrap();
+
+        assert_eq!(error_code(&recv(&client).await), (4, 38));
     }
 
     // ---- Allocate over a lapsed allocation ----------------------------------
