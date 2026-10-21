@@ -23,7 +23,9 @@ COPY --from=builder /build/target/release/uturn /usr/local/bin/uturn
 EXPOSE 3478/udp
 
 # Required: UTURN_EXTERNAL_IP must be set
-# Optional: UTURN_PORT, UTURN_REALM, UTURN_USERS, UTURN_LOG_LEVEL
+# Auth (one required, or UTURN_ALLOW_ANONYMOUS=true):
+#   UTURN_USERS (user:pass,...) and/or UTURN_AUTH_SECRET (TURN REST API secret)
+# Optional: UTURN_PORT, UTURN_REALM, UTURN_LOG_LEVEL
 
 USER uturn
 ENTRYPOINT ["/usr/local/bin/uturn"]
