@@ -87,10 +87,45 @@ docker run -p 3478:3478/udp \
 | `--external-ip` | `UTURN_EXTERNAL_IP` | (required) | Public IP for relay addresses |
 | `--realm` | `UTURN_REALM` | uturn | TURN realm for authentication |
 | `--user` | `UTURN_USERS` | - | Credentials in `user:pass` format (repeatable) |
+| `--static-auth-secret` | `UTURN_AUTH_SECRET` | - | Shared secret for time-limited credentials (repeatable, see below) |
 | `--log-level` | `UTURN_LOG_LEVEL` | info | Log level: trace, debug, info, warn, error |
 | `--max-allocations-per-ip` | `UTURN_MAX_ALLOC_PER_IP` | 200 | Max concurrent allocations per IP (0 = unlimited) |
 | `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 30 | Max allocation requests per IP per minute (0 = unlimited) |
 | `--nonce-lifetime-secs` | `UTURN_NONCE_LIFETIME` | 3600 | Nonce validity period in seconds |
+
+## Time-limited credentials (TURN REST API)
+
+With `--static-auth-secret`, uTURN accepts short-lived credentials minted by
+your application backend from a shared secret. This is the scheme from
+[draft-uberti-behave-turn-rest](https://datatracker.ietf.org/doc/html/draft-uberti-behave-turn-rest-00),
+compatible with coturn's `use-auth-secret` / `static-auth-secret`, so a backend
+that already issues coturn credentials works unchanged.
+
+- **username** = `<expiry-unix-seconds>:<id>` (the `:<id>` part is optional)
+- **password** = `base64(HMAC-SHA1(secret, username))`
+
+The backend shares only the secret with uTURN; the two never talk to each
+other. The "REST API" is an endpoint in your own backend that hands these to
+logged-in clients — uTURN only verifies them:
+
+```js
+// Node.js, in your backend
+const crypto = require('crypto');
+const ttl = 24 * 3600;
+const username = `${Math.floor(Date.now() / 1000) + ttl}:${userId}`;
+const credential = crypto.createHmac('sha1', process.env.TURN_SECRET)
+  .update(username).digest('base64');
+// -> RTCPeerConnection({ iceServers: [{ urls: 'turn:turn.example.com:3478', username, credential }] })
+```
+
+Credentials are checked on every request, including Refresh, so an allocation
+cannot outlive its credentials: media stops within a minute of expiry. Pick a
+TTL longer than your longest call, and keep backend and relay clocks in sync.
+
+To rotate, pass both secrets (`UTURN_AUTH_SECRET=new,old`), switch the backend
+to the new one, then drop the old one once its credentials have expired.
+Static `--user` credentials keep working alongside, and win if a static
+username happens to look like `<expiry>:<id>`.
 
 ## Testing
 
@@ -121,10 +156,10 @@ Note: The `-y` self-test flag doesn't work with single-port TURN since client an
 - [x] ChannelBind
 - [x] Send/Data Indications
 - [x] Long-term credentials (RFC 5389)
+- [x] Time-limited credentials (TURN REST API / shared secret)
 - [x] Client-to-client relay (single-port mode, ICE ufrag routed)
 - [ ] TCP TURN
 - [ ] TURNS (TLS/DTLS)
-- [ ] REST API for ephemeral credentials
 
 ## Architecture
 

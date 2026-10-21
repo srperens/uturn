@@ -1,7 +1,16 @@
 const { chromium } = require('playwright');
+const crypto = require('crypto');
 
 const TURN = process.env.TURN_URL || 'turn:192.0.2.2:3478?transport=udp';
-const USER = 'test', PASS = 'testpass';
+// TURN_SECRET mints time-limited TURN REST API credentials the way an
+// application backend would; otherwise static test:testpass.
+const [USER, PASS] = process.env.TURN_SECRET
+  ? (() => {
+      const user = `${Math.floor(Date.now() / 1000) + 3600}:relaytest`;
+      const pass = crypto.createHmac('sha1', process.env.TURN_SECRET).update(user).digest('base64');
+      return [user, pass];
+    })()
+  : ['test', 'testpass'];
 const RESTART = process.env.ICE_RESTART === '1';
 
 (async () => {

@@ -137,7 +137,7 @@ impl TurnHandler {
     ///
     /// Returns the authenticated username and its key on success, or the error
     /// response to send (401 with fresh REALM/NONCE, 438 Stale Nonce, or 400).
-    /// Callers must have checked that credentials are configured at all.
+    /// Callers must have checked that authentication is enabled at all.
     fn verify_long_term_credentials(&self, msg: &StunInfo) -> Result<(String, [u8; 16]), Vec<u8>> {
         // MESSAGE-INTEGRITY must be present: first contact gets a 401 challenge.
         if msg.message_integrity.is_none() {
@@ -153,13 +153,18 @@ impl TurnHandler {
             }
         };
 
-        let password = match self.config.get_password(username) {
-            Some(p) => p,
-            None => {
-                warn!("Unknown username in authenticated request: {}", username);
-                return Err(self.build_unauthorized_response(msg));
-            }
-        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let passwords = self.config.candidate_passwords(username, now);
+        if passwords.is_empty() {
+            warn!(
+                "Unknown or expired username in authenticated request: {}",
+                username
+            );
+            return Err(self.build_unauthorized_response(msg));
+        }
 
         // Validate nonce freshness
         match &msg.nonce {
@@ -195,9 +200,6 @@ impl TurnHandler {
             _ => {} // Realm matches
         }
 
-        // Always use server's realm for key computation
-        let key = TurnAuth::compute_key(username, &self.config.realm, password);
-
         let (integrity, offset) = match (&msg.message_integrity, msg.message_integrity_offset) {
             (Some(i), Some(o)) => (i, o),
             _ => {
@@ -213,10 +215,16 @@ impl TurnHandler {
         let new_len = (offset - 20 + 24) as u16;
         msg_for_hmac[2..4].copy_from_slice(&new_len.to_be_bytes());
 
-        if !TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, &key) {
+        // Always use server's realm for key computation. More than one
+        // candidate only when several REST API secrets are configured.
+        let key = passwords
+            .iter()
+            .map(|password| TurnAuth::compute_key(username, &self.config.realm, password))
+            .find(|key| TurnAuth::verify_message_integrity(&msg_for_hmac, integrity, key));
+        let Some(key) = key else {
             warn!("Invalid MESSAGE-INTEGRITY for user {}", username);
             return Err(self.build_unauthorized_response(msg));
-        }
+        };
 
         debug!("MESSAGE-INTEGRITY validated for user {}", username);
         Ok((username.clone(), key))
@@ -244,7 +252,7 @@ impl TurnHandler {
         msg: &StunInfo,
         src_addr: SocketAddr,
     ) -> Result<(AllocationId, Option<[u8; 16]>), Vec<u8>> {
-        let auth = if self.config.credentials.is_empty() {
+        let auth = if !self.config.auth_enabled() {
             None
         } else {
             Some(self.verify_long_term_credentials(msg)?)
@@ -555,7 +563,7 @@ impl TurnHandler {
 
         // 1. Authenticate. Nothing below - including the retransmission shortcut -
         //    may act on a request whose MESSAGE-INTEGRITY has not been verified.
-        let auth: Option<(String, [u8; 16])> = if self.config.credentials.is_empty() {
+        let auth: Option<(String, [u8; 16])> = if !self.config.auth_enabled() {
             None
         } else {
             match self.verify_long_term_credentials(msg) {
@@ -2159,8 +2167,13 @@ mod tests {
     /// Add the credential attributes and a MESSAGE-INTEGRITY over `raw`, the way
     /// a client would. `raw` holds only the header, which is all the server
     /// hashes here; the parsed attributes are set as fields.
-    fn sign(mut msg: StunInfo, config: &Config, key: &[u8; 16]) -> StunInfo {
-        msg.username = Some(USER.to_string());
+    fn sign(msg: StunInfo, config: &Config, key: &[u8; 16]) -> StunInfo {
+        sign_as(msg, USER, config, key)
+    }
+
+    /// `sign` for an arbitrary username.
+    fn sign_as(mut msg: StunInfo, user: &str, config: &Config, key: &[u8; 16]) -> StunInfo {
+        msg.username = Some(user.to_string());
         msg.realm = Some(config.realm.clone());
         msg.nonce = Some(TurnAuth::generate_nonce(&config.nonce_secret));
 
@@ -2291,6 +2304,131 @@ mod tests {
 
         let resp = recv(&client).await;
         assert_eq!(error_code(&resp), (4, 1), "401 Unauthorized");
+    }
+
+    // ---- TURN REST API (shared secret) credentials ---------------------------
+
+    const SECRET: &str = "example-secret";
+
+    /// Handler configured with REST API secrets only - no static `--user`.
+    fn secret_handler(secrets: &[&str]) -> (TurnHandler, Arc<AllocationTable>, Arc<Config>) {
+        let mut cfg = Config::new(ip(RELAY_IP)).with_port(RELAY_PORT);
+        for secret in secrets {
+            cfg = cfg.with_auth_secret(*secret);
+        }
+        let config = Arc::new(cfg);
+        let allocations = Arc::new(AllocationTable::new());
+        let rate_limiter = Arc::new(RateLimiter::new(120, 100));
+        (
+            TurnHandler::new(Arc::clone(&config), Arc::clone(&allocations), rate_limiter),
+            allocations,
+            config,
+        )
+    }
+
+    /// REST API username expiring `offset_secs` from now, and its key under `secret`.
+    fn ephemeral(config: &Config, secret: &str, offset_secs: i64) -> (String, [u8; 16]) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let user = format!("{}:alice", now + offset_secs);
+        let password = TurnAuth::ephemeral_password(secret, &user);
+        let key = TurnAuth::compute_key(&user, &config.realm, &password);
+        (user, key)
+    }
+
+    fn allocate_request() -> StunInfo {
+        let mut alloc = request(StunMethod::Allocate, 0x0003);
+        alloc.requested_transport = Some(17);
+        alloc
+    }
+
+    #[tokio::test]
+    async fn allocate_with_ephemeral_credentials_succeeds() {
+        let (h, table, config) = secret_handler(&[SECRET]);
+        let (server, client, client_addr) = socket_pair().await;
+        let (user, key) = ephemeral(&config, SECRET, 3600);
+
+        let msg = sign_as(allocate_request(), &user, &config, &key);
+        h.handle_allocate(&msg, client_addr, &server).await.unwrap();
+
+        let resp = recv(&client).await;
+        assert_eq!(&resp[0..2], &[0x01, 0x03], "Allocate success response");
+        assert_signed_with(&resp, &key);
+        assert_eq!(table.get_by_client(client_addr).unwrap().username, user);
+    }
+
+    #[tokio::test]
+    async fn allocate_with_expired_ephemeral_credentials_is_401() {
+        let (h, table, config) = secret_handler(&[SECRET]);
+        let (server, client, client_addr) = socket_pair().await;
+        let (user, key) = ephemeral(&config, SECRET, -1);
+
+        let msg = sign_as(allocate_request(), &user, &config, &key);
+        h.handle_allocate(&msg, client_addr, &server).await.unwrap();
+
+        assert_eq!(error_code(&recv(&client).await), (4, 1));
+        assert!(table.get_by_client(client_addr).is_none());
+    }
+
+    #[tokio::test]
+    async fn allocate_signed_with_wrong_secret_is_401() {
+        let (h, table, config) = secret_handler(&[SECRET]);
+        let (server, client, client_addr) = socket_pair().await;
+        let (user, key) = ephemeral(&config, "not-the-secret", 3600);
+
+        let msg = sign_as(allocate_request(), &user, &config, &key);
+        h.handle_allocate(&msg, client_addr, &server).await.unwrap();
+
+        assert_eq!(error_code(&recv(&client).await), (4, 1));
+        assert!(table.get_by_client(client_addr).is_none());
+    }
+
+    #[tokio::test]
+    async fn secret_only_config_is_not_anonymous() {
+        // With no static users the relay must still challenge: a secret alone
+        // must not fall through to anonymous mode.
+        let (h, table, _config) = secret_handler(&[SECRET]);
+        let (server, client, client_addr) = socket_pair().await;
+
+        h.handle_allocate(&allocate_request(), client_addr, &server)
+            .await
+            .unwrap();
+
+        assert_eq!(error_code(&recv(&client).await), (4, 1));
+        assert!(table.get_by_client(client_addr).is_none());
+    }
+
+    #[tokio::test]
+    async fn rotated_secrets_are_both_accepted() {
+        let (h, _table, config) = secret_handler(&["old-secret", "new-secret"]);
+        for (n, secret) in ["old-secret", "new-secret"].into_iter().enumerate() {
+            let (server, client, client_addr) = socket_pair().await;
+            let (user, key) = ephemeral(&config, secret, 3600 + n as i64);
+
+            let msg = sign_as(allocate_request(), &user, &config, &key);
+            h.handle_allocate(&msg, client_addr, &server).await.unwrap();
+
+            let resp = recv(&client).await;
+            assert_eq!(&resp[0..2], &[0x01, 0x03], "{secret} accepted");
+            assert_signed_with(&resp, &key);
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_after_ephemeral_expiry_is_401() {
+        // Credentials are checked on every request, so an allocation cannot be
+        // kept alive past the credential's expiry.
+        let (h, table, config) = secret_handler(&[SECRET]);
+        let (server, client, client_addr) = socket_pair().await;
+        let (user, key) = ephemeral(&config, SECRET, -1);
+        table.create(client_addr, user.clone(), 600);
+
+        let msg = sign_as(request(StunMethod::Refresh, 0x0004), &user, &config, &key);
+        h.handle_refresh(&msg, client_addr, &server).await.unwrap();
+
+        assert_eq!(error_code(&recv(&client).await), (4, 1));
     }
 
     // ---- Allocate over a lapsed allocation ----------------------------------

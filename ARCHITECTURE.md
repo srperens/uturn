@@ -527,8 +527,12 @@ struct AllocationManager {
 ## Security Considerations
 
 1. **Authentication**: Long-term credentials (RFC 5389), verified by
-   MESSAGE-INTEGRITY on every request. Static credentials are shared across
-   clients unless the deployment issues per-user or ephemeral ones.
+   MESSAGE-INTEGRITY on every request. Passwords come either from static
+   `--user` entries, which are shared across clients unless the deployment
+   issues per-user ones, or are derived from a shared secret for time-limited
+   TURN REST API usernames (`<expiry>:<id>`, see README). An expired REST
+   username is rejected on every request, Refresh included, so an allocation
+   cannot outlive its credentials.
 2. **Permissions**: Peer permissions are enforced with a 5-minute lifetime
    refreshed by CreatePermission/ChannelBind (RFC 5766 §9), but note they
    provide **little isolation between calls in single-port mode**: every client
@@ -575,6 +579,5 @@ USERNAMEs and see who talks to whom.
 
 - **TCP TURN**: Tunnel over TCP for restrictive firewalls
 - **TURNS**: TLS encryption
-- **REST API**: Dynamic credential management
 - **Metrics**: Prometheus endpoint
 - **Clustering**: Distributed allocation state

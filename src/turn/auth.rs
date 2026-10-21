@@ -1,5 +1,6 @@
 //! TURN authentication (long-term credentials)
 
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
@@ -16,6 +17,27 @@ impl TurnAuth {
         let input = format!("{}:{}:{}", username, realm, password);
         let digest = md5::compute(input.as_bytes());
         digest.0
+    }
+
+    /// Expiry (unix seconds) carried by a TURN REST API username.
+    ///
+    /// The format is `<expiry>:<id>`, or a bare `<expiry>`
+    /// (draft-uberti-behave-turn-rest, as implemented by coturn's
+    /// `use-auth-secret`). Returns `None` when the username does not start
+    /// with a timestamp.
+    pub fn ephemeral_expiry(username: &str) -> Option<u64> {
+        let ts = username.split(':').next()?;
+        if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        ts.parse().ok()
+    }
+
+    /// Password for a TURN REST API username: base64(HMAC-SHA1(secret, username))
+    pub fn ephemeral_password(secret: &str, username: &str) -> String {
+        let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC key length");
+        mac.update(username.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
     }
 
     /// Compute MESSAGE-INTEGRITY attribute value
@@ -120,6 +142,35 @@ mod tests {
         let key = TurnAuth::compute_key("user", "realm", "pass");
         // Key is MD5("user:realm:pass")
         assert_eq!(key.len(), 16);
+    }
+
+    #[test]
+    fn test_ephemeral_password_vector() {
+        // Independent reference:
+        // printf '1761100000:alice' | openssl dgst -sha1 -hmac example-secret -binary | base64
+        assert_eq!(
+            TurnAuth::ephemeral_password("example-secret", "1761100000:alice"),
+            "IhDlw9EWGUfbCxOx+FBk4ye0Kd0="
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_expiry() {
+        assert_eq!(
+            TurnAuth::ephemeral_expiry("1761100000:alice"),
+            Some(1761100000)
+        );
+        assert_eq!(TurnAuth::ephemeral_expiry("1761100000"), Some(1761100000));
+        assert_eq!(
+            TurnAuth::ephemeral_expiry("1761100000:a:b"),
+            Some(1761100000)
+        );
+        assert_eq!(TurnAuth::ephemeral_expiry("alice"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("alice:1761100000"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry(":alice"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry(""), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("+12:alice"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("99999999999999999999:x"), None);
     }
 
     #[test]

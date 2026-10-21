@@ -42,6 +42,18 @@ struct Args {
     #[arg(short, long, env = "UTURN_USERS", value_delimiter = ',')]
     user: Vec<String>,
 
+    /// Shared secret for time-limited TURN REST API credentials (coturn's
+    /// `static-auth-secret`). Username `<expiry-unix-secs>:<id>`, password
+    /// base64(HMAC-SHA1(secret, username)). Repeat to accept several secrets
+    /// while rotating.
+    #[arg(
+        long,
+        env = "UTURN_AUTH_SECRET",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
+    static_auth_secret: Vec<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "UTURN_LOG_LEVEL", default_value = "info")]
     log_level: Level,
@@ -59,7 +71,8 @@ struct Args {
     nonce_lifetime_secs: u64,
 
     /// Run as an open relay with no authentication. Without this flag the
-    /// server refuses to start when no `--user` is configured. Exposing an
+    /// server refuses to start when neither `--user` nor
+    /// `--static-auth-secret` is configured. Exposing an
     /// anonymous relay on the public internet will be abused.
     #[arg(long, env = "UTURN_ALLOW_ANONYMOUS", default_value = "false")]
     allow_anonymous: bool,
@@ -98,10 +111,17 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    if credentials.is_empty() && !args.allow_anonymous {
+    let auth_secrets: Vec<String> = args
+        .static_auth_secret
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if credentials.is_empty() && auth_secrets.is_empty() && !args.allow_anonymous {
         error!("No credentials configured. Refusing to start an unauthenticated TURN relay.");
         error!(
-            "Pass --user USER:PASS (or UTURN_USERS=...) to configure auth, \
+            "Pass --user USER:PASS (or UTURN_USERS=...) and/or \
+             --static-auth-secret SECRET (or UTURN_AUTH_SECRET=...) to configure auth, \
              or --allow-anonymous to intentionally run as an open relay."
         );
         bail!("missing credentials");
@@ -116,6 +136,7 @@ async fn main() -> Result<()> {
         external_ip: args.external_ip,
         realm: args.realm,
         credentials,
+        auth_secrets,
         max_allocations_per_ip: args.max_allocations_per_ip,
         rate_limit_per_minute: args.rate_limit_per_minute,
         nonce_lifetime_secs: args.nonce_lifetime_secs,
@@ -132,7 +153,14 @@ async fn main() -> Result<()> {
         config.external_ip
     );
 
-    if config.credentials.is_empty() {
+    if !config.auth_secrets.is_empty() {
+        info!(
+            "TURN REST API credentials enabled ({} shared secret(s))",
+            config.auth_secrets.len()
+        );
+    }
+
+    if !config.auth_enabled() {
         warn!(
             "ANONYMOUS MODE: server is running as an open relay with no authentication. \
              This will be abused on the public internet (amplification, free transit, \
