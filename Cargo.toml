@@ -15,19 +15,19 @@ tokio = { version = "1", features = ["full"] }
 
 # Networking
 bytes = "1"
-socket2 = "0.5"
+socket2 = "0.6"
 
 # Data structures
 dashmap = "6"
 parking_lot = "0.12"
 
 # Crypto (for TURN auth)
-hmac = "0.12"
-sha1 = "0.10"
-md5 = "0.7"
+hmac = "0.13"
+sha1 = "0.11"
+md5 = "0.8"
 base64 = "0.22"
 crc = "3"
-rand = "0.8"
+rand = "0.10"
 
 # Config & CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -40,9 +40,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 
-[dev-dependencies]
-tokio-test = "0.4"
-webrtc-util = "0.9"
 
 [profile.release]
 lto = true
