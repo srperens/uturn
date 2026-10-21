@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.84-alpine AS builder
+FROM rust:1.99-alpine3.24 AS builder
 
 RUN apk add --no-cache musl-dev
 
@@ -10,7 +10,7 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime stage
-FROM alpine:3.19
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S uturn \
