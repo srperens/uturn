@@ -29,6 +29,10 @@ TURN_URL='turn:192.0.2.2:3478?transport=udp' node relaytest.js
 ICE_RESTART=1 node relaytest.js        # also exercises an ICE restart mid-call
 ```
 
+To exercise time-limited TURN REST API credentials instead of `test:testpass`,
+start the server with `--static-auth-secret example-secret-0123456789` and run with
+`TURN_SECRET=example-secret-0123456789`.
+
 Two peers with `iceTransportPolicy: 'relay'` connect through the server and
 exchange DataChannel bytes. Exit 0 with a `roundtrip: pong:ping` line means a
 full relayed call works (ICE **and** DTLS completed).

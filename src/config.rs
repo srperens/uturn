@@ -2,8 +2,10 @@
 
 use std::net::IpAddr;
 
+use crate::turn::TurnAuth;
+
 /// Server configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// UDP port to listen on
     pub port: u16,
@@ -19,6 +21,14 @@ pub struct Config {
 
     /// Static credentials (username, password)
     pub credentials: Vec<(String, String)>,
+
+    /// Shared secrets for TURN REST API (time-limited) credentials.
+    ///
+    /// A username `<expiry>:<id>` is accepted with password
+    /// base64(HMAC-SHA1(secret, username)) until `expiry` (unix seconds).
+    /// Every secret is tried, so a new one can be added before the old one is
+    /// retired.
+    pub auth_secrets: Vec<String>,
 
     /// Maximum allocations per IP address (0 = unlimited)
     pub max_allocations_per_ip: u32,
@@ -45,6 +55,30 @@ pub struct Config {
     pub max_channels_per_alloc: usize,
 }
 
+/// Redacts passwords and secrets, so logging a `Config` cannot leak them.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let users: Vec<&str> = self.credentials.iter().map(|(u, _)| u.as_str()).collect();
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .field("external_ip", &self.external_ip)
+            .field("realm", &self.realm)
+            .field("credentials", &users)
+            .field(
+                "auth_secrets",
+                &format_args!("[{} redacted]", self.auth_secrets.len()),
+            )
+            .field("max_allocations_per_ip", &self.max_allocations_per_ip)
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("nonce_lifetime_secs", &self.nonce_lifetime_secs)
+            .field("nonce_secret", &"[redacted]")
+            .field("allow_anonymous", &self.allow_anonymous)
+            .field("max_permissions_per_alloc", &self.max_permissions_per_alloc)
+            .field("max_channels_per_alloc", &self.max_channels_per_alloc)
+            .finish()
+    }
+}
+
 impl Config {
     /// Create a new config with minimal settings
     pub fn new(external_ip: IpAddr) -> Self {
@@ -56,6 +90,7 @@ impl Config {
             external_ip,
             realm: "uturn".to_string(),
             credentials: Vec::new(),
+            auth_secrets: Vec::new(),
             max_allocations_per_ip: 200,
             rate_limit_per_minute: 30,
             nonce_lifetime_secs: 3600,
@@ -88,11 +123,108 @@ impl Config {
         self
     }
 
-    /// Get password for username (if exists)
-    pub fn get_password(&self, username: &str) -> Option<&str> {
-        self.credentials
-            .iter()
-            .find(|(u, _)| u == username)
-            .map(|(_, p)| p.as_str())
+    /// Add a shared secret for TURN REST API credentials
+    pub fn with_auth_secret(mut self, secret: impl Into<String>) -> Self {
+        self.auth_secrets.push(secret.into());
+        self
+    }
+
+    /// Whether requests must authenticate. False only in anonymous mode.
+    pub fn auth_enabled(&self) -> bool {
+        !self.credentials.is_empty() || !self.auth_secrets.is_empty()
+    }
+
+    /// Passwords a request with this username may be signed with.
+    ///
+    /// A static credential wins outright. Otherwise a TURN REST API username
+    /// that has not expired at `now` (unix seconds) yields one password per
+    /// shared secret. Empty means the username is unknown or expired.
+    pub fn candidate_passwords(&self, username: &str, now: u64) -> Vec<String> {
+        if let Some((_, p)) = self.credentials.iter().find(|(u, _)| u == username) {
+            return vec![p.clone()];
+        }
+        match TurnAuth::ephemeral_expiry(username) {
+            Some(expiry) if expiry > now => self
+                .auth_secrets
+                .iter()
+                .map(|secret| TurnAuth::ephemeral_password(secret, username))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_761_000_000;
+
+    fn config() -> Config {
+        Config::new("203.0.113.10".parse().unwrap())
+    }
+
+    #[test]
+    fn auth_enabled_by_users_or_secret() {
+        assert!(!config().auth_enabled());
+        assert!(config().with_credential("u", "p").auth_enabled());
+        // A secret alone must not leave the relay open.
+        assert!(config().with_auth_secret("s").auth_enabled());
+    }
+
+    #[test]
+    fn ephemeral_username_valid_until_expiry() {
+        let cfg = config().with_auth_secret("s");
+        let user = format!("{}:alice", NOW + 60);
+        assert_eq!(
+            cfg.candidate_passwords(&user, NOW),
+            vec![TurnAuth::ephemeral_password("s", &user)]
+        );
+        assert!(cfg.candidate_passwords(&user, NOW + 60).is_empty());
+        assert!(cfg.candidate_passwords(&user, NOW + 61).is_empty());
+    }
+
+    #[test]
+    fn ephemeral_username_rejected_without_secret() {
+        let cfg = config().with_credential("u", "p");
+        assert!(cfg
+            .candidate_passwords(&format!("{}:alice", NOW + 60), NOW)
+            .is_empty());
+    }
+
+    #[test]
+    fn every_secret_is_a_candidate() {
+        let cfg = config().with_auth_secret("old").with_auth_secret("new");
+        let user = format!("{}:alice", NOW + 60);
+        assert_eq!(
+            cfg.candidate_passwords(&user, NOW),
+            vec![
+                TurnAuth::ephemeral_password("old", &user),
+                TurnAuth::ephemeral_password("new", &user),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let out = format!(
+            "{:?}",
+            config()
+                .with_credential("alice", "hunter2-static")
+                .with_auth_secret("example-secret-value")
+        );
+        assert!(out.contains("alice"));
+        assert!(!out.contains("hunter2-static"));
+        assert!(!out.contains("example-secret-value"));
+    }
+
+    #[test]
+    fn static_credential_wins_over_ephemeral_format() {
+        let user = format!("{}:alice", NOW + 60);
+        let cfg = config()
+            .with_credential(user.clone(), "static")
+            .with_auth_secret("s");
+        assert_eq!(cfg.candidate_passwords(&user, NOW), vec!["static"]);
+        assert!(cfg.candidate_passwords("unknown", NOW).is_empty());
     }
 }
